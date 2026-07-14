@@ -1,0 +1,11 @@
+# NOTE: the comment-related options below are nightly-only. They are applied by
+# the nightly rustfmt that neovim/conform invokes on save. Running stable
+# `cargo fmt` still works but prints "unstable feature" warnings and leaves
+# comments unwrapped. Use the editor (or cargo +nightly fmt) for full output.
+
+edition = "2024"
+
+wrap_comments = true
+comment_width = 80
+
+format_code_in_doc_comments = true
