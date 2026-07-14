@@ -1,0 +1,6 @@
+/target/
+.local/
+
+# capture outputs
+*.pcap
+*.22000

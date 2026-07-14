@@ -1,0 +1,33 @@
+[package]
+name = "infishark-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line tool for the InfiShark BLEShark Nano."
+keywords = ["ble", "wifi", "security", "esp32", "cli"]
+categories = ["command-line-utilities", "hardware-support"]
+
+[[bin]]
+name = "infishark"
+path = "src/main.rs"
+
+[dependencies]
+infishark = { path = "../core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4"
+console = "0.15"
+reedline = "0.35"
+shlex = "1"
+self_update = { version = "0.42", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
