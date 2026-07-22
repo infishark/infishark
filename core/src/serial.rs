@@ -53,6 +53,7 @@ fn auto_select() -> Result<String> {
         })
         .collect();
     espressif.sort();
+    let espressif = prefer_callout_ports(espressif);
     let mut nanos: Vec<String> = espressif
         .iter()
         .filter(|p| probe_device_info(p, 800).is_some())
@@ -69,5 +70,56 @@ fn auto_select() -> Result<String> {
             "multiple BLEShark Nano devices found ({}); pass --port to choose",
             nanos.join(", ")
         ),
+    }
+}
+
+fn prefer_callout_ports(paths: Vec<String>) -> Vec<String> {
+    // macOS exposes one USB serial endpoint as both /dev/cu.* and /dev/tty.*.
+    // /dev/cu.* is the outgoing callout device and is the better CLI default.
+    // If both names exist, keep only /dev/cu.* so one Nano does not look like two.
+    let callout_names: std::collections::BTreeSet<String> = paths
+        .iter()
+        .filter_map(|p| p.strip_prefix("/dev/cu.").map(str::to_string))
+        .collect();
+
+    paths
+        .into_iter()
+        .filter(|p| {
+            p.strip_prefix("/dev/tty.")
+                .map(|name| !callout_names.contains(name))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefer_callout_ports;
+
+    #[test]
+    fn macos_cu_port_wins_over_matching_tty_port() {
+        let ports = vec![
+            "/dev/cu.usbmodem21201".to_string(),
+            "/dev/tty.usbmodem21201".to_string(),
+        ];
+        assert_eq!(prefer_callout_ports(ports), vec!["/dev/cu.usbmodem21201"]);
+    }
+
+    #[test]
+    fn keeps_tty_port_when_no_matching_cu_port_exists() {
+        let ports = vec!["/dev/ttyUSB0".to_string()];
+        assert_eq!(prefer_callout_ports(ports), vec!["/dev/ttyUSB0"]);
+    }
+
+    #[test]
+    fn keeps_unrelated_ports() {
+        let ports = vec![
+            "/dev/cu.usbmodem21201".to_string(),
+            "/dev/tty.usbmodem99999".to_string(),
+        ];
+        assert_eq!(
+            prefer_callout_ports(ports),
+            vec!["/dev/cu.usbmodem21201", "/dev/tty.usbmodem99999"]
+        );
     }
 }
