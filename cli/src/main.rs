@@ -9,6 +9,8 @@ mod manage;
 mod monitor;
 mod portal;
 mod ports;
+mod privs;
+mod recon;
 mod shell;
 mod signals;
 mod target;
@@ -907,6 +909,7 @@ fn main() -> ExitCode {
             if cli.json {
                 println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
             } else {
+                // Multi-line root hints from privs::require_root.
                 eprintln!("Error: {e:#}");
             }
             ExitCode::FAILURE
@@ -919,51 +922,6 @@ fn run(cli: &Cli) -> Result<()> {
         Some(command) => dispatch(cli, command),
         None => shell::run(cli),
     }
-}
-
-// `wifi adapter` (tun) and `ble hid bridge` (uinput/hidraw) need host root.
-#[cfg(target_os = "linux")]
-fn command_needs_root(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::Wifi {
-            action: WifiCmd::Adapter { .. },
-            ..
-        }
-    ) || matches!(
-        cmd,
-        Command::Ble {
-            action: BleCmd::Hid {
-                action: HidCmd::Bridge { .. }
-            },
-            ..
-        }
-    )
-}
-
-// Re-run under sudo (which prompts) when a root-only command is invoked as a
-// normal user, so most commands stay sudo-free.
-#[cfg(target_os = "linux")]
-fn maybe_reexec_root(cli: &Cli) -> Option<ExitCode> {
-    let cmd = cli.command.as_ref()?;
-    if !command_needs_root(cmd) || unsafe { libc::geteuid() } == 0 {
-        return None;
-    }
-    let exe = std::env::current_exe().ok()?;
-    let args = std::env::args().skip(1);
-    let status = std::process::Command::new("sudo")
-        .arg(exe)
-        .args(args)
-        .status();
-    Some(match status {
-        Ok(s) if s.success() => ExitCode::SUCCESS,
-        _ => ExitCode::FAILURE,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn maybe_reexec_root(_cli: &Cli) -> Option<ExitCode> {
-    None
 }
 
 fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
@@ -1546,6 +1504,9 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             return Ok(());
         }
         return print_networks(&nets, cli.json);
+    // TUN needs root; fail before opening the device or picking a network.
+    if matches!(action, WifiCmd::Adapter { .. }) {
+        privs::require_root("wifi adapter")?;
     }
     // Monitor streams indefinitely; give the read loop a long ceiling so a quiet
     // channel doesn't error between frames (Ctrl-C ends it).
@@ -2202,6 +2163,10 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
             no_start,
             clone,
         } => {
+            // /dev/input grab needs root; fail before opening the Nano.
+            if !*clone {
+                privs::require_root("ble hid bridge")?;
+            }
             let dev = cli.open(cli.timeout_ms.max(15_000))?;
             if *clone {
                 return hidraw::run(
