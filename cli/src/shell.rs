@@ -72,15 +72,6 @@ fn port_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-// Commands that grab host resources (tun, uinput/hidraw) and need root.
-fn needs_sudo(line: &str) -> bool {
-    let t: Vec<&str> = line.split_whitespace().collect();
-    matches!(
-        t.as_slice(),
-        ["wifi", "adapter", ..] | ["ble", "hid", "bridge", ..]
-    )
-}
-
 struct Shell {
     devices: Vec<PortEntry>,
     selected: Option<String>,
@@ -340,10 +331,13 @@ impl Shell {
             Some(p) if !line.contains("--port") => format!("--port '{p}' "),
             _ => String::new(),
         };
-        let prefix = if sudo { "sudo " } else { "" };
-        let cmd = format!("{prefix}'{}' {port}{line}", exe.display());
+        let cmd = format!("'{}' {port}{line}", exe.display());
         RUNNING.store(true, Ordering::SeqCst);
-        if let Err(e) = std::process::Command::new("sh").arg("-c").arg(cmd).status() {
+        if let Err(e) = std::process::Command::new(crate::privs::tool_path("sh"))
+            .arg("-c")
+            .arg(cmd)
+            .status()
+        {
             eprintln!("failed to run: {e}");
         }
     }

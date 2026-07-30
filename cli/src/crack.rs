@@ -26,7 +26,10 @@ pub fn run(hashfile: &str, wordlist: Option<&str>) {
 }
 
 pub fn hashcat_available() -> bool {
-    Command::new("hashcat").arg("--version").output().is_ok()
+    Command::new(crate::privs::tool_path("hashcat"))
+        .arg("--version")
+        .output()
+        .is_ok()
 }
 
 fn resolve_wordlist(wordlist: Option<&str>) -> Option<String> {
@@ -40,7 +43,7 @@ fn resolve_wordlist(wordlist: Option<&str>) -> Option<String> {
 }
 
 pub fn crack_22000(hashfile: &Path, wordlist: &Path) -> Result<Option<String>> {
-    let status = Command::new("hashcat")
+    let status = Command::new(crate::privs::tool_path("hashcat"))
         .args(["-m", "22000"])
         .arg(hashfile)
         .arg(wordlist)
@@ -49,7 +52,7 @@ pub fn crack_22000(hashfile: &Path, wordlist: &Path) -> Result<Option<String>> {
     if !matches!(status.code(), Some(0 | 1)) {
         bail!("hashcat exited with {status}"); // 0=cracked, 1=exhausted
     }
-    let out = Command::new("hashcat")
+    let out = Command::new(crate::privs::tool_path("hashcat"))
         .args(["-m", "22000", "--show"])
         .arg(hashfile)
         .output()

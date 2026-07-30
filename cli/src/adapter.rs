@@ -21,6 +21,7 @@ pub fn run(
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        crate::privs::require_root("wifi adapter")?;
         linux::run(dev, target, config, opts)
     }
     #[cfg(not(target_os = "linux"))]
@@ -442,7 +443,7 @@ mod linux {
     }
 
     fn current_default() -> Option<String> {
-        let out = std::process::Command::new("ip")
+        let out = std::process::Command::new(crate::privs::tool_path("ip"))
             .args(["route", "show", "default"])
             .output()
             .ok()?;
@@ -472,7 +473,7 @@ mod linux {
 
     fn run_cmd(prog: &str, args: &[&str]) -> Result<()> {
         eprintln!("+ {prog} {}", args.join(" "));
-        let status = std::process::Command::new(prog)
+        let status = std::process::Command::new(crate::privs::tool_path(prog))
             .args(args)
             .status()
             .with_context(|| format!("running `{prog}` (is it installed / are you root?)"))?;

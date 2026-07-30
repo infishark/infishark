@@ -18,6 +18,8 @@ pub struct BridgeOpts {
 pub fn run(dev: Device, opts: BridgeOpts) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        // /dev/input grab needs root (or input group); fail before device setup.
+        crate::privs::require_root("ble hid bridge")?;
         linux::run(dev, opts)
     }
     #[cfg(not(target_os = "linux"))]
