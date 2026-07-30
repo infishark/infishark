@@ -1,17 +1,26 @@
 #!/usr/bin/env sh
-# infishark CLI installer for Linux and macOS.
-# Installs a prebuilt `infishark` binary when one is published; otherwise builds from source with existing Rust toolchain. Target: ~/.local/bin.
+
+# infishark CLI installer for Linux and macOS. Prefers a prebuilt version from GitHub Releases. Otherwise, builds from source with the local Rust toolchain. 
 #
-#   curl -fsSL https://cdn.infishark.com/install.sh | sh
+# Install root: ~/.local/bin (or, you can override with INFISHARK_BIN_DIR).
+#
+# curl -fsSL https://cdn.infishark.com/install.sh | sh
+
 set -eu
 
 REPO="infishark/infishark"
 BIN=infishark
 DEST="${INFISHARK_BIN_DIR:-$HOME/.local/bin}"
+OUT="$DEST/$BIN"
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mnote:\033[0m %s\n' "$1"; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+assert_bin() {
+    [ -f "$1" ] || die "Expected binary missing: $1"
+    [ -s "$1" ] || die "Expected binary is empty: $1"
+}
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -25,23 +34,32 @@ esac
 
 mkdir -p "$DEST"
 
+installed=
 if [ -n "$target" ]; then
     url="https://github.com/$REPO/releases/latest/download/$BIN-$target.tar.gz"
     tmp="$(mktemp -d)"
-    if curl -fsSL "$url" -o "$tmp/pkg.tar.gz" 2>/dev/null; then
+    # shellcheck disable=SC2064
+    trap 'rm -rf "$tmp"' EXIT
+    if curl -fsSL "$url" -o "$tmp/pkg.tar.gz"; then
         say "Installing prebuilt $BIN ($target)"
         tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"
-        install -m 0755 "$tmp/$BIN" "$DEST/$BIN"
-        rm -rf "$tmp"
-        installed=1
+        if [ ! -f "$tmp/$BIN" ] || [ ! -s "$tmp/$BIN" ]; then
+            warn "prebuilt archive missing $BIN; trying source build"
+        else
+            install -m 0755 "$tmp/$BIN" "$OUT"
+            assert_bin "$OUT"
+            installed=1
+        fi
     else
-        rm -rf "$tmp"
+        warn "prebuilt unavailable for $target; trying source build"
     fi
+    rm -rf "$tmp"
+    trap - EXIT
 fi
 
 if [ -z "${installed:-}" ]; then
     command -v cargo >/dev/null 2>&1 \
-        || die "No prebuilt binary for $os-$arch, and Rust isn't installed. Install it from https://rustup.rs then re-run."
+        || die "No prebuilt binary for ${os}-${arch}, and Rust isn't installed. Install it from https://rustup.rs then re-run."
     if [ "$os" = "Linux" ] && ! pkg-config --exists libudev 2>/dev/null; then
         say "Installing Linux USB deps (libudev, pkg-config)"
         if   command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y pkg-config libudev-dev
@@ -51,6 +69,7 @@ if [ -z "${installed:-}" ]; then
     fi
     say "Building $BIN from source"
     cargo install --git "https://github.com/$REPO" infishark-cli --root "$(dirname "$DEST")"
+    assert_bin "$OUT"
 fi
 
 say "Installed $BIN to $DEST"
