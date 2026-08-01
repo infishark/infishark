@@ -10,7 +10,6 @@ mod monitor;
 mod portal;
 mod ports;
 mod privs;
-mod recon;
 mod shell;
 mod signals;
 mod target;
@@ -898,9 +897,6 @@ enum GattCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Some(code) = maybe_reexec_root(&cli) {
-        return code;
-    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1504,6 +1500,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             return Ok(());
         }
         return print_networks(&nets, cli.json);
+    }
     // TUN needs root; fail before opening the device or picking a network.
     if matches!(action, WifiCmd::Adapter { .. }) {
         privs::require_root("wifi adapter")?;
