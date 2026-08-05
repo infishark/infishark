@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
 
@@ -10,6 +11,11 @@ use crate::demux::{Demuxer, Event};
 use crate::frame::{self, Frame};
 use crate::protocol::{ERR_OK, PKT_ERROR, PKT_EVENT, PKT_RESPONSE, RESP_MORE};
 use crate::response::{ResponseHeader, parse_response_header};
+
+fn debug_serial() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ISHARK_DEBUG_SERIAL").is_some())
+}
 
 /// reassembled device response (the data after the 4-byte response header)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +132,7 @@ impl<S: Read + Write> Transport<S> {
                     Event::Cli(f) => self.inbox.push_back(f),
                     // Device debug text: surfaced to stderr with ISHARK_DEBUG_SERIAL set.
                     Event::Log(bytes) => {
-                        if std::env::var_os("ISHARK_DEBUG_SERIAL").is_some() {
+                        if debug_serial() {
                             let _ = std::io::stderr().write_all(&bytes);
                         }
                     }
