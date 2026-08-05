@@ -2,25 +2,25 @@
 
 The Rust SDK and command-line tool for the BLEShark Nano.
 
-This turns the Nano into a raw RF peripheral your computer drives over serial. The device is the radio; the host is the compute; this SDK is the membrane between them.
+This turns the Nano into a raw RF peripheral your computer drives over serial.
 
-`core/` is the SDK (`infishark`), a typed `Device` client over a framed serial transport. `cli/` is the `infishark` binary built on it.
+`core/` is the SDK (`infishark`) -- a typed `Device` client over a framed serial transport. `cli/` is the `infishark` CLI built on it.
 
 ## Install
 
-**CLI** (the `infishark` tool) installs with one command; no Rust needed once release binaries are published:
+**CLI** (the `infishark` tool) installs with one command. Prefer the published release binaries (no Rust required):
 
+**Linux/MacOS (bash)**
 ```sh
-# Linux / macOS
 curl -fsSL https://cdn.infishark.com/install.sh | sh
 ```
 
+**Windows (PowerShell)**
 ```powershell
-# Windows (PowerShell)
 irm https://cdn.infishark.com/install.ps1 | iex
 ```
 
-The installer grabs a prebuilt binary for your platform, or builds from source with your Rust toolchain if none is published yet (Linux source builds need `libudev` + `pkg-config`, which the script installs for you). The binary lands in `~/.local/bin` (`%USERPROFILE%\.infishark\bin` on Windows).
+Binary lands in `~/.local/bin` (or `%USERPROFILE%\.infishark\bin` on Windows).
 
 ## Quickstart (SDK)
 
@@ -42,22 +42,23 @@ Add it to your project:
 cargo add infishark --git https://github.com/infishark/infishark
 ```
 
-Runnable examples live in `core/examples/`: `cargo run --example ble_scan` (also `wifi_scan`, `device_info`). For a fuller worked example, see the `airhorn` project, an automated Find My tag locator built entirely on this SDK.
+Runnable examples live in `core/examples/`.
 
 ## CLI
 
 ```sh
 infishark # open up the shell
-ports # list detected devices
+help
+ports
 device info
 wifi scan
 ble scan
 ```
 
-Every command also takes `--json` for machine-readable output.
+[Full docs](https://docs.infishark.com/docs/sdk)
 
 ## License
 
-GPL-3.0-only. You may use, modify, and redistribute this freely, but any work built on it must also be open-source under the GPL. The BLEShark Nano firmware itself is a separate, closed-source product. For commercial (closed-source) licensing, contact support@infishark.com.
+GPL-3.0-only. You may use, modify, and redistribute this freely, but any work built on it must also be open-source under the GPL. The BLEShark Nano firmware itself is a separate, closed-source product. For commercial (closed-source) licensing, contact `support@infishark.com`.
 
 This SDK is in the early stages, so bugs are to be expected. If you hit one, please open an issue or pull request.
