@@ -31,7 +31,7 @@ pub fn parse_eapol(f: &[u8]) -> Option<EapolView> {
         return None;
     }
     // The data body is LLC/SNAP, its EtherType, then the EAPOL-Key PDU.
-    let b = &frame.body;
+    let b = frame.body;
     let is_eapol = b.len() >= 8
         && b.starts_with(&LLC_SNAP)
         && u16::from_be_bytes([b[6], b[7]]) == ethertype::EAPOL;

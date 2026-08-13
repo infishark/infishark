@@ -99,7 +99,7 @@ impl FrameType {
 }
 
 /// A parsed 802.11 frame (3-address); `body` starts after the MAC header.
-pub struct Frame {
+pub struct Frame<'a> {
     pub ftype: FrameType,
     pub subtype: u8,
     pub to_ds: bool,
@@ -108,10 +108,10 @@ pub struct Frame {
     pub addr1: Mac,
     pub addr2: Mac,
     pub addr3: Mac,
-    pub body: Vec<u8>,
+    pub body: &'a [u8],
 }
 
-impl Frame {
+impl Frame<'_> {
     /// The BSSID under the To/From-DS address convention.
     pub fn bssid(&self) -> Mac {
         match (self.to_ds, self.from_ds) {
@@ -142,7 +142,7 @@ impl Frame {
 /// and HT Control fields; 4-address WDS frames are not resolved.
 /// Note that the device filters for bandwidth; this parser validates for
 /// correctness.
-pub fn parse_frame(f: &[u8]) -> Option<Frame> {
+pub fn parse_frame(f: &[u8]) -> Option<Frame<'_>> {
     if f.len() < 24 {
         return None;
     }
@@ -160,7 +160,7 @@ pub fn parse_frame(f: &[u8]) -> Option<Frame> {
         addr1: f[4..10].try_into().ok()?,
         addr2: f[10..16].try_into().ok()?,
         addr3: f[16..22].try_into().ok()?,
-        body: f.get(hdr..).unwrap_or(&[]).to_vec(),
+        body: f.get(hdr..).unwrap_or(&[]),
     })
 }
 

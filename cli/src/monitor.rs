@@ -230,10 +230,10 @@ fn subtype_num(s: &str) -> Result<u8> {
 
 fn ethertype_num(s: &str) -> Result<u16> {
     Ok(match s {
-        "eapol" => 0x888e,
-        "arp" => 0x0806,
-        "ipv4" => 0x0800,
-        "ipv6" => 0x86dd,
+        "eapol" => ieee80211::ethertype::EAPOL,
+        "arp" => ieee80211::ethertype::ARP,
+        "ipv4" => ieee80211::ethertype::IPV4,
+        "ipv6" => ieee80211::ethertype::IPV6,
         _ => {
             let h = s.strip_prefix("0x").unwrap_or(s);
             u16::from_str_radix(h, 16).map_err(|_| anyhow::anyhow!("bad --ethertype '{s}'"))?
