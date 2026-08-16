@@ -38,11 +38,12 @@ pub fn probe_device_info(path: &str, timeout_ms: u64) -> Option<serde_json::Valu
     serde_json::from_slice(&resp.body).ok()
 }
 
-// BLEShark Nano is not registered under the espressif/usb-pids GitHub repo because it is
-// based on an ESP32-C3 which does not have OTG. This means it cannot use a custom PID, so
-// we must use the Espressif VID to shortlist candidates and then confirm each is a Nano
-// by probing its identity. A bare JTAG/serial debug unit or ESP shares the VID but never
-// answers the device-info probe.
+// BLEShark Nano is not registered under the espressif/usb-pids GitHub repo
+// because it is based on an ESP32-C3 which does not have OTG. This means it
+// cannot use a custom PID, so we must use the Espressif VID to shortlist
+// candidates and then confirm each is a Nano by probing its identity. A bare
+// JTAG/serial debug unit or ESP shares the VID but never answers the
+// device-info probe.
 fn auto_select() -> Result<String> {
     let ports = serialport::available_ports().context("listing serial ports")?;
     let mut espressif: Vec<String> = ports
@@ -53,14 +54,23 @@ fn auto_select() -> Result<String> {
         })
         .collect();
     espressif.sort();
-    let espressif = prefer_callout_ports(espressif);
-    let mut nanos: Vec<String> = espressif
-        .iter()
-        .filter(|p| probe_device_info(p, 800).is_some())
-        .cloned()
-        .collect();
-    match nanos.len() {
-        1 => Ok(nanos.remove(0)),
+    let espressif = prefer_cu_over_tty(espressif);
+    // one device can still answer on more than one node
+    let mut devices: Vec<(String, String)> = Vec::new();
+    for path in &espressif {
+        let Some(info) = probe_device_info(path, 800) else {
+            continue;
+        };
+        let Some(serial) = info.get("serial").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if devices.iter().any(|(_, s)| s == serial) {
+            continue;
+        }
+        devices.push((path.clone(), serial.to_string()));
+    }
+    match devices.len() {
+        1 => Ok(devices.remove(0).0),
         0 if espressif.is_empty() => bail!("no BLEShark Nano found; pass --port"),
         0 => bail!(
             "no BLEShark Nano found; Espressif port(s) present but not responding: {}. pass --port",
@@ -68,15 +78,20 @@ fn auto_select() -> Result<String> {
         ),
         _ => bail!(
             "multiple BLEShark Nano devices found ({}); pass --port to choose",
-            nanos.join(", ")
+            devices
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
 
-fn prefer_callout_ports(paths: Vec<String>) -> Vec<String> {
-    // macOS exposes one USB serial endpoint as both /dev/cu.* and /dev/tty.*.
-    // /dev/cu.* is the outgoing callout device and is the better CLI default.
-    // If both names exist, keep only /dev/cu.* so one Nano does not look like two.
+/// BSD & macOS expose each USB serial endpoint as both a callout (`cu`) and a
+/// dial-in (`tty`). Opening either talks to the same device; keeping both makes
+/// one Nano look like two. `cu` is the best choice as no cf<->lr processing, it
+/// waits for a real hardware connection, etc
+pub fn prefer_cu_over_tty(paths: Vec<String>) -> Vec<String> {
     let callout_names: std::collections::BTreeSet<String> = paths
         .iter()
         .filter_map(|p| p.strip_prefix("/dev/cu.").map(str::to_string))
@@ -94,32 +109,32 @@ fn prefer_callout_ports(paths: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::prefer_callout_ports;
+    use super::prefer_cu_over_tty;
 
     #[test]
     fn macos_cu_port_wins_over_matching_tty_port() {
         let ports = vec![
-            "/dev/cu.usbmodem21201".to_string(),
-            "/dev/tty.usbmodem21201".to_string(),
+            "/dev/cu.usbmodem13377".to_string(),
+            "/dev/tty.usbmodem13377".to_string(),
         ];
-        assert_eq!(prefer_callout_ports(ports), vec!["/dev/cu.usbmodem21201"]);
+        assert_eq!(prefer_cu_over_tty(ports), vec!["/dev/cu.usbmodem13377"]);
     }
 
     #[test]
     fn keeps_tty_port_when_no_matching_cu_port_exists() {
         let ports = vec!["/dev/ttyUSB0".to_string()];
-        assert_eq!(prefer_callout_ports(ports), vec!["/dev/ttyUSB0"]);
+        assert_eq!(prefer_cu_over_tty(ports), vec!["/dev/ttyUSB0"]);
     }
 
     #[test]
     fn keeps_unrelated_ports() {
         let ports = vec![
-            "/dev/cu.usbmodem21201".to_string(),
+            "/dev/cu.usbmodem13377".to_string(),
             "/dev/tty.usbmodem99999".to_string(),
         ];
         assert_eq!(
-            prefer_callout_ports(ports),
-            vec!["/dev/cu.usbmodem21201", "/dev/tty.usbmodem99999"]
+            prefer_cu_over_tty(ports),
+            vec!["/dev/cu.usbmodem13377", "/dev/tty.usbmodem99999"]
         );
     }
 }
