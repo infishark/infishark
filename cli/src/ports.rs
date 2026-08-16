@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use serde::Serialize;
 use serialport::{SerialPortInfo, SerialPortType};
@@ -58,6 +60,13 @@ pub(crate) fn list(all: bool) -> Result<Vec<PortEntry>> {
         .filter(|port| all || !is_builtin_system_port(&port.name))
         .collect();
 
+    // keep one endpoint for macOS
+    let keep: std::collections::HashSet<String> =
+        infishark::serial::prefer_cu_over_tty(ports.iter().map(|p| p.name.clone()).collect())
+            .into_iter()
+            .collect();
+    ports.retain(|p| keep.contains(&p.name));
+
     // Confirm Espressif-VID ports by asking for identity; a real Nano answers.
     for port in &mut ports {
         if port.vid == Some(ESPRESSIF_VID) {
@@ -65,8 +74,45 @@ pub(crate) fn list(all: bool) -> Result<Vec<PortEntry>> {
         }
     }
 
+    // Same device serial on two path names is one Nano (prefer callout path).
+    ports = dedupe_confirmed_nanos(ports);
+
     ports.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(ports)
+}
+
+/// Keep a single row per confirmed Nano identity (`device.serial`).
+fn dedupe_confirmed_nanos(ports: Vec<PortEntry>) -> Vec<PortEntry> {
+    let mut best: HashMap<String, PortEntry> = HashMap::new();
+    let mut other = Vec::new();
+    for p in ports {
+        let Some(serial) = p.device.as_ref().map(|d| d.serial.clone()) else {
+            other.push(p);
+            continue;
+        };
+        match best.get(&serial) {
+            None => {
+                best.insert(serial, p);
+            }
+            Some(prev) if port_rank(&p.name) < port_rank(&prev.name) => {
+                best.insert(serial, p);
+            }
+            Some(_) => {}
+        }
+    }
+    other.extend(best.into_values());
+    other
+}
+
+/// Lower is better
+fn port_rank(name: &str) -> u8 {
+    if name.starts_with("/dev/cu.") {
+        0
+    } else if name.starts_with("/dev/tty.") {
+        2
+    } else {
+        1
+    }
 }
 
 fn probe(name: &str) -> Option<DeviceIdent> {
