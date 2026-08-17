@@ -344,7 +344,8 @@ impl Device {
         Ok(())
     }
 
-    /// Run a BLE scan, aggregating streamed sightings by address (latest wins).
+    /// Run a BLE scan, aggregating streamed sightings by address. Identity
+    /// sticks across reports
     pub fn ble_scan(&mut self, opts: &BleScanOpts) -> Result<Vec<BleDevice>> {
         self.command_ok_local(protocol::CMD_BLE_SCAN, &opts.to_json())?;
         let mut devices: std::collections::BTreeMap<String, BleDevice> =
@@ -354,7 +355,10 @@ impl Device {
             match id {
                 protocol::EVT_BLE_DEVICE => {
                     if let Ok(d) = serde_json::from_slice::<BleDevice>(&payload) {
-                        devices.insert(d.address.clone(), d);
+                        devices
+                            .entry(d.address.clone())
+                            .and_modify(|e| e.merge_from(&d))
+                            .or_insert(d);
                     }
                 }
                 protocol::EVT_SCAN_DONE => break,

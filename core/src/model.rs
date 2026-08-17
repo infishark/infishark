@@ -137,7 +137,7 @@ impl PortalOpts {
     }
 }
 
-/// One BLE device aggregated from a scan (latest sighting wins).
+/// One BLE device aggregated from a scan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BleDevice {
     pub address: String,
@@ -183,6 +183,29 @@ impl BleDevice {
                     self.company = Some(name.to_string());
                 }
             }
+        }
+    }
+
+    /// Fold a newer sighting into this entry (same address).
+    pub fn merge_from(&mut self, newer: &BleDevice) {
+        if let Some(n) = newer.name.as_ref().filter(|s| !s.is_empty()) {
+            self.name = Some(n.clone());
+        }
+        self.rssi = newer.rssi;
+        if newer.addr_type.is_some() {
+            self.addr_type = newer.addr_type;
+        }
+        if newer.company_id.is_some() {
+            self.company_id = newer.company_id;
+        }
+        if newer.vendor.as_ref().is_some_and(|s| !s.is_empty()) {
+            self.vendor = newer.vendor.clone();
+        }
+        if newer.company.as_ref().is_some_and(|s| !s.is_empty()) {
+            self.company = newer.company.clone();
+        }
+        for (k, v) in &newer.extra {
+            merge_extra_field(&mut self.extra, k, v);
         }
     }
 }
@@ -231,7 +254,8 @@ impl BleScanOpts {
     pub fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         insert_opt(&mut m, "duration_ms", self.duration_ms);
-        insert_flag(&mut m, "active", self.passive, false.into());
+        // Always emit active: device defaults to passive if the key is absent.
+        m.insert("active".into(), (!self.passive).into());
         insert_opt(&mut m, "interval", self.interval);
         insert_opt(&mut m, "window", self.window);
         insert_flag(&mut m, "dedup", self.dedup, true.into());
@@ -399,6 +423,12 @@ mod tests {
     }
 
     #[test]
+    fn ble_opts_emit_active_true_by_default() {
+        let j = BleScanOpts::default().to_json();
+        assert_eq!(j["active"], true);
+    }
+
+    #[test]
     fn ble_opts_emit_only_overrides() {
         let opts = BleScanOpts {
             passive: true,
@@ -409,5 +439,66 @@ mod tests {
         assert_eq!(j["active"], false);
         assert_eq!(j["scan_phy"], 2);
         assert!(j.get("interval").is_none());
+    }
+
+    #[test]
+    fn ble_device_merge_keeps_name_when_later_sighting_is_nameless() {
+        let mut d = BleDevice {
+            address: "aa:bb:cc:dd:ee:ff".into(),
+            name: Some("Device123".into()),
+            rssi: -50,
+            addr_type: Some(1),
+            company_id: Some(0x004c),
+            vendor: None,
+            company: None,
+            extra: BTreeMap::from([("connectable".into(), serde_json::json!(true))]),
+        };
+        let later = BleDevice {
+            address: "aa:bb:cc:dd:ee:ff".into(),
+            name: None,
+            rssi: -62,
+            addr_type: Some(1),
+            company_id: None,
+            vendor: None,
+            company: None,
+            extra: BTreeMap::from([
+                ("connectable".into(), serde_json::json!(false)),
+                ("rssi_ema".into(), serde_json::json!(-60)),
+            ]),
+        };
+        d.merge_from(&later);
+        assert_eq!(d.name.as_deref(), Some("Device123"));
+        assert_eq!(d.rssi, -62);
+        assert_eq!(d.company_id, Some(0x004c));
+        assert_eq!(d.extra.get("connectable"), Some(&serde_json::json!(true)));
+        assert_eq!(d.extra.get("rssi_ema"), Some(&serde_json::json!(-60)));
+    }
+
+    #[test]
+    fn ble_device_merge_takes_newer_nonempty_name() {
+        let mut d = BleDevice {
+            address: "aa:bb:cc:dd:ee:ff".into(),
+            name: None,
+            rssi: -70,
+            addr_type: None,
+            company_id: None,
+            vendor: None,
+            company: None,
+            extra: BTreeMap::new(),
+        };
+        let later = BleDevice {
+            address: "aa:bb:cc:dd:ee:ff".into(),
+            name: Some("Device123".into()),
+            rssi: -41,
+            addr_type: Some(0),
+            company_id: None,
+            vendor: None,
+            company: None,
+            extra: BTreeMap::new(),
+        };
+        d.merge_from(&later);
+        assert_eq!(d.name.as_deref(), Some("Device123"));
+        assert_eq!(d.addr_type, Some(0));
+        assert_eq!(d.rssi, -41);
     }
 }

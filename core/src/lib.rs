@@ -3,8 +3,10 @@
 //!
 //! ```no_run
 //! let mut dev = infishark::Device::open(None, 12_000)?;
+//! // Default scan is active (names/scan responses). Set passive for dense RF.
 //! for d in dev.ble_scan(&infishark::BleScanOpts::default())? {
-//!     println!("{} {}", d.address, d.rssi);
+//!     let name = d.name.as_deref().unwrap_or("<unknown>");
+//!     println!("{}  {} dBm  {name}", d.address, d.rssi);
 //! }
 //! # Ok::<(), infishark::Error>(())
 //! ```
