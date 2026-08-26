@@ -117,3 +117,4 @@ pub const EVT_BLE_HID_OUTPUT: u16 = 0x000B;
 pub const EVT_WIFI_DEVICE: u16 = 0x000C;
 pub const EVT_IR: u16 = 0x000D;
 pub const EVT_PORTAL_REQUEST: u16 = 0x000E;
+pub const EVT_WIFI_TX: u16 = 0x000F;

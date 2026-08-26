@@ -135,9 +135,10 @@ impl Device {
     }
 
     /// Enter promiscuous capture. When `associate` is `Some((ssid, pass))`, the
-    /// device joins that network first and keeps the STA link up (channel follows
-    /// the AP). `pass` may be empty for open networks. When `None`, classic
-    /// channel-locked sniff (no association). Drain with [`Device::next_wifi_frame`].
+    /// device joins that network first and keeps the STA link up (channel
+    /// follows the AP). `pass` may be empty for open networks. When `None`,
+    /// classic channel-locked sniff (no association). Drain with
+    /// [`Device::next_wifi_frame`].
     pub fn wifi_monitor_start(
         &mut self,
         channel: u8,
@@ -153,7 +154,8 @@ impl Device {
         self.command_ok(protocol::CMD_WIFI_RAW_MONITOR, &params)
     }
 
-    /// Like [`wifi_monitor_start`] but join a saved-network slot before promisc.
+    /// Like [`wifi_monitor_start`] but join a saved-network slot before
+    /// promisc.
     pub fn wifi_monitor_start_saved(
         &mut self,
         channel: u8,
@@ -188,14 +190,43 @@ impl Device {
         Ok(())
     }
 
-    /// Inject one raw 802.11 MAC frame (no FCS) on `channel` (0 = leave the
-    /// device's current channel).
+    /// Inject one raw 802.11 MAC frame (no FCS) on `channel` (0 = leave
+    /// current).
     pub fn wifi_raw_tx(&mut self, frame: &[u8], channel: u8) -> Result<bool> {
-        let mut args = Vec::with_capacity(1 + frame.len());
+        let (ok, fail) = self.wifi_raw_tx_burst(frame, channel, 1, 0)?;
+        Ok(ok >= 1 && fail == 0)
+    }
+
+    /// On-device burst. `count` 0 = until stop.
+    pub fn wifi_raw_tx_burst(
+        &mut self,
+        frame: &[u8],
+        channel: u8,
+        count: u16,
+        interval_ms: u16,
+    ) -> Result<(u32, u32)> {
+        let mut args = Vec::with_capacity(5 + frame.len());
         args.push(channel);
+        args.extend_from_slice(&count.to_le_bytes());
+        args.extend_from_slice(&interval_ms.to_le_bytes());
         args.extend_from_slice(frame);
         let v = self.json_command(protocol::CMD_WIFI_RAW_TX, &args)?;
-        Ok(v.get("tx_ok").and_then(|x| x.as_bool()).unwrap_or(true))
+        if count == 1 && interval_ms == 0 {
+            let ok = v.get("tx_ok").and_then(|x| x.as_bool()).unwrap_or(false);
+            return Ok(if ok { (1, 0) } else { (0, 1) });
+        }
+        Ok((0, 0))
+    }
+
+    /// Next EVT_WIFI_TX: (sent, fail, total, done). total 0 = until-stop mode.
+    pub fn wait_wifi_tx(&mut self) -> Result<(u32, u32, u16, bool)> {
+        let body = self.wait_for_event(protocol::EVT_WIFI_TX)?;
+        let ev: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let sent = ev.get("sent").and_then(|s| s.as_u64()).unwrap_or(0) as u32;
+        let fail = ev.get("fail").and_then(|s| s.as_u64()).unwrap_or(0) as u32;
+        let total = ev.get("total").and_then(|s| s.as_u64()).unwrap_or(0) as u16;
+        let done = ev.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+        Ok((sent, fail, total, done))
     }
 
     /// Transmit a decoded IR code. `repeats` 0 uses the protocol's minimum.
@@ -503,7 +534,7 @@ impl Device {
     }
 
     /// Start the captive portal with SoftAP / content options. Returns the
-    /// device's effective AP identity (`ssid`, `mac`, `channel`, `ip`, …).
+    /// device's effective AP identity (`ssid`, `mac`, `channel`, `ip`, etc).
     /// When `opts.host_content` is true, bodies are streamed from the host via
     /// [`Device::portal_resp_chunk`] after each
     /// [`protocol::EVT_PORTAL_REQUEST`].
