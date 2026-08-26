@@ -1,7 +1,4 @@
 //! 802.11 MAC frame builders (raw TX; the radio appends FCS) and a parser.
-//!
-//! Management frames and injectable control frames: CTS, RTS, BAR, PS-Poll.
-//! ACK needs SIFS timing the host cannot hit, so it stays on raw hex.
 
 use crate::error::{Context, Result};
 
@@ -28,8 +25,16 @@ pub fn parse_mac(s: &str) -> Result<Mac> {
     Ok(mac)
 }
 
-/// Management-frame subtype bitmask values (type is always 00 for these). Use
-/// with `1 << [mgmt_subtype::type]`
+pub mod channel {
+    const MIN: u8 = 1;
+    const MAX: u8 = 14;
+
+    pub fn check_ch(ch: u8) -> bool {
+        (MIN..=MAX).contains(&ch)
+    }
+}
+
+/// Management subtypes (type = 00). Monitor masks: `1 << subtype`.
 pub mod mgmt_subtype {
     pub const ASSOC_REQ: u8 = 0;
     pub const ASSOC_RESP: u8 = 1;
@@ -37,16 +42,28 @@ pub mod mgmt_subtype {
     pub const REASSOC_RESP: u8 = 3;
     pub const PROBE_REQ: u8 = 4;
     pub const PROBE_RESP: u8 = 5;
+    pub const TIMING_ADV: u8 = 6;
+    pub const RESERVED_7: u8 = 7;
     pub const BEACON: u8 = 8;
     pub const ATIM: u8 = 9;
     pub const DISASSOC: u8 = 10;
     pub const AUTH: u8 = 11;
     pub const DEAUTH: u8 = 12;
     pub const ACTION: u8 = 13;
+    pub const ACTION_NO_ACK: u8 = 14;
+    pub const RESERVED_15: u8 = 15;
 }
 
-/// Control-frame subtype values (type is always 01 for these).
+/// Control subtypes (type = 01).
 pub mod ctrl_subtype {
+    pub const RESERVED_0: u8 = 0;
+    pub const RESERVED_1: u8 = 1;
+    pub const TRIGGER: u8 = 2;
+    pub const TACK: u8 = 3;
+    pub const BF_REPORT_POLL: u8 = 4;
+    pub const VHT_NDP_ANNOUNCE: u8 = 5;
+    pub const CONTROL_EXTENSION: u8 = 6;
+    pub const CONTROL_WRAPPER: u8 = 7;
     pub const BAR: u8 = 8;
     pub const BA: u8 = 9;
     pub const PS_POLL: u8 = 10;
@@ -54,14 +71,27 @@ pub mod ctrl_subtype {
     pub const CTS: u8 = 12;
     pub const ACK: u8 = 13;
     pub const CF_END: u8 = 14;
+    pub const CF_END_CF_ACK: u8 = 15;
 }
 
-/// Data-frame subtype values (type is always 10 for these).
+/// Data subtypes (type = 10).
 pub mod data_subtype {
     pub const DATA: u8 = 0;
+    pub const DATA_CF_ACK: u8 = 1;
+    pub const DATA_CF_POLL: u8 = 2;
+    pub const DATA_CF_ACK_CF_POLL: u8 = 3;
     pub const NULL: u8 = 4;
+    pub const CF_ACK: u8 = 5;
+    pub const CF_POLL: u8 = 6;
+    pub const CF_ACK_CF_POLL: u8 = 7;
     pub const QOS_DATA: u8 = 8;
+    pub const QOS_DATA_CF_ACK: u8 = 9;
+    pub const QOS_DATA_CF_POLL: u8 = 10;
+    pub const QOS_DATA_CF_ACK_CF_POLL: u8 = 11;
     pub const QOS_NULL: u8 = 12;
+    pub const RESERVED_13: u8 = 13;
+    pub const QOS_CF_POLL: u8 = 14;
+    pub const QOS_CF_ACK_CF_POLL: u8 = 15;
 }
 
 /// Common EtherType values (carried after an LLC/SNAP header on data frames).
@@ -138,24 +168,32 @@ impl Frame<'_> {
     }
 }
 
-/// Parse the 802.11 MAC header; None if too short. `body` skips the QoS Control
-/// and HT Control fields; 4-address WDS frames are not resolved.
-/// Note that the device filters for bandwidth; this parser validates for
-/// correctness.
+/// Parse the 802.11 MAC header; None if too short.
+///
+/// `body` skips the QoS Control, HT Control, and (when ToDS+FromDS) the 4th
+/// address. Note that the device filters for bandwidth. This parser validates
+/// for correctness.
 pub fn parse_frame(f: &[u8]) -> Option<Frame<'_>> {
     if f.len() < 24 {
         return None;
     }
     let subtype = (f[0] >> 4) & 0xf;
     let ftype = FrameType::from_fc(f[0] >> 2);
+    let to_ds = f[1] & 0x01 != 0;
+    let from_ds = f[1] & 0x02 != 0;
     let qos = ftype == FrameType::Data && subtype & 0x8 != 0;
     let order = f[1] & 0x80 != 0;
-    let hdr = 24 + if qos { 2 } else { 0 } + if qos && order { 4 } else { 0 };
+    let wds = to_ds && from_ds;
+    let hdr =
+        24 + if wds { 6 } else { 0 } + if qos { 2 } else { 0 } + if qos && order { 4 } else { 0 };
+    if f.len() < hdr {
+        return None;
+    }
     Some(Frame {
         ftype,
         subtype,
-        to_ds: f[1] & 0x01 != 0,
-        from_ds: f[1] & 0x02 != 0,
+        to_ds,
+        from_ds,
         protected: f[1] & 0x40 != 0,
         addr1: f[4..10].try_into().ok()?,
         addr2: f[10..16].try_into().ok()?,
@@ -632,7 +670,7 @@ pub struct Mgmt {
 impl Mgmt {
     /// Serialize to wire bytes, without the trailing FCS.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut f = Vec::with_capacity(64);
+        let mut f = Vec::with_capacity(64); // hint; 24 fixed + ~40 body
         f.push(self.body.subtype() << 4); // FC byte 0: version 0, type 00 (mgmt), subtype
         f.push(0x00); // FC byte 1: flags
         f.extend_from_slice(&self.duration.to_le_bytes());
@@ -728,19 +766,21 @@ pub fn assoc_req(ap: Mac, sta: Mac, ssid: &str, ies_extra: Vec<Ie>) -> Mgmt {
     )
 }
 
+const FC_TYPE_MGMT: u8 = 0b00 << 2;
 const FC_TYPE_CTRL: u8 = 0b01 << 2;
+const FC_TYPE_DATA: u8 = 0b10 << 2;
 const BAR_COMPRESSED: u16 = 1 << 2;
 
-/// A control frame; only the injectable subtypes are modeled.
+/// Control frames with fixed layouts. Other subtypes: raw_ctrl / raw_frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ctrl {
-    /// Clear To Send. "CTS-to-self" (`ra` = own MAC) sets every listener's NAV.
+    /// CTS-to-self when `ra` is the transmitter's own MAC.
     Cts { ra: Mac, duration: u16 },
-    /// Request To Send; `duration` sets the NAV. NAV-DoS pair to [`Ctrl::Cts`].
+    /// NAV pair with Cts.
     Rts { ra: Mac, ta: Mac, duration: u16 },
-    /// PS-Poll: poll `bssid` for frames buffered for `ta` (assoc id `aid`).
+    /// Poll `bssid` for frames buffered for `ta` (assoc id `aid`).
     PsPoll { bssid: Mac, ta: Mac, aid: u16 },
-    /// Block Ack Request; `ssn` past the peer's window desyncs its block-ack.
+    /// `ssn` past the peer window desyncs block-ack.
     Bar {
         ra: Mac,
         ta: Mac,
@@ -748,6 +788,10 @@ pub enum Ctrl {
         ssn: u16,
         duration: u16,
     },
+    /// SIFS-timed as a standard peer; host inject is async (RE/fuzz).
+    Ack { ra: Mac },
+    /// Clears NAV after RTS/CTS-style games.
+    CfEnd { ra: Mac, bssid: Mac },
 }
 
 impl Ctrl {
@@ -757,17 +801,23 @@ impl Ctrl {
             Ctrl::PsPoll { .. } => ctrl_subtype::PS_POLL,
             Ctrl::Rts { .. } => ctrl_subtype::RTS,
             Ctrl::Cts { .. } => ctrl_subtype::CTS,
+            Ctrl::Ack { .. } => ctrl_subtype::ACK,
+            Ctrl::CfEnd { .. } => ctrl_subtype::CF_END,
         }
     }
 
-    /// Serialize to wire bytes, without the trailing FCS.
+    /// Wire bytes without FCS.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut f = Vec::with_capacity(24);
-        f.push((self.subtype() << 4) | FC_TYPE_CTRL); // FC byte 0: version 0, type 01 (ctrl), subtype
-        f.push(0x00); // FC byte 1: flags
+        f.push((self.subtype() << 4) | FC_TYPE_CTRL);
+        f.push(0x00);
         match self {
             Ctrl::Cts { ra, duration } => {
                 f.extend_from_slice(&duration.to_le_bytes());
+                f.extend_from_slice(ra);
+            }
+            Ctrl::Ack { ra } => {
+                f.extend_from_slice(&0u16.to_le_bytes());
                 f.extend_from_slice(ra);
             }
             Ctrl::Rts { ra, ta, duration } => {
@@ -776,7 +826,7 @@ impl Ctrl {
                 f.extend_from_slice(ta);
             }
             Ctrl::PsPoll { bssid, ta, aid } => {
-                f.extend_from_slice(&(aid | 0xc000).to_le_bytes()); // AID in the Duration/ID field, top two bits set
+                f.extend_from_slice(&(aid | 0xc000).to_le_bytes());
                 f.extend_from_slice(bssid);
                 f.extend_from_slice(ta);
             }
@@ -793,9 +843,144 @@ impl Ctrl {
                 f.extend_from_slice(&((u16::from(*tid) << 12) | BAR_COMPRESSED).to_le_bytes());
                 f.extend_from_slice(&seq_ctrl_le(*ssn));
             }
+            Ctrl::CfEnd { ra, bssid } => {
+                f.extend_from_slice(&0u16.to_le_bytes());
+                f.extend_from_slice(ra);
+                f.extend_from_slice(bssid);
+            }
         }
         f
     }
+}
+
+/// 3-address data frame. QoS Control included when `subtype & 0x8 != 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Data {
+    pub subtype: u8,
+    pub to_ds: bool,
+    pub from_ds: bool,
+    pub protected: bool,
+    pub power_mgmt: bool,
+    pub duration: u16,
+    pub seq: u16,
+    pub addr1: Mac,
+    pub addr2: Mac,
+    pub addr3: Mac,
+    pub qos_control: u16,
+    pub payload: Vec<u8>,
+}
+
+impl Data {
+    fn fc1(&self) -> u8 {
+        let mut f = 0u8;
+        if self.to_ds {
+            f |= 0x01;
+        }
+        if self.from_ds {
+            f |= 0x02;
+        }
+        if self.power_mgmt {
+            f |= 0x10;
+        }
+        if self.protected {
+            f |= 0x40;
+        }
+        f
+    }
+
+    /// Wire bytes without FCS.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let qos = self.subtype & 0x8 != 0;
+        let mut f = Vec::with_capacity(30 + self.payload.len());
+        f.push((self.subtype << 4) | FC_TYPE_DATA);
+        f.push(self.fc1());
+        f.extend_from_slice(&self.duration.to_le_bytes());
+        f.extend_from_slice(&self.addr1);
+        f.extend_from_slice(&self.addr2);
+        f.extend_from_slice(&self.addr3);
+        f.extend_from_slice(&seq_ctrl_le(self.seq));
+        if qos {
+            f.extend_from_slice(&self.qos_control.to_le_bytes());
+        }
+        f.extend_from_slice(&self.payload);
+        f
+    }
+}
+
+fn data_base(subtype: u8, addr1: Mac, addr2: Mac, addr3: Mac, to_ds: bool, from_ds: bool) -> Data {
+    Data {
+        subtype,
+        to_ds,
+        from_ds,
+        protected: false,
+        power_mgmt: false,
+        duration: 0,
+        seq: 0,
+        addr1,
+        addr2,
+        addr3,
+        qos_control: 0,
+        payload: Vec::new(),
+    }
+}
+
+/// Null, STA -> AP (ToDS=1).
+pub fn null_to_ap(ap: Mac, sta: Mac) -> Data {
+    data_base(data_subtype::NULL, ap, sta, ap, true, false)
+}
+
+/// QoS Null, STA -> AP; `tid` in low 4 bits of QoS Control.
+pub fn qos_null_to_ap(ap: Mac, sta: Mac, tid: u8) -> Data {
+    let mut d = data_base(data_subtype::QOS_NULL, ap, sta, ap, true, false);
+    d.qos_control = u16::from(tid & 0x0f);
+    d
+}
+
+/// Data, STA -> AP; `payload` is the MSDU.
+pub fn data_to_ap(ap: Mac, sta: Mac, payload: Vec<u8>) -> Data {
+    let mut d = data_base(data_subtype::DATA, ap, sta, ap, true, false);
+    d.payload = payload;
+    d
+}
+
+/// QoS Data, STA -> AP.
+pub fn qos_data_to_ap(ap: Mac, sta: Mac, tid: u8, payload: Vec<u8>) -> Data {
+    let mut d = data_base(data_subtype::QOS_DATA, ap, sta, ap, true, false);
+    d.qos_control = u16::from(tid & 0x0f);
+    d.payload = payload;
+    d
+}
+
+/// Mgmt with arbitrary subtype/body (duration and seq = 0).
+pub fn raw_mgmt(subtype: u8, addr1: Mac, addr2: Mac, addr3: Mac, body: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(24 + body.len());
+    f.push(((subtype & 0x0f) << 4) | FC_TYPE_MGMT);
+    f.push(0x00);
+    f.extend_from_slice(&0u16.to_le_bytes());
+    f.extend_from_slice(&addr1);
+    f.extend_from_slice(&addr2);
+    f.extend_from_slice(&addr3);
+    f.extend_from_slice(&seq_ctrl_le(0));
+    f.extend_from_slice(body);
+    f
+}
+
+/// Ctrl FC + `after_fc` (Duration/ID and addresses as needed).
+pub fn raw_ctrl(subtype: u8, after_fc: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(2 + after_fc.len());
+    f.push(((subtype & 0x0f) << 4) | FC_TYPE_CTRL);
+    f.push(0x00);
+    f.extend_from_slice(after_fc);
+    f
+}
+
+/// Fully raw MPDU: fc0, fc1, rest (no FCS).
+pub fn raw_frame(fc0: u8, fc1: u8, rest: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(2 + rest.len());
+    f.push(fc0);
+    f.push(fc1);
+    f.extend_from_slice(rest);
+    f
 }
 
 #[cfg(test)]
@@ -995,5 +1180,63 @@ mod tests {
         assert_eq!(&f[10..16], &AP);
         assert_eq!(&f[16..18], &[0x04, 0x00]);
         assert_eq!(&f[18..20], &(100u16 << 4).to_le_bytes());
+    }
+
+    #[test]
+    fn ack_wire_layout() {
+        let f = Ctrl::Ack { ra: STA }.to_bytes();
+        assert_eq!(f.len(), 10);
+        assert_eq!(&f[0..2], &[0xd4, 0x00]);
+        assert_eq!(&f[2..4], &[0, 0]);
+        assert_eq!(&f[4..10], &STA);
+    }
+
+    #[test]
+    fn null_to_ap_wire_layout() {
+        let f = null_to_ap(AP, STA).to_bytes();
+        assert_eq!(f.len(), 24);
+        assert_eq!(f[0] >> 4, data_subtype::NULL);
+        assert_eq!(f[0] & 0x0c, FC_TYPE_DATA);
+        assert_eq!(f[1] & 0x03, 0x01); // ToDS
+        assert_eq!(&f[4..10], &AP);
+        assert_eq!(&f[10..16], &STA);
+        assert_eq!(&f[16..22], &AP);
+    }
+
+    #[test]
+    fn qos_null_includes_qos_control() {
+        let f = qos_null_to_ap(AP, STA, 5).to_bytes();
+        assert_eq!(f.len(), 26);
+        assert_eq!(f[0] >> 4, data_subtype::QOS_NULL);
+        assert_eq!(&f[24..26], &5u16.to_le_bytes());
+    }
+
+    #[test]
+    fn data_to_ap_appends_payload() {
+        let f = data_to_ap(AP, STA, vec![0xaa, 0xbb]).to_bytes();
+        assert_eq!(f.len(), 26);
+        assert_eq!(f[0] >> 4, data_subtype::DATA);
+        assert_eq!(&f[24..26], &[0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn raw_mgmt_matches_deauth_layout() {
+        let typed = deauth(AP, STA, 7).to_bytes();
+        let raw = raw_mgmt(mgmt_subtype::DEAUTH, STA, AP, AP, &7u16.to_le_bytes());
+        assert_eq!(raw, typed);
+    }
+
+    #[test]
+    fn raw_ctrl_ack_matches_typed() {
+        let typed = Ctrl::Ack { ra: STA }.to_bytes();
+        let mut after = Vec::new();
+        after.extend_from_slice(&0u16.to_le_bytes());
+        after.extend_from_slice(&STA);
+        assert_eq!(raw_ctrl(ctrl_subtype::ACK, &after), typed);
+    }
+
+    #[test]
+    fn raw_frame_prefixes_fc() {
+        assert_eq!(raw_frame(0xd4, 0x00, &[1, 2, 3]), vec![0xd4, 0x00, 1, 2, 3]);
     }
 }
