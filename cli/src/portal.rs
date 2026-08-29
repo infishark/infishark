@@ -8,6 +8,7 @@ use infishark::protocol;
 use infishark::{Device, PortalOpts};
 
 pub fn run(mut dev: Device, dir: Option<PathBuf>, opts: PortalOpts) -> Result<()> {
+    dev.set_read_timeout(std::time::Duration::from_millis(300))?;
     let root = if let Some(dir) = dir {
         let root = dir
             .canonicalize()
