@@ -1,8 +1,6 @@
 #!/usr/bin/env sh
 
-# infishark CLI installer for Linux and macOS. Prefers a prebuilt version from GitHub Releases. Otherwise, builds from source with the local Rust toolchain. 
-#
-# Install root: ~/.local/bin (or, you can override with INFISHARK_BIN_DIR).
+# infishark CLI installer for Linux and macOS. Prefers a prebuilt version from GitHub Releases. Otherwise, builds from source with the local Rust toolchain.
 #
 # curl -fsSL https://cdn.infishark.com/install.sh | sh
 
@@ -20,6 +18,68 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 assert_bin() {
     [ -f "$1" ] || die "Expected binary missing: $1"
     [ -s "$1" ] || die "Expected binary is empty: $1"
+}
+
+sys_dir() {
+    if [ "$os" = "Darwin" ]; then
+        # /usr/bin is SIP-protected on macOS.
+        printf '%s' /usr/local/bin
+    else
+        printf '%s' /usr/bin
+    fi
+}
+
+system_link() {
+    sysdir="$(sys_dir)"
+    sysout="$sysdir/$BIN"
+    case "$DEST" in
+        "$sysdir"|/usr/bin|/usr/local/bin|/bin) return ;;
+    esac
+    if [ -L "$sysout" ]; then
+        existing="$(readlink "$sysout" 2>/dev/null || true)"
+        if [ "$existing" = "$OUT" ]; then
+            say "System link already present: $sysout -> $OUT"
+            return
+        fi
+    fi
+    case "${INFISHARK_SYSTEM_LINK:-}" in
+        0|false|no|N|n) return ;;
+        1|true|yes|Y|y) ;;
+        *)
+            say "Recommended: link $BIN into $sysdir so sudo $BIN works (sudo ignores ~/.local/bin)."
+            ans=
+            if [ -e /dev/tty ] && printf 'Create %s -> %s? [Y/n] ' "$sysout" "$OUT" >/dev/tty 2>/dev/null; then
+                IFS= read -r ans </dev/tty || ans=
+            else
+                warn "No TTY; skipping system link. Re-run with INFISHARK_SYSTEM_LINK=1 or: sudo ln -sfn \"$OUT\" \"$sysout\""
+                return
+            fi
+            case "$ans" in
+                ''|Y|y|yes|YES|Yes) ;;
+                *)
+                    warn "Skipped. You can add it later with: sudo ln -sfn \"$OUT\" \"$sysout\""
+                    return
+                    ;;
+            esac
+            ;;
+    esac
+    if [ -e "$sysout" ] && [ ! -L "$sysout" ]; then
+        warn "$sysout already exists and is not a symlink; not overwriting"
+        return
+    fi
+    say "Linking $sysout -> $OUT"
+    if [ "$(id -u)" -eq 0 ]; then
+        mkdir -p "$sysdir"
+        ln -sfn "$OUT" "$sysout"
+    else
+        command -v sudo >/dev/null 2>&1 || {
+            warn "sudo not found; create the link yourself: ln -sfn \"$OUT\" \"$sysout\""
+            return
+        }
+        sudo mkdir -p "$sysdir"
+        sudo ln -sfn "$OUT" "$sysout"
+    fi
+    say "Linked $sysout -> $OUT"
 }
 
 os="$(uname -s)"
@@ -77,4 +137,5 @@ case ":$PATH:" in
     *":$DEST:"*) ;;
     *) warn "$DEST is not on your PATH. Add it: export PATH=\"$DEST:\$PATH\"" ;;
 esac
+system_link
 say "Done. Run: $BIN ports"
