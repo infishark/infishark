@@ -1,6 +1,6 @@
-//! run the device as a USB Wi-Fi adapter. The device joins a saved network and NAPTs the host's IP
-//! traffic over a SLIP tunnel on the USB serial link. Currently, it is only implemented for Linux.
-//! Other OSes are planned.
+//! run the device as a USB Wi-Fi adapter. The device joins a saved network and
+//! NAPTs the host's IP traffic over a SLIP tunnel on the USB serial link.
+//! Currently, it is only implemented for Linux. Other OSes are planned.
 
 use anyhow::Result;
 use infishark::{AdapterConfig, AdapterTarget, Device};
@@ -56,8 +56,8 @@ fn slip_encode(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Incremental SLIP decoder: bytes arrive split across serial reads, so state (partial frame +
-/// pending escape) persists between feeds.
+/// Incremental SLIP decoder: bytes arrive split across serial reads, so state
+/// (partial frame + pending escape) persists between feeds.
 struct SlipDecoder {
     buf: Vec<u8>,
     esc: bool,
@@ -221,7 +221,8 @@ mod linux {
 
         install_sigint();
 
-        // Serial writer is shared (tun pump, Ctrl-C stop, OLED toggle); the mutex keeps SLIP frames from interleaving on the wire.
+        // Serial writer is shared (tun pump, Ctrl-C stop, OLED toggle); the mutex keeps
+        // SLIP frames from interleaving on the wire.
         let reader = port.try_clone().context("cloning serial port")?;
         let writer = Arc::new(Mutex::new(port));
 
@@ -296,7 +297,6 @@ mod linux {
         mut reader: Box<dyn SerialPort>,
         mut tun: std::fs::File,
     ) -> std::thread::JoinHandle<()> {
-        // Short read timeout so the loop can notice a Ctrl-C between frames.
         let _ = reader.set_timeout(Duration::from_millis(250));
         std::thread::spawn(move || {
             let mut dec = SlipDecoder::new();
@@ -373,8 +373,8 @@ mod linux {
         }
     }
 
-    // Put stdin into cbreak mode (single keypresses, no echo) but keep ISIG so our Ctrl-C still
-    // works.
+    // Put stdin into cbreak mode (single keypresses, no echo) but keep ISIG so our
+    // Ctrl-C still works.
     fn enable_raw_stdin() -> Option<libc::termios> {
         unsafe {
             let mut orig: libc::termios = std::mem::zeroed();
@@ -413,7 +413,9 @@ mod linux {
         )
     }
 
-    // Clamp advertised TCP MSS on SYNs leaving the tunnel; otherwise PMTUD blackholes silently drop oversized packets. Applied on the interface, independent of routes.
+    // Clamp advertised TCP MSS on SYNs leaving the tunnel; otherwise PMTUD
+    // blackholes silently drop oversized packets. Applied on the interface,
+    // independent of routes.
     fn mss_clamp_args<'a>(op: &'a str, ifname: &'a str, mss: &'a str) -> [&'a str; 15] {
         [
             "-t",
