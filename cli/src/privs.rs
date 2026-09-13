@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 /// Fail with a copy-pasteable `sudo /path/to/infishark...` when not root.
 pub fn require_root(feature: &str) -> Result<()> {
@@ -15,7 +15,7 @@ pub fn require_root(feature: &str) -> Result<()> {
                 .unwrap_or_else(|_| "infishark".into());
             let mut parts = vec![exe];
             parts.extend(std::env::args().skip(1));
-            bail!(
+            anyhow::bail!(
                 "{feature} needs root.\n\
                  This install is not on root's PATH; use:\n\
                    sudo {}",
@@ -113,11 +113,29 @@ mod tests {
 
     #[test]
     fn shell_quote_path_with_spaces() {
-        let p = "/home/user/documents/space space space/documents documents/ASCII char";
-        assert_eq!(shell_quote(p), "'/home/r00t/docs/shell direCtory'");
+        let p = "/home/user/my tools/infishark";
+        assert_eq!(shell_quote(p), "'/home/user/my tools/infishark'");
         assert_eq!(
             shell_join(&[p.into(), "wifi".into(), "adapter".into()]),
-            "'/home/1337/.local/bin/infishark' wifi adapter"
+            "'/home/user/my tools/infishark' wifi adapter"
         );
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quote() {
+        // The POSIX '\'' dance: close the quote, emit an escaped one, reopen.
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+    }
+
+    #[test]
+    fn shell_quote_leaves_plain_tokens_bare() {
+        assert_eq!(shell_quote("adapter"), "adapter");
+        assert_eq!(shell_quote("--ssid"), "--ssid");
+    }
+
+    #[test]
+    fn shell_quote_wraps_the_empty_token() {
+        // Without quoting, an empty arg would vanish from the pasted command.
+        assert_eq!(shell_quote(""), "''");
     }
 }

@@ -248,22 +248,11 @@ impl Shell {
             .last()
             .map(|t| matches!(t, "--help" | "-h" | "help"))
             .unwrap_or(false);
-        // Pipes/redirects and root commands run through the system shell.
-        if !is_help {
-            let sudo = needs_sudo(line);
-            let piped = line.contains(['|', '>', '<']);
-            if sudo && piped {
-                eprintln!("a root command can't be piped");
-                return;
-            }
-            if piped {
-                self.run_external(line, false);
-                return;
-            }
-            if sudo {
-                self.run_external(line, true);
-                return;
-            }
+        // Pipes/redirects run through the system shell. Root-only commands run
+        // in-process; privs::require_root prints a pasteable sudo line if needed.
+        if !is_help && line.contains(['|', '>', '<']) {
+            self.run_external(line);
+            return;
         }
 
         let Some(toks) = shlex::split(line) else {
@@ -321,8 +310,8 @@ impl Shell {
         }
     }
 
-    // Re-run through the system shell so pipes work and sudo can prompt.
-    fn run_external(&self, line: &str, sudo: bool) {
+    // Re-run through the system shell so pipes and redirects work.
+    fn run_external(&self, line: &str) {
         let Ok(exe) = std::env::current_exe() else {
             eprintln!("cannot locate the infishark binary");
             return;
