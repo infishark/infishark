@@ -1,7 +1,7 @@
 //! Device-side capture filter: only wanted frames cross the serial link.
 
 use crate::hex;
-use crate::ieee80211::{FrameType, Mac, mgmt_subtype};
+use crate::ieee80211::{FrameType, Mac, ethertype, mgmt_subtype};
 use crate::json::insert_opt;
 use serde_json::json;
 
@@ -65,11 +65,24 @@ impl MonitorFilter {
         }
     }
 
+    /// DATA frames with EtherType 0x888e (EAPOL). Forces cleartext-only so the
+    /// device early-filter can drop encrypted data before it fills the ring
+    /// without this, a busy 2.4 GHz channel loses M1-M4 to ring overflow.
     pub fn eapol() -> Self {
         Self {
             types: FrameType::Data.bit(),
-            ethertype: Some(0x888e),
+            ethertype: Some(ethertype::EAPOL),
+            protected: Some(false),
             ..Self::all()
+        }
+    }
+
+    /// EAPOL for one BSSID (addr1/2/3 match). Used by handshake capture so only
+    /// the target AP's 4-way crosses the serial link.
+    pub fn eapol_for(bssid: Mac) -> Self {
+        Self {
+            addr: Some(bssid),
+            ..Self::eapol()
         }
     }
 
@@ -154,7 +167,17 @@ mod tests {
         let f = MonitorFilter::eapol();
         assert_eq!(f.types, FrameType::Data.bit());
         assert_eq!(f.ethertype, Some(0x888e));
+        assert_eq!(f.protected, Some(false));
         assert_eq!(f.mgmt_subtypes, 0);
+    }
+
+    #[test]
+    fn eapol_for_locks_bssid() {
+        let bssid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let f = MonitorFilter::eapol_for(bssid);
+        assert_eq!(f.addr, Some(bssid));
+        assert_eq!(f.ethertype, Some(0x888e));
+        assert_eq!(f.protected, Some(false));
     }
 
     #[test]
