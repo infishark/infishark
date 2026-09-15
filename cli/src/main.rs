@@ -14,6 +14,7 @@ mod recon;
 mod shell;
 mod signals;
 mod target;
+mod tx;
 mod ui;
 
 use std::io::Write;
@@ -373,21 +374,62 @@ enum WifiCmd {
         #[arg(long)]
         out: Option<String>,
     },
-    /// Inject a raw 802.11 frame (hex, no FCS), optionally repeated as a burst.
+    /// Inject an 802.11 frame (named template or --hex), optionally as a burst.
     Tx {
-        /// The full 802.11 MAC frame as hex, no FCS (the radio appends it).
-        #[arg(long)]
-        hex: String,
-        /// Channel to transmit on (1-14; 0 = leave the device's current
-        /// channel).
+        /// Named template. Omit when using --hex.
+        #[arg(value_enum, value_name = "TEMPLATE", required_unless_present = "hex")]
+        template: Option<tx::Template>,
+        /// Full MAC frame as hex, no FCS (the radio appends it).
+        #[arg(long, conflicts_with = "template")]
+        hex: Option<String>,
+        /// Channel (1-14). 0 = device current, or AP channel after a scan pick.
+        /// Beacon: 0 = channel 6 when synthesizing.
         #[arg(long, default_value_t = 0)]
         channel: u8,
-        /// Transmit the frame this many times in one on-device burst.
+        /// TX attempts per target (0 = until Ctrl-C). Runs on-device.
         #[arg(long, default_value_t = 1)]
         count: u16,
-        /// Delay between transmits in ms.
+        /// Gap between on-device TX attempts in ms (not 802.11 Duration/ID).
         #[arg(long, default_value_t = 0)]
         interval_ms: u16,
+        /// AP MAC (alias of --bssid). If omitted for AP-required templates,
+        /// scan + pick. Beacon: omitted = local BSSID (no scan).
+        #[arg(long)]
+        ap: Option<String>,
+        /// AP BSSID (needs --channel when set without a scan).
+        #[arg(long)]
+        bssid: Option<String>,
+        /// Scan filter for AP-required templates. Beacon/probe-req: the
+        /// advertised or probed SSID (no scan).
+        #[arg(long)]
+        ssid: Option<String>,
+        /// Station MAC (default: broadcast on deauth/disassoc).
+        #[arg(long)]
+        sta: Option<String>,
+        /// Receiver address (control templates).
+        #[arg(long)]
+        ra: Option<String>,
+        /// Transmitter address (rts/bar/ps-poll; default AP when applicable).
+        #[arg(long)]
+        ta: Option<String>,
+        /// 802.11 reason code (deauth/disassoc).
+        #[arg(long, default_value_t = 7)]
+        reason: u16,
+        /// Duration/ID (rts/cts/bar).
+        #[arg(long, default_value_t = 0)]
+        duration: u16,
+        /// Association id (ps-poll).
+        #[arg(long, default_value_t = 1)]
+        aid: u16,
+        /// TID (qos-null, qos-data, bar).
+        #[arg(long, default_value_t = 0)]
+        tid: u8,
+        /// Starting sequence number (bar).
+        #[arg(long, default_value_t = 0)]
+        ssn: u16,
+        /// MSDU payload hex (data / qos-data).
+        #[arg(long)]
+        payload: Option<String>,
     },
     /// Deauth an AP's clients until Ctrl-C; picker or --ssid/--bssid.
     Deauth {
@@ -898,9 +940,6 @@ enum GattCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Some(code) = maybe_reexec_root(&cli) {
-        return code;
-    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1504,6 +1543,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             return Ok(());
         }
         return print_networks(&nets, cli.json);
+    }
     // TUN needs root; fail before opening the device or picking a network.
     if matches!(action, WifiCmd::Adapter { .. }) {
         privs::require_root("wifi adapter")?;
@@ -1527,6 +1567,12 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
         WifiCmd::Adapter { .. } => cli.timeout_ms.max(30_000),
         // Deauth runs until Ctrl-C; keep the read ceiling high like Monitor.
         WifiCmd::Deauth { .. } => cli.timeout_ms.max(3_600_000),
+        WifiCmd::Tx { count, .. } if *count != 1 => cli.timeout_ms.max(3_600_000),
+        WifiCmd::Tx {
+            template: Some(_),
+            hex: None,
+            ..
+        } => cli.timeout_ms.max(15_000),
         // Handshake blocks on next_wifi_frame until crackable/timeout/Ctrl-C.
         WifiCmd::Handshake { .. } => cli.timeout_ms.max(3_600_000),
         // Host-streamed portal waits on phone GETs between serial timeouts.
@@ -1681,28 +1727,64 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             stream_wifi_monitor(&mut dev, &mut w)
         }
         WifiCmd::Tx {
+            template,
             hex,
             channel,
             count,
             interval_ms,
+            ap,
+            bssid,
+            ssid,
+            sta,
+            ra,
+            ta,
+            reason,
+            duration,
+            aid,
+            tid,
+            ssn,
+            payload,
         } => {
-            let frame = infishark::hex::decode(hex)?;
-            let n = (*count).max(1);
-            let mut ok = 0u32;
-            for i in 0..n {
-                if dev.wifi_raw_tx(&frame, *channel)? {
-                    ok += 1;
-                }
-                if *interval_ms > 0 && i + 1 < n {
-                    std::thread::sleep(std::time::Duration::from_millis(*interval_ms as u64));
-                }
-            }
-            dev.stop_current_task()?; // stop the TX so the device returns to normal operation
-            print_action(
-                serde_json::json!({ "tx_ok": ok, "tx_fail": n as u32 - ok }),
-                format!("Transmitted {ok}/{n} frame(s)."),
+            let v = tx::run(
+                &mut dev,
+                &tx::Opts {
+                    template: *template,
+                    hex: hex.clone(),
+                    channel: *channel,
+                    count: *count,
+                    interval_ms: *interval_ms,
+                    ap: ap.clone(),
+                    bssid: bssid.clone(),
+                    ssid: ssid.clone(),
+                    sta: sta.clone(),
+                    ra: ra.clone(),
+                    ta: ta.clone(),
+                    reason: *reason,
+                    duration: *duration,
+                    aid: *aid,
+                    tid: *tid,
+                    ssn: *ssn,
+                    payload: payload.clone(),
+                },
+                oui_db,
                 cli.json,
-            )
+            )?;
+            let ok = v.get("tx_ok").and_then(|x| x.as_u64()).unwrap_or(0);
+            let fail = v.get("tx_fail").and_then(|x| x.as_u64()).unwrap_or(0);
+            let total = v.get("total").and_then(|x| x.as_u64());
+            let stopped = v.get("stopped").and_then(|x| x.as_bool()).unwrap_or(false);
+            let msg = if stopped {
+                match total {
+                    Some(0) | None => format!("Stopped: sent {ok}, fail {fail}."),
+                    Some(t) => format!("Stopped: sent {ok}, fail {fail} (of {t})."),
+                }
+            } else {
+                match total {
+                    Some(0) | None => format!("Transmitted {ok} frame(s) (fail {fail})."),
+                    Some(t) => format!("Transmitted {ok}/{t} frame(s) (fail {fail})."),
+                }
+            };
+            print_action(v, msg, cli.json)
         }
         WifiCmd::Deauth {
             ssid,

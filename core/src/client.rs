@@ -1,5 +1,7 @@
 //! High-level device facade. Typed client over the framed transport
 
+use std::time::{Duration, Instant};
+
 use crate::error::{Error, Result};
 use serialport::SerialPort;
 
@@ -55,21 +57,30 @@ impl Device {
 
     /// Run a Wi-Fi scan, aggregating streamed sightings by BSSID (latest wins).
     pub fn wifi_scan(&mut self, opts: &WifiScanOpts) -> Result<Vec<Network>> {
+        let _ = self.stop_current_task();
+        let _ = self.transport.drain_events();
         self.command_ok_local(protocol::CMD_WIFI_SCAN, &opts.to_json())?;
+        let _ = self.transport.drain_events();
         let mut nets: std::collections::BTreeMap<String, Network> =
             std::collections::BTreeMap::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let (id, payload) = self.transport.next_event()?;
-            match id {
-                protocol::EVT_WIFI_DEVICE => {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match self.transport.next_event() {
+                Ok((protocol::EVT_WIFI_DEVICE, payload)) => {
                     if let Ok(n) = serde_json::from_slice::<Network>(&payload) {
                         nets.insert(n.bssid.clone(), n);
                     }
                 }
-                protocol::EVT_SCAN_DONE => break,
-                _ => {}
+                Ok((protocol::EVT_SCAN_DONE, _)) => break,
+                Ok(_) => {}
+                Err(Error::Timeout) => continue,
+                Err(e) => return Err(e),
             }
         }
+        let _ = self.stop_current_task();
         Ok(nets.into_values().collect())
     }
 
@@ -151,6 +162,7 @@ impl Device {
             params["ssid"] = ssid.into();
             params["pass"] = pass.into();
         }
+        let _ = self.stop_current_task();
         self.command_ok(protocol::CMD_WIFI_RAW_MONITOR, &params)
     }
 
@@ -165,6 +177,7 @@ impl Device {
         let mut params = filter.to_json();
         params["channel"] = channel.into();
         params["index"] = saved_index.into();
+        let _ = self.stop_current_task();
         self.command_ok(protocol::CMD_WIFI_RAW_MONITOR, &params)
     }
 
@@ -205,6 +218,16 @@ impl Device {
         count: u16,
         interval_ms: u16,
     ) -> Result<(u32, u32)> {
+        if frame.is_empty() {
+            return Err(Error::msg("empty 802.11 frame"));
+        }
+        if 5 + frame.len() > protocol::MAX_PAYLOAD {
+            return Err(Error::msg(format!(
+                "802.11 frame too long ({} bytes, max {})",
+                frame.len(),
+                protocol::MAX_PAYLOAD - 5
+            )));
+        }
         let mut args = Vec::with_capacity(5 + frame.len());
         args.push(channel);
         args.extend_from_slice(&count.to_le_bytes());
@@ -221,7 +244,10 @@ impl Device {
     /// Next EVT_WIFI_TX: (sent, fail, total, done). total 0 = until-stop mode.
     pub fn wait_wifi_tx(&mut self) -> Result<(u32, u32, u16, bool)> {
         let body = self.wait_for_event(protocol::EVT_WIFI_TX)?;
-        let ev: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let ev: serde_json::Value = serde_json::from_slice(&body)?;
+        if ev.get("sent").is_none() && ev.get("fail").is_none() && ev.get("done").is_none() {
+            return Err(Error::msg("EVT_WIFI_TX missing fields"));
+        }
         let sent = ev.get("sent").and_then(|s| s.as_u64()).unwrap_or(0) as u32;
         let fail = ev.get("fail").and_then(|s| s.as_u64()).unwrap_or(0) as u32;
         let total = ev.get("total").and_then(|s| s.as_u64()).unwrap_or(0) as u16;
