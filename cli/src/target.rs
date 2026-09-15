@@ -77,7 +77,7 @@ fn net_to_target(n: &Network) -> Option<Target> {
     };
     Some(Target {
         bssid: ieee80211::parse_mac(&n.bssid).ok()?,
-        channel: u8::try_from(n.channel).ok()?,
+        channel: ieee80211::channel::check_ch(n.channel).then_some(n.channel)?,
         ssid: n.ssid.clone(),
         rsn,
         label: if n.ssid.is_empty() {

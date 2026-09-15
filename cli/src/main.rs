@@ -16,6 +16,7 @@ mod signals;
 mod target;
 mod tx;
 mod ui;
+mod wifi_analysis;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -245,9 +246,36 @@ enum WifiCmd {
         /// Only report this BSSID (AA:BB:CC:DD:EE:FF).
         #[arg(long)]
         bssid: Option<String>,
+        /// Extra columns (ciphers, bandwidth, secondary, country, risk flags).
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Print the last Wi-Fi scan results.
-    List,
+    List {
+        /// Extra columns (ciphers, bandwidth, secondary, country, risk flags).
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+    /// Show full detail for one AP from the last scan (#, SSID, or BSSID).
+    Show {
+        /// Scan table row #, SSID, or BSSID.
+        target: String,
+    },
+    /// Deep recon: lock an AP's channel and summarize clients / probes /
+    /// airtime.
+    Recon {
+        /// Scan table row #, SSID, or BSSID (omit to pick interactively).
+        target: Option<String>,
+        /// Target AP by SSID (strongest BSSID if several).
+        #[arg(long)]
+        ssid: Option<String>,
+        /// Target AP by BSSID.
+        #[arg(long, conflicts_with = "ssid")]
+        bssid: Option<String>,
+        /// Seconds to dwell (0 = until Ctrl-C). Default 15.
+        #[arg(long, short = 't', default_value_t = 15)]
+        seconds: u64,
+    },
     /// Manage the networks saved on the device (used by Connect, the adapter,
     /// OTA updates, and more).
     Saved {
@@ -481,11 +509,12 @@ enum WifiCmd {
         /// Keep collecting after the first crackable capture.
         #[arg(long)]
         continuous: bool,
-        /// Deauth frames per burst.
-        #[arg(long, default_value_t = 2)]
+        /// Deauth frames per burst (cold start uses at least 5).
+        #[arg(long, default_value_t = 5)]
         deauth_count: u32,
-        /// Delay between deauth bursts in ms.
-        #[arg(long, default_value_t = 5000)]
+        /// Delay between deauth bursts in ms (also floors the post-burst
+        /// quiet).
+        #[arg(long, default_value_t = 2000)]
         deauth_interval: u64,
         /// PMKID solicitation attempts.
         #[arg(long, default_value_t = 5)]
@@ -610,7 +639,8 @@ enum BleCmd {
         /// Which PHYs to scan: 1m (fast), coded (long range), or all (default).
         #[arg(long, value_enum)]
         phy: Option<ScanPhy>,
-        /// Passive scan: listen only, no scan-response payloads.
+        /// Passive scan: listen only (no SCAN_REQ / scan-response names).
+        /// Default is active so local names can appear.
         #[arg(long)]
         passive: bool,
         /// Scan interval in milliseconds (how often a listen window starts).
@@ -864,7 +894,9 @@ enum GattCmd {
     Connect {
         /// Target address, e.g. AA:BB:CC:DD:EE:FF.
         address: Option<String>,
-        /// Address type: 0=public, 1=random.
+        /// Address type: 0=public, 1=random. Prefer the type from `ble scan`
+        /// (interactive pick uses it). Wrong type is a common cause of
+        /// connect timeout / HCI 0x3E.
         #[arg(long, default_value_t = 0)]
         addr_type: u8,
         /// BLE connection-attempt timeout in ms (distinct from the global
@@ -1480,7 +1512,7 @@ fn cmd_ir_rx(
     // Short reads so Ctrl-C is noticed between captures.
     dev.set_read_timeout(Duration::from_millis(300))?;
     if !cli.json {
-        eprintln!("Listening for IR… (Ctrl-C to stop)");
+        eprintln!("Listening for IR... (Ctrl-C to stop)");
         ui::ir_header(verbose);
     }
     let mut caps: Vec<IrCapture> = Vec::new();
@@ -1536,13 +1568,25 @@ fn cmd_ir_rx(
 }
 
 fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
-    if let WifiCmd::List = action {
+    if let WifiCmd::List { verbose } = action {
         let nets = LAST_WIFI.lock().unwrap().clone();
         if nets.is_empty() && !cli.json {
             println!("no cached scan; run `wifi scan` first");
             return Ok(());
         }
-        return print_networks(&nets, cli.json);
+        return print_networks(&nets, cli.json, *verbose);
+    }
+    if let WifiCmd::Show { target } = action {
+        let nets = LAST_WIFI.lock().unwrap().clone();
+        if nets.is_empty() {
+            bail!("no cached scan; run `wifi scan` first");
+        }
+        let n = recon::resolve_from_cache(&nets, Some(target), None, None)?;
+        if cli.json {
+            return print_value(&serde_json::to_value(&n)?, true);
+        }
+        ui::network_detail(&n);
+        return Ok(());
     }
     // TUN needs root; fail before opening the device or picking a network.
     if matches!(action, WifiCmd::Adapter { .. }) {
@@ -1554,6 +1598,14 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
         WifiCmd::Monitor { .. } => cli.timeout_ms.max(3_600_000),
         // A full scan sweeps every channel; wait for the device's SCAN_DONE.
         WifiCmd::Scan { .. } => cli.timeout_ms.max(15_000),
+        // Recon dwells on one channel; size the ceiling to the dwell + margin.
+        WifiCmd::Recon { seconds, .. } => {
+            if *seconds == 0 {
+                cli.timeout_ms.max(3_600_000)
+            } else {
+                cli.timeout_ms.max(seconds * 1000 + 10_000)
+            }
+        }
         // Interactive add scans first; size the read wait to the scan duration.
         WifiCmd::Saved {
             action:
@@ -1567,6 +1619,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
         WifiCmd::Adapter { .. } => cli.timeout_ms.max(30_000),
         // Deauth runs until Ctrl-C; keep the read ceiling high like Monitor.
         WifiCmd::Deauth { .. } => cli.timeout_ms.max(3_600_000),
+        // Named tx may scan; multi/continuous burst needs a long read ceiling.
         WifiCmd::Tx { count, .. } if *count != 1 => cli.timeout_ms.max(3_600_000),
         WifiCmd::Tx {
             template: Some(_),
@@ -1588,6 +1641,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             no_hidden,
             ssid,
             bssid,
+            verbose,
         } => {
             let opts = WifiScanOpts {
                 active: *active,
@@ -1603,10 +1657,50 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             let mut nets = nets?;
             enrich_wifi(oui_db, &mut nets);
             *LAST_WIFI.lock().unwrap() = nets.clone();
-            print_networks(&nets, cli.json)
+            print_networks(&nets, cli.json, *verbose)
         }
-        WifiCmd::List => unreachable!("served from cache before the device opens"),
-        WifiCmd::Saved { action } => cmd_wifi_saved(&mut dev, cli, action),
+        WifiCmd::List { .. } | WifiCmd::Show { .. } => {
+            unreachable!("served from cache before the device opens")
+        }
+        WifiCmd::Recon {
+            target,
+            ssid,
+            bssid,
+            seconds,
+        } => {
+            // Prefer last scan; otherwise scan. No target/ssid/bssid: interactive picker.
+            let mut nets = LAST_WIFI.lock().unwrap().clone();
+            let interactive = target.is_none() && ssid.is_none() && bssid.is_none();
+            if nets.is_empty() {
+                let opts = WifiScanOpts {
+                    active: false,
+                    dwell_ms: None,
+                    channel: None,
+                    hide_hidden: false,
+                    ssid: ssid.clone(),
+                    bssid: bssid.clone(),
+                };
+                let sp = ui::Spinner::start("scanning networks");
+                let scanned = dev.wifi_scan(&opts);
+                sp.stop();
+                nets = scanned?;
+                enrich_wifi(oui_db, &mut nets);
+                *LAST_WIFI.lock().unwrap() = nets.clone();
+            }
+            let net = if interactive {
+                ui::pick_network(&nets)?
+            } else {
+                recon::resolve_from_cache(
+                    &nets,
+                    target.as_deref(),
+                    ssid.as_deref(),
+                    bssid.as_deref(),
+                )?
+            };
+            let oui = load_oui(oui_db);
+            recon::run(&mut dev, &net, *seconds, oui.as_ref(), cli.json)
+        }
+        WifiCmd::Saved { action } => cmd_wifi_saved(&mut dev, cli, oui_db, action),
         WifiCmd::Adapter {
             index,
             ssid,
@@ -1706,9 +1800,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             })?;
             // Associate can take ~20s; stretch the open timeout for this path.
             if ssid.is_some() || index.is_some() {
-                dev.set_read_timeout(std::time::Duration::from_millis(
-                    cli.timeout_ms.max(30_000),
-                ))?;
+                dev.set_read_timeout(std::time::Duration::from_millis(cli.timeout_ms.max(30_000)))?;
             }
             if let Some(i) = index {
                 dev.wifi_monitor_start_saved(*channel, &mf, *i)?;
@@ -1719,7 +1811,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 dev.wifi_monitor_start(*channel, &mf, None)?;
             }
             let mut w: Box<dyn Write> = match out {
-                Some(f) => Box::new(std::io::BufWriter::new(std::fs::File::create(f)?)),
+                Some(f) => Box::new(std::io::BufWriter::new(ui::create_secure(f)?)),
                 None => Box::new(std::io::stdout().lock()),
             };
             pcap::write_global_header(&mut w, pcap::LINKTYPE_IEEE802_11_RADIOTAP)?;
@@ -1885,7 +1977,12 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
     }
 }
 
-fn cmd_wifi_saved(dev: &mut Device, cli: &Cli, action: &SavedCmd) -> Result<()> {
+fn cmd_wifi_saved(
+    dev: &mut Device,
+    cli: &Cli,
+    oui_db: Option<&str>,
+    action: &SavedCmd,
+) -> Result<()> {
     match action {
         SavedCmd::List => {
             let nets = dev.wifi_saved_list()?;
@@ -1900,7 +1997,7 @@ fn cmd_wifi_saved(dev: &mut Device, cli: &Cli, action: &SavedCmd) -> Result<()> 
             ssid,
             pass,
             scan_ms,
-        } => cmd_wifi_add(dev, cli, ssid.clone(), pass.clone(), *scan_ms),
+        } => cmd_wifi_add(dev, cli, oui_db, ssid.clone(), pass.clone(), *scan_ms),
         SavedCmd::Rm { index } => {
             let count = dev.wifi_saved_delete(*index)?;
             print_action(
@@ -1915,13 +2012,14 @@ fn cmd_wifi_saved(dev: &mut Device, cli: &Cli, action: &SavedCmd) -> Result<()> 
 fn cmd_wifi_add(
     dev: &mut Device,
     cli: &Cli,
+    oui_db: Option<&str>,
     ssid: Option<String>,
     pass: Option<String>,
     scan_ms: u32,
 ) -> Result<()> {
     let ssid = match ssid {
         Some(s) => s,
-        None => pick_ssid_interactively(dev, scan_ms)?,
+        None => pick_ssid_interactively(dev, oui_db, scan_ms)?,
     };
     // Prompt is echoed (personal-machine tool); pass --pass to avoid it in scripts.
     let pass = match pass {
@@ -1936,33 +2034,24 @@ fn cmd_wifi_add(
     )
 }
 
-/// Scan, then let the operator pick an SSID by number. Networks are deduped by
-/// SSID (strongest sighting wins) and hidden APs are dropped.
-fn pick_ssid_interactively(dev: &mut Device, scan_ms: u32) -> Result<String> {
-    eprintln!("Scanning for networks (~{}s)...", (scan_ms / 1000).max(1));
+/// Scan, then pick via the shared Wi-Fi table (`ui::pick_network`)
+fn pick_ssid_interactively(dev: &mut Device, oui_db: Option<&str>, scan_ms: u32) -> Result<String> {
     let opts = WifiScanOpts {
         active: true,
         hide_hidden: true,
         ..Default::default()
     };
-    let nets = dev.wifi_scan(&opts)?;
-    let mut best: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for n in &nets {
-        if n.ssid.is_empty() {
-            continue;
-        }
-        let e = best.entry(n.ssid.clone()).or_insert(i64::MIN);
-        *e = (*e).max(n.rssi);
-    }
-    if best.is_empty() {
+    let spin_msg = format!("scanning networks (~{}s)", (scan_ms / 1000).max(1));
+    let sp = ui::Spinner::start(&spin_msg);
+    let nets = dev.wifi_scan(&opts);
+    sp.stop();
+    let mut nets = nets?;
+    nets.retain(|n| !n.ssid.is_empty());
+    if nets.is_empty() {
         anyhow::bail!("no networks found (use --ssid for a hidden network)");
     }
-    let mut list: Vec<(String, i64)> = best.into_iter().collect();
-    list.sort_by_key(|(_, rssi)| std::cmp::Reverse(*rssi));
-    let pick = ui::pick_from_list(&list, "Pick a network number: ", |(s, rssi)| {
-        format!("{s}  ({rssi} dBm)")
-    })?;
-    Ok(pick.0.clone())
+    enrich_wifi(oui_db, &mut nets);
+    Ok(ui::pick_network(&nets)?.ssid)
 }
 
 fn pick_saved_index(dev: &mut Device) -> Result<u8> {
@@ -1978,13 +2067,14 @@ fn pick_saved_index(dev: &mut Device) -> Result<u8> {
 
 /// Scan briefly, then pick a BLE peer by number. Returns its address and the
 /// address type to connect with (so a random-address peer resolves correctly).
-fn pick_ble_target(dev: &mut Device) -> Result<(String, u8)> {
+fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
     eprintln!("Scanning for BLE devices (~5s)...");
     let opts = BleScanOpts {
         duration_ms: Some(5000),
         ..Default::default()
     };
-    let devices = dev.ble_scan(&opts)?;
+    let mut devices = dev.ble_scan(&opts)?;
+    enrich_ble(db, &mut devices);
     let pick = ui::pick_ble_device(&devices)?;
     Ok((pick.address.clone(), pick.addr_type.unwrap_or(0)))
 }
@@ -2064,7 +2154,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
                 None => print_devices(&devices, cli.json),
             }
         }
-        BleCmd::Gatt { action } => cmd_gatt(cli, action),
+        BleCmd::Gatt { action } => cmd_gatt(cli, db, action),
         BleCmd::Adv {
             raw,
             name,
@@ -2496,13 +2586,15 @@ fn warn_if_mesh_active(dev: &mut Device) {
     }
 }
 
-fn cmd_gatt(cli: &Cli, action: &GattCmd) -> Result<()> {
-    // connect/enum can take a few seconds; give the read loop headroom.
+fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
+    // connect/enum can take a few seconds (cold discovery); later ATT ops use
+    // the on-device cache and should be fast.
     let base = cli.timeout_ms.max(12_000);
     let timeout = match action {
         GattCmd::Connect {
             connect_timeout_ms, ..
         } => base.max(connect_timeout_ms.unwrap_or(0) as u64 + 3_000),
+        GattCmd::Enum => base.max(30_000),
         // A subscription streams indefinitely; wait a long time between values
         // (Ctrl-C ends it).
         GattCmd::Subscribe { .. } => 3_600_000,
@@ -2527,7 +2619,7 @@ fn cmd_gatt(cli: &Cli, action: &GattCmd) -> Result<()> {
         } => {
             let (address, addr_type) = match address {
                 Some(a) => (a.clone(), *addr_type),
-                None => pick_ble_target(&mut dev)?,
+                None => pick_ble_target(&mut dev, db)?,
             };
             let opts = GattConnectOpts {
                 addr_type,
@@ -2544,8 +2636,19 @@ fn cmd_gatt(cli: &Cli, action: &GattCmd) -> Result<()> {
                 passkey: *passkey,
             };
             warn_if_mesh_active(&mut dev);
-            dev.gatt_connect(&address, &opts)?;
-            print_ok(cli.json)
+            match dev.gatt_connect(&address, &opts) {
+                Ok(()) => print_ok(cli.json),
+                Err(e) => {
+                    if !cli.json && matches!(addr_type, 0 | 1) {
+                        let alt = if addr_type == 0 { 1 } else { 0 };
+                        eprintln!(
+                            "hint: link-layer connect failed before GATT. \
+retry {address} with --addr-type {alt}"
+                        );
+                    }
+                    Err(e.into())
+                }
+            }
         }
         GattCmd::Enum => {
             let services = dev.gatt_enum()?;
@@ -2605,14 +2708,22 @@ fn load_db<T>(open: impl FnOnce() -> Result<T>, note: &str) -> Option<T> {
 
 fn load_oui(oui_db: Option<&str>) -> Option<oui::Db> {
     load_db(
-        || oui::db_path(oui_db).and_then(|p| oui::Db::load(&p)).map_err(Into::into),
+        || {
+            oui::db_path(oui_db)
+                .and_then(|p| oui::Db::load(&p))
+                .map_err(Into::into)
+        },
         "note: OUI database not installed; run `infishark manage oui update` for vendor names",
     )
 }
 
 fn load_company(company_db: Option<&str>) -> Option<company::Db> {
     load_db(
-        || company::db_path(company_db).and_then(|p| company::Db::load(&p)).map_err(Into::into),
+        || {
+            company::db_path(company_db)
+                .and_then(|p| company::Db::load(&p))
+                .map_err(Into::into)
+        },
         "note: BLE company database not installed; run `infishark manage company update` for manufacturer names",
     )
 }
@@ -2632,11 +2743,65 @@ fn enrich_ble(db: &DbOpts, devices: &mut [infishark::model::BleDevice]) {
     }
 }
 
-fn print_networks(nets: &[infishark::model::Network], as_json: bool) -> Result<()> {
+fn print_networks(nets: &[infishark::model::Network], as_json: bool, verbose: bool) -> Result<()> {
     if as_json {
-        print_items("networks", nets, true)
+        // Host-only enrichment (posture/flags/summary) stays off the device wire;
+        // attach it here for machine consumers of `--json`.
+        let summary = wifi_analysis::scan_summary(nets);
+        let mut order: Vec<usize> = (0..nets.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(nets[i].rssi));
+        let enriched: Vec<serde_json::Value> = order
+            .iter()
+            .map(|&i| {
+                let n = &nets[i];
+                let mut v = serde_json::to_value(n).unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("posture".into(), wifi_analysis::posture(n).as_str().into());
+                    let flags = wifi_analysis::risk_flags(n);
+                    if !flags.is_empty() {
+                        obj.insert("flags".into(), flags.into());
+                    }
+                }
+                v
+            })
+            .collect();
+        let mut body = serde_json::json!({
+            "count": nets.len(),
+            "networks": enriched,
+            "summary": {
+                "total": summary.total,
+                "open": summary.open,
+                "wep": summary.wep,
+                "wpa2": summary.wpa2,
+                "wpa3": summary.wpa3,
+                "enterprise": summary.enterprise,
+                "wps": summary.wps,
+                "hidden": summary.hidden,
+                "by_channel": summary.by_channel,
+            },
+        });
+        if verbose {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "hidden_correlations".into(),
+                    wifi_analysis::hidden_correlations(nets, 8)
+                        .iter()
+                        .map(|h| {
+                            serde_json::json!({
+                                "hidden_bssid": h.hidden_bssid,
+                                "named_ssid": h.named_ssid,
+                                "named_bssid": h.named_bssid,
+                                "rssi_delta": h.rssi_delta,
+                                "same_channel": h.same_channel,
+                            })
+                        })
+                        .collect(),
+                );
+            }
+        }
+        print_value(&body, true)
     } else {
-        ui::network_table(nets);
+        ui::network_table(nets, verbose);
         Ok(())
     }
 }
