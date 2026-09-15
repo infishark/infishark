@@ -132,11 +132,13 @@ impl Handshake {
             return false;
         };
         if msg == 1 {
-            // A fresh M1 (re)locks the client and restarts the 4-way.
-            self.station = Some(view.station);
             if let Some(p) = pmkid_from_key_data(&view.key_data) {
                 self.pmkid = Some(p);
             }
+            if self.station.is_some() && self.station != Some(view.station) {
+                return self.pmkid.is_some();
+            }
+            self.station = Some(view.station);
             self.msgs[1] = None;
             self.msgs[2] = None;
             self.msgs[3] = None;
