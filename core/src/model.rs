@@ -16,15 +16,16 @@ pub struct Network {
     #[serde(default)]
     pub ssid: String,
     #[serde(default)]
-    pub rssi: i64,
+    pub rssi: i8,
     #[serde(default)]
-    pub channel: i64,
+    pub channel: u8,
     #[serde(default)]
     pub encryption: String,
     /// Host-resolved OUI vendor; omitted until enriched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
-    /// Every other field present in the scan record (ciphers, PHY, country, ...).
+    /// Every other field present in the scan record (ciphers, PHY, country,
+    /// ...).
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -35,6 +36,29 @@ impl Network {
             if let Some(v) = db.lookup(&self.bssid) {
                 self.vendor = Some(v.to_string());
             }
+        }
+    }
+
+    pub fn extra_str(&self, key: &str) -> &str {
+        self.extra.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    pub fn extra_bool(&self, key: &str) -> bool {
+        match self.extra.get(key) {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::Number(n)) => n.as_u64() == Some(1),
+            Some(serde_json::Value::String(s)) => {
+                matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "1")
+            }
+            _ => false,
+        }
+    }
+
+    pub fn extra_num(&self, key: &str) -> String {
+        match self.extra.get(key) {
+            Some(serde_json::Value::Number(x)) => x.to_string(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => String::new(),
         }
     }
 }
@@ -72,11 +96,13 @@ pub struct AdapterConfig {
     pub hostname: Option<String>,
 }
 
-/// Captive-portal SoftAP / content options for [`crate::Device::wifi_portal_start`].
-/// Omitted fields keep device session defaults (settings SSID, open AP, ch 1, …).
+/// Captive-portal SoftAP / content options for
+/// [`crate::Device::wifi_portal_start`]. Omitted fields keep device session
+/// defaults (settings SSID, open AP, ch 1, etc).
 #[derive(Debug, Clone, Default)]
 pub struct PortalOpts {
-    /// Stream HTML bodies from the host (`EVT_PORTAL_REQUEST` / `CMD_PORTAL_RESP`).
+    /// Stream HTML bodies from the host (`EVT_PORTAL_REQUEST` /
+    /// `CMD_PORTAL_RESP`).
     pub host_content: bool,
     pub ssid: Option<String>,
     /// WPA2-PSK passphrase; `None` or empty = open network.
@@ -192,7 +218,7 @@ impl BleDevice {
             self.name = Some(n.clone());
         }
         self.rssi = newer.rssi;
-        if newer.addr_type.is_some() {
+        if self.addr_type.is_none() {
             self.addr_type = newer.addr_type;
         }
         if newer.company_id.is_some() {
@@ -210,6 +236,39 @@ impl BleDevice {
     }
 }
 
+/// Merge one JSON extra field: sticky true for connectable/scannable; skip
+/// null/empty overwrites that would wipe earlier enrichment.
+fn merge_extra_field(
+    extra: &mut BTreeMap<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    if value.is_null() {
+        return;
+    }
+    if value.as_str() == Some("") {
+        return;
+    }
+    if value.as_array().is_some_and(|a| a.is_empty()) {
+        if !extra.contains_key(key) {
+            extra.insert(key.to_string(), value.clone());
+        }
+        return;
+    }
+    match key {
+        "connectable" | "scannable" => {
+            if value.as_bool() == Some(true) {
+                extra.insert(key.to_string(), value.clone());
+            } else if !extra.contains_key(key) {
+                extra.insert(key.to_string(), value.clone());
+            }
+        }
+        _ => {
+            extra.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 /// Wi-Fi scan request. `None`/`false` fields use the device default (passive,
 /// driver dwell, all channels, hidden APs included, no SSID/BSSID filter).
 #[derive(Debug, Clone, Default)]
@@ -223,7 +282,8 @@ pub struct WifiScanOpts {
 }
 
 impl WifiScanOpts {
-    /// Wire arg object for the scan request (only non-default overrides are emitted).
+    /// Wire arg object for the scan request (only non-default overrides are
+    /// emitted).
     pub fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         insert_flag(&mut m, "active", self.active, true.into());
@@ -236,21 +296,25 @@ impl WifiScanOpts {
     }
 }
 
-/// BLE scan request. `None`/`false` fields use the device default (10s active
-/// scan, controller interval/window, dedup off, SCAN_ALL PHY).
+/// BLE scan request. Default is an active scan (scan responses / names).
+/// Set [`BleScanOpts::passive`] for listen-only in dense RF. Other `None`
+/// fields use device defaults (10s, controller interval/window, dedup off, 1M).
 #[derive(Debug, Clone, Default)]
 pub struct BleScanOpts {
     pub duration_ms: Option<u32>,
+    /// When true, listen only (no SCAN_REQ). Default false = active scan.
     pub passive: bool,
     pub interval: Option<u16>,
     pub window: Option<u16>,
     pub dedup: bool,
-    /// BLE PHY mask: 1 = 1M, 2 = Coded, 3 = both.
+    /// BLE PHY mask: 1 = 1M (device default), 2 = Coded, 3 = both.
+    /// Prefer 1M on ESP32-C3; dual-PHY has produced empty scans.
     pub scan_phy: Option<u8>,
 }
 
 impl BleScanOpts {
-    /// Wire arg object for the scan request (only non-default overrides are emitted).
+    /// Wire arg object for the scan request (only non-default overrides are
+    /// emitted).
     pub fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         insert_opt(&mut m, "duration_ms", self.duration_ms);
@@ -322,7 +386,12 @@ impl GattConnectOpts {
     pub fn to_json(&self, address: &str) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         m.insert("address".into(), address.into());
-        insert_flag(&mut m, "addr_type", self.addr_type != 0, self.addr_type.into());
+        insert_flag(
+            &mut m,
+            "addr_type",
+            self.addr_type != 0,
+            self.addr_type.into(),
+        );
         insert_opt(&mut m, "timeout_ms", self.timeout_ms);
         insert_opt(&mut m, "min_interval", self.min_interval);
         insert_opt(&mut m, "max_interval", self.max_interval);
