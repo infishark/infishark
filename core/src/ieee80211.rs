@@ -174,13 +174,31 @@ impl Frame<'_> {
 /// address. Note that the device filters for bandwidth. This parser validates
 /// for correctness.
 pub fn parse_frame(f: &[u8]) -> Option<Frame<'_>> {
-    if f.len() < 24 {
+    if f.len() < 10 {
         return None;
     }
     let subtype = (f[0] >> 4) & 0xf;
     let ftype = FrameType::from_fc(f[0] >> 2);
     let to_ds = f[1] & 0x01 != 0;
     let from_ds = f[1] & 0x02 != 0;
+    if ftype == FrameType::Ctrl {
+        let addr1 = f.get(4..10)?.try_into().ok()?;
+        let addr2 = f.get(10..16).and_then(|s| s.try_into().ok()).unwrap_or([0; 6]);
+        return Some(Frame {
+            ftype,
+            subtype,
+            to_ds: false,
+            from_ds: false,
+            protected: false,
+            addr1,
+            addr2,
+            addr3: [0; 6],
+            body: &[],
+        });
+    }
+    if f.len() < 24 {
+        return None;
+    }
     let qos = ftype == FrameType::Data && subtype & 0x8 != 0;
     let order = f[1] & 0x80 != 0;
     let wds = to_ds && from_ds;
@@ -251,6 +269,18 @@ mod frame_tests {
     #[test]
     fn rejects_a_short_frame() {
         assert!(parse_frame(&[0x08, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn parses_ack_control_frame() {
+        let mut f = vec![0xd4, 0x00, 0, 0];
+        f.extend_from_slice(&[0x11; 6]);
+        let fr = parse_frame(&f).unwrap();
+        assert_eq!(fr.ftype, FrameType::Ctrl);
+        assert_eq!(fr.subtype, ctrl_subtype::ACK);
+        assert_eq!(fr.addr1, [0x11; 6]);
+        assert_eq!(fr.addr2, [0; 6]);
+        assert!(fr.body.is_empty());
     }
 }
 
@@ -433,10 +463,9 @@ pub struct Ie {
 impl Ie {
     /// SSID element. An empty string is the wildcard SSID.
     pub fn ssid(ssid: &str) -> Ie {
-        Ie {
-            id: 0,
-            data: ssid.as_bytes().to_vec(),
-        }
+        let mut data = ssid.as_bytes().to_vec();
+        data.truncate(32);
+        Ie { id: 0, data }
     }
 
     /// Supported Rates; empty = default b/g set, else 500 kbps-unit rate bytes.
@@ -485,9 +514,10 @@ impl Ie {
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
+        let n = self.data.len().min(255);
         out.push(self.id);
-        out.push(self.data.len() as u8);
-        out.extend_from_slice(&self.data);
+        out.push(n as u8);
+        out.extend_from_slice(&self.data[..n]);
     }
 }
 
