@@ -71,7 +71,6 @@ impl<S: Read + Write> Transport<S> {
     }
 
     /// Buffered EVENT frames seen while awaiting responses (oldest first).
-    #[allow(dead_code)]
     pub fn drain_events(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.events)
     }

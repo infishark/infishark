@@ -98,20 +98,16 @@ pub struct Opts {
     pub payload: Option<String>,
 }
 
-fn mac(s: &str) -> Result<Mac> {
-    Ok(ieee80211::parse_mac(s)?)
-}
-
 fn require_mac(flag: &str, v: Option<&str>) -> Result<Mac> {
     match v {
-        Some(s) => mac(s),
+        Some(s) => Ok(ieee80211::parse_mac(s)?),
         None => bail!("--{flag} is required for this template"),
     }
 }
 
 fn sta_or_broadcast(sta: Option<&str>) -> Result<Mac> {
     match sta {
-        Some(s) => mac(s),
+        Some(s) => Ok(ieee80211::parse_mac(s)?),
         None => Ok(ieee80211::BROADCAST),
     }
 }
@@ -138,15 +134,19 @@ struct Synth {
     channel: u8,
 }
 
-// beacon request identity
 fn synthesize(o: &Opts) -> Result<Synth> {
+    if let (Some(a), Some(b)) = (o.ap.as_deref(), o.bssid.as_deref()) {
+        if !a.eq_ignore_ascii_case(b) {
+            bail!("--ap and --bssid disagree");
+        }
+    }
     match o.ap.as_deref().or(o.bssid.as_deref()) {
         Some(b) => {
             if o.channel == 0 {
                 bail!("--bssid/--ap needs --channel");
             }
             Ok(Synth {
-                ap: mac(b)?,
+                ap: ieee80211::parse_mac(b)?,
                 ssid: o.ssid.clone().unwrap_or_default(),
                 channel: require_2ghz(o.channel)?,
             })
@@ -167,7 +167,7 @@ fn build_no_ap(t: Template, o: &Opts) -> Result<Vec<u8>> {
     Ok(match t {
         Template::ProbeReq => {
             let src = match &o.sta {
-                Some(s) => mac(s)?,
+                Some(s) => ieee80211::parse_mac(s)?,
                 None => DEFAULT_MAC,
             };
             ieee80211::probe_req(src, o.ssid.as_deref().unwrap_or("")).to_bytes()
@@ -213,7 +213,7 @@ fn build_with_ap(t: Template, ap: Mac, o: &Opts, ssid_hint: &str, channel: u8) -
         .to_bytes(),
         Template::CfEnd => Ctrl::CfEnd {
             ra: match o.ra.as_deref().or(o.sta.as_deref()) {
-                Some(s) => mac(s)?,
+                Some(s) => ieee80211::parse_mac(s)?,
                 None => ieee80211::BROADCAST,
             },
             bssid: ap,
@@ -239,7 +239,7 @@ fn build_with_ap(t: Template, ap: Mac, o: &Opts, ssid_hint: &str, channel: u8) -
         Template::Rts => Ctrl::Rts {
             ra: require_mac("ra", o.ra.as_deref().or(o.sta.as_deref()))?,
             ta: match o.ta.as_deref() {
-                Some(s) => mac(s)?,
+                Some(s) => ieee80211::parse_mac(s)?,
                 None => ap,
             },
             duration: o.duration,
@@ -248,7 +248,7 @@ fn build_with_ap(t: Template, ap: Mac, o: &Opts, ssid_hint: &str, channel: u8) -
         Template::Bar => Ctrl::Bar {
             ra: require_mac("ra", o.ra.as_deref().or(o.sta.as_deref()))?,
             ta: match o.ta.as_deref() {
-                Some(s) => mac(s)?,
+                Some(s) => ieee80211::parse_mac(s)?,
                 None => ap,
             },
             tid: o.tid,
@@ -263,6 +263,11 @@ fn build_with_ap(t: Template, ap: Mac, o: &Opts, ssid_hint: &str, channel: u8) -
 }
 
 fn resolve_ap(dev: &mut Device, o: &Opts, oui_db: Option<&str>) -> Result<Vec<Target>> {
+    if let (Some(a), Some(b)) = (o.ap.as_deref(), o.bssid.as_deref()) {
+        if !a.eq_ignore_ascii_case(b) {
+            bail!("--ap and --bssid disagree");
+        }
+    }
     let bssid = o.ap.as_deref().or(o.bssid.as_deref());
     let channel = (o.channel != 0).then_some(o.channel);
     if bssid.is_none() && o.ssid.is_none() {
@@ -275,8 +280,15 @@ fn resolve_ap(dev: &mut Device, o: &Opts, oui_db: Option<&str>) -> Result<Vec<Ta
     Ok(targets)
 }
 
-fn tx_channel(user: u8, target: &Target) -> u8 {
-    if user != 0 { user } else { target.channel }
+fn tx_channel(user: u8, target: &Target) -> Result<u8> {
+    if user != 0 && user != target.channel {
+        bail!(
+            "--channel {user} is not the AP channel {} ({})",
+            target.channel,
+            target.label
+        );
+    }
+    Ok(if user != 0 { user } else { target.channel })
 }
 
 struct BurstResult {
@@ -294,60 +306,58 @@ fn burst(
     interval_ms: u16,
     json: bool,
 ) -> Result<BurstResult> {
-    let oneshot = count == 1 && interval_ms == 0;
-    let (ok, fail) = dev.wifi_raw_tx_burst(frame, channel, count, interval_ms)?;
-    if oneshot {
-        return Ok(BurstResult {
-            sent: ok,
-            fail,
-            stopped: false,
-        });
-    }
-
     crate::signals::install_sigint();
     crate::signals::RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut last = (0u32, 0u32);
-    let mut finished = false;
-    while crate::signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
-        dev.set_read_timeout(std::time::Duration::from_millis(400))?;
-        match dev.wait_wifi_tx() {
-            Ok((sent, fail, total, done)) => {
-                last = (sent, fail);
-                if !json {
-                    if total == 0 {
-                        eprint!("\r tx sent={sent} fail={fail} (until stop)   ");
-                    } else {
-                        eprint!("\r tx sent={sent} fail={fail} / {total}   ");
+    let oneshot = count == 1 && interval_ms == 0;
+    let out = (|| {
+        let (ok, fail) = dev.wifi_raw_tx_burst(frame, channel, count, interval_ms)?;
+        if oneshot {
+            return Ok(BurstResult {
+                sent: ok,
+                fail,
+                stopped: false,
+            });
+        }
+        let mut last = (0u32, 0u32);
+        let mut finished = false;
+        while crate::signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+            dev.set_read_timeout(std::time::Duration::from_millis(400))?;
+            match dev.wait_wifi_tx() {
+                Ok((sent, fail, total, done)) => {
+                    last = (sent, fail);
+                    if !json {
+                        if total == 0 {
+                            eprint!("\r tx sent={sent} fail={fail} (until stop)   ");
+                        } else {
+                            eprint!("\r tx sent={sent} fail={fail} / {total}   ");
+                        }
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
                     }
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    if done {
+                        finished = true;
+                        break;
+                    }
                 }
-                if done {
-                    finished = true;
-                    break;
-                }
-            }
-            Err(_) => {
-                if !crate::signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
+                Err(infishark::Error::Timeout) => {}
+                Err(e) => {
+                    if !crate::signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    return Err(e.into());
                 }
             }
         }
-    }
-    if !json {
-        eprintln!();
-    }
-    let interrupted = !finished;
-    if interrupted || count == 0 {
-        let _ = dev.stop_current_task();
-    } else {
-        // Finite burst completed on-device; still drop TX radio context.
-        let _ = dev.stop_current_task();
-    }
-    Ok(BurstResult {
-        sent: last.0,
-        fail: last.1,
-        stopped: interrupted,
-    })
+        if !json {
+            eprintln!();
+        }
+        Ok(BurstResult {
+            sent: last.0,
+            fail: last.1,
+            stopped: !finished,
+        })
+    })();
+    let _ = dev.stop_current_task();
+    out
 }
 
 fn planned_total(count: u16, targets: usize) -> u32 {
@@ -427,7 +437,7 @@ pub fn run(
             let targets = resolve_ap(dev, o, oui_db)?;
             targets_n = targets.len();
             for tgt in &targets {
-                let ch = tx_channel(o.channel, tgt);
+                let ch = tx_channel(o.channel, tgt)?;
                 let frame = build_with_ap(t, tgt.bssid, o, &tgt.ssid, ch)?;
                 last_len = frame.len();
                 let r = burst(dev, &frame, ch, o.count, o.interval_ms, json)?;
@@ -449,6 +459,9 @@ pub fn run(
             stopped = r.stopped;
         }
         ApMode::None => {
+            if o.ap.is_some() || o.bssid.is_some() {
+                bail!("this template does not take --ap/--bssid");
+            }
             let frame = build_no_ap(t, o)?;
             last_len = frame.len();
             let r = burst(dev, &frame, o.channel, o.count, o.interval_ms, json)?;
@@ -531,7 +544,7 @@ mod tests {
         o.bssid = Some("DE:AD:BE:EF:12:34".into());
         o.channel = 11;
         let s = synthesize(&o).unwrap();
-        assert_eq!(s.ap, mac("DE:AD:BE:EF:12:34").unwrap());
+        assert_eq!(s.ap, ieee80211::parse_mac("DE:AD:BE:EF:12:34").unwrap());
         assert!(s.ssid.is_empty());
         assert_eq!(s.channel, 11);
     }
