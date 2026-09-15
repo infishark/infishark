@@ -192,7 +192,18 @@ impl Shell {
     fn builtin(&mut self, line: &str) -> bool {
         let mut toks = line.split_whitespace();
         match toks.next().unwrap_or("") {
-            "help" | "?" | "--help" | "-h" => self.help(),
+            "help" | "?" | "--help" | "-h" => {
+                let rest: Vec<String> = toks.map(str::to_string).collect();
+                if rest.is_empty() {
+                    self.help();
+                } else {
+                    let root = Cli::command();
+                    match resolve(&root, &rest) {
+                        Some(cmd) => render_help(cmd, &rest),
+                        None => eprintln!("no such command"),
+                    }
+                }
+            }
             "clear" => {
                 let _ = console::Term::stdout().clear_screen();
             }
@@ -243,40 +254,27 @@ impl Shell {
     }
 
     fn exec(&mut self, line: &str) {
-        let is_help = line
-            .split_whitespace()
-            .last()
-            .map(|t| matches!(t, "--help" | "-h" | "help"))
-            .unwrap_or(false);
-        // Pipes/redirects and root commands run through the system shell.
-        if !is_help {
-            let sudo = needs_sudo(line);
-            let piped = line.contains(['|', '>', '<']);
-            if sudo && piped {
-                eprintln!("a root command can't be piped");
-                return;
-            }
-            if piped {
-                self.run_external(line, false);
-                return;
-            }
-            if sudo {
-                self.run_external(line, true);
-                return;
-            }
-        }
-
         let Some(toks) = shlex::split(line) else {
             eprintln!("unbalanced quotes");
             return;
         };
+        let is_help = toks.iter().any(|t| matches!(t.as_str(), "--help" | "-h"));
+        if !is_help && line.contains(['|', '>', '<']) {
+            self.run_external(line);
+            return;
+        }
+
         let root = Cli::command();
 
-        // Any help request renders in our own style, at any depth.
         if is_help {
-            let path = &toks[..toks.len().saturating_sub(1)];
-            match resolve(&root, path) {
-                Some(cmd) => render_help(cmd, path),
+            let path: Vec<String> = toks
+                .iter()
+                .take_while(|t| !matches!(t.as_str(), "--help" | "-h"))
+                .filter(|t| !t.starts_with('-'))
+                .cloned()
+                .collect();
+            match resolve(&root, &path) {
+                Some(cmd) => render_help(cmd, &path),
                 None => eprintln!("no such command"),
             }
             return;
@@ -321,17 +319,18 @@ impl Shell {
         }
     }
 
-    // Re-run through the system shell so pipes work and sudo can prompt.
-    fn run_external(&self, line: &str, sudo: bool) {
+    fn run_external(&self, line: &str) {
         let Ok(exe) = std::env::current_exe() else {
             eprintln!("cannot locate the infishark binary");
             return;
         };
         let port = match &self.selected {
-            Some(p) if !line.contains("--port") => format!("--port '{p}' "),
+            Some(p) if !line.contains("--port") => {
+                format!("--port {} ", sh_quote(p))
+            }
             _ => String::new(),
         };
-        let cmd = format!("'{}' {port}{line}", exe.display());
+        let cmd = format!("{} {port}{line}", sh_quote(&exe.display().to_string()));
         RUNNING.store(true, Ordering::SeqCst);
         if let Err(e) = std::process::Command::new(crate::privs::tool_path("sh"))
             .arg("-c")
@@ -436,7 +435,7 @@ fn render_help(cmd: &Command, path: &[String]) {
         }
         let w = args.iter().map(|a| arg_label(a).len()).max().unwrap_or(8);
         for a in args {
-            help_row(&arg_label(a), a.get_help().map(|h| h.to_string()), w);
+            help_row(&arg_label(a), Some(arg_help(a)), w);
         }
     } else {
         let w = subs.iter().map(|s| s.get_name().len()).max().unwrap_or(8);
@@ -446,11 +445,34 @@ fn render_help(cmd: &Command, path: &[String]) {
     }
 }
 
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn arg_label(a: &Arg) -> String {
     match a.get_long() {
         Some(l) => format!("--{l}"),
         None => format!("<{}>", a.get_id()),
     }
+}
+
+fn arg_help(a: &Arg) -> String {
+    let mut s = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+    let vals: Vec<String> = a
+        .get_possible_values()
+        .into_iter()
+        .filter(|v| !v.is_hide_set())
+        .map(|v| v.get_name().to_string())
+        .collect();
+    if !vals.is_empty() {
+        let list = vals.join(", ");
+        if s.is_empty() {
+            s = format!("[{list}]");
+        } else {
+            s = format!("{s} [{list}]");
+        }
+    }
+    s
 }
 
 fn help_row(name: &str, about: Option<String>, w: usize) {
