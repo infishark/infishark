@@ -1,6 +1,6 @@
 //! 802.11 MAC frame builders (raw TX; the radio appends FCS) and a parser.
 
-use crate::error::{Context, Result};
+use crate::error::Result;
 
 /// A 48-bit MAC address, wire order.
 pub type Mac = [u8; 6];
@@ -8,21 +8,14 @@ pub type Mac = [u8; 6];
 /// The broadcast address.
 pub const BROADCAST: Mac = [0xff; 6];
 
-/// Parse "AA:BB:CC:DD:EE:FF" (or '-' separated) into a [`Mac`].
+/// I/G bit clear.
+pub fn is_unicast(mac: Mac) -> bool {
+    mac[0] & 1 == 0
+}
+
+/// Parse a MAC (`AA:BB:CC:DD:EE:FF`, dashes, or compact hex).
 pub fn parse_mac(s: &str) -> Result<Mac> {
-    let mut mac = [0u8; 6];
-    let mut n = 0;
-    for part in s.split([':', '-']) {
-        if n == 6 {
-            bail!("MAC '{s}' has too many octets");
-        }
-        mac[n] = u8::from_str_radix(part, 16).with_context(|| format!("bad MAC octet '{part}'"))?;
-        n += 1;
-    }
-    if n != 6 {
-        bail!("MAC '{s}' needs 6 octets");
-    }
-    Ok(mac)
+    crate::hex::decode_n(s).map_err(|_| crate::Error::msg(format!("bad MAC '{s}'")))
 }
 
 pub mod channel {
@@ -31,6 +24,27 @@ pub mod channel {
 
     pub fn check_ch(ch: u8) -> bool {
         (MIN..=MAX).contains(&ch)
+    }
+
+    /// 0 = current or all.
+    pub fn check_tx(ch: u8) -> bool {
+        ch == 0 || check_ch(ch)
+    }
+
+    pub fn require(ch: u8) -> crate::Result<u8> {
+        if check_ch(ch) {
+            Ok(ch)
+        } else {
+            bail!("channel {ch} out of range (1-14)")
+        }
+    }
+
+    pub fn require_tx(ch: u8) -> crate::Result<u8> {
+        if check_tx(ch) {
+            Ok(ch)
+        } else {
+            bail!("channel {ch} out of range (1-14; 0 = current)")
+        }
     }
 }
 
@@ -171,8 +185,7 @@ impl Frame<'_> {
 /// Parse the 802.11 MAC header; None if too short.
 ///
 /// `body` skips the QoS Control, HT Control, and (when ToDS+FromDS) the 4th
-/// address. Note that the device filters for bandwidth. This parser validates
-/// for correctness.
+/// address.
 pub fn parse_frame(f: &[u8]) -> Option<Frame<'_>> {
     if f.len() < 10 {
         return None;
@@ -183,7 +196,10 @@ pub fn parse_frame(f: &[u8]) -> Option<Frame<'_>> {
     let from_ds = f[1] & 0x02 != 0;
     if ftype == FrameType::Ctrl {
         let addr1 = f.get(4..10)?.try_into().ok()?;
-        let addr2 = f.get(10..16).and_then(|s| s.try_into().ok()).unwrap_or([0; 6]);
+        let addr2 = f
+            .get(10..16)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0; 6]);
         return Some(Frame {
             ftype,
             subtype,
@@ -1070,9 +1086,18 @@ mod tests {
     }
 
     #[test]
+    fn unicast_is_ig_bit_clear() {
+        assert!(is_unicast([0xB0, 0xE4, 0xD5, 0x0A, 0xC7, 0xD2]));
+        assert!(!is_unicast(BROADCAST));
+        assert!(!is_unicast([0x01, 0x00, 0x5E, 0x7F, 0xFF, 0xFA]));
+        assert!(!is_unicast([0x33, 0x33, 0x00, 0x00, 0x00, 0xFB]));
+    }
+
+    #[test]
     fn parse_mac_accepts_colons_and_dashes() {
         assert_eq!(parse_mac("00:11:22:33:44:55").unwrap(), AP);
         assert_eq!(parse_mac("aa-bb-cc-dd-ee-ff").unwrap(), STA);
+        assert_eq!(parse_mac("001122334455").unwrap(), AP);
         assert!(parse_mac("00:11:22:33:44").is_err());
         assert!(parse_mac("zz:11:22:33:44:55").is_err());
     }
