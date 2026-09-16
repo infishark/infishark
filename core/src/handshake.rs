@@ -1,5 +1,6 @@
 //! Parse EAPOL, assemble the WPA 4-way / PMKID, emit pcap + hashcat 22000.
 
+use crate::hex;
 use crate::ieee80211::{FrameType, Mac, beacon, ethertype, parse_frame};
 use crate::pcap::{LINKTYPE_IEEE802_11_RADIOTAP, write_global_header, write_radiotap_record};
 
@@ -219,13 +220,13 @@ impl Handshake {
     /// TYPE=02: WPA02<mic><ap><sta><essid><anonce><eapol><mp>
     pub fn to_hc22000(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        let ap = hc_hex(&self.bssid);
-        let essid = hc_hex(self.ssid.as_bytes());
+        let ap = hex::encode_lower(&self.bssid);
+        let essid = hex::encode_lower(self.ssid.as_bytes());
         if let (Some(pmkid), Some(sta)) = (self.pmkid, self.station) {
             lines.push(format!(
                 "WPA*01*{}*{ap}*{}*{essid}***",
-                hc_hex(&pmkid),
-                hc_hex(&sta)
+                hex::encode_lower(&pmkid),
+                hex::encode_lower(&sta)
             ));
         }
         if let (Some((am, from_m3)), Some((sm, from_m4))) =
@@ -240,19 +241,14 @@ impl Handshake {
             };
             lines.push(format!(
                 "WPA*02*{}*{ap}*{}*{essid}*{}*{}*{mp}",
-                hc_hex(&sm.view.mic),
-                hc_hex(&sm.view.station),
-                hc_hex(&am.view.nonce),
-                hc_hex(&eapol_mic_zeroed(&sm.view.eapol)),
+                hex::encode_lower(&sm.view.mic),
+                hex::encode_lower(&sm.view.station),
+                hex::encode_lower(&am.view.nonce),
+                hex::encode_lower(&eapol_mic_zeroed(&sm.view.eapol)),
             ));
         }
         lines
     }
-}
-
-// Lowercase hex, the convention hashcat 22000 fields use.
-fn hc_hex(b: &[u8]) -> String {
-    crate::hex::encode_lower(b)
 }
 
 // The EAPOL PDU with its 16-byte MIC field zeroed, as mode 22000 requires.
