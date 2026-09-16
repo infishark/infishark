@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use serialport::SerialPort;
 
 use crate::hex;
+use crate::ieee80211;
 use crate::ir::{IrCapture, IrCode, RawIr};
 use crate::model::{
     AdapterConfig, AdapterTarget, BleDevice, BleScanOpts, GattConnectOpts, GattNotification,
@@ -17,25 +18,28 @@ use crate::transport::{Response, Transport};
 
 pub struct Device {
     transport: Transport<Box<dyn SerialPort>>,
+    port: String,
 }
 
 impl Device {
     /// Open the device's serial port (auto-selected when `port` is `None`).
     /// `timeout_ms` bounds every blocking read including event waits
     pub fn open(port: Option<&str>, timeout_ms: u64) -> Result<Self> {
-        Ok(Self {
-            transport: serial::open_device(port, timeout_ms)?,
-        })
+        let (port, transport) = serial::open_device(port, timeout_ms)?;
+        Ok(Self { transport, port })
     }
 
-    /// Low-level function - send a raw opcode + arg bytes, get the correlated
-    /// response
+    /// Path of the serial node this client opened.
+    pub fn port(&self) -> &str {
+        &self.port
+    }
+
+    /// Send a raw opcode + arg bytes and wait for the correlated response.
     pub fn transact(&mut self, opcode: u16, args: &[u8]) -> Result<Response> {
         self.transport.transact(opcode, args)
     }
 
-    /// Low-level function - block for the next reassembled device event `(id,
-    /// json)`
+    /// Block for the next reassembled device event `(id, json)`.
     pub fn next_event(&mut self) -> Result<(u16, Vec<u8>)> {
         self.transport.next_event()
     }
@@ -43,6 +47,10 @@ impl Device {
     /// Device identity (serial, firmware, MAC, flash).
     pub fn device_info(&mut self) -> Result<serde_json::Value> {
         self.json_command(protocol::CMD_DEVICE_INFO, b"")
+    }
+
+    pub fn firmware_identity(&mut self) -> Result<crate::fw::DeviceFw> {
+        crate::fw::DeviceFw::from_info(&self.device_info()?)
     }
 
     /// Live status (uptime, heap, battery, mesh).
@@ -57,6 +65,11 @@ impl Device {
 
     /// Run a Wi-Fi scan, aggregating streamed sightings by BSSID (latest wins).
     pub fn wifi_scan(&mut self, opts: &WifiScanOpts) -> Result<Vec<Network>> {
+        if let Some(ch) = opts.channel {
+            if ch != 0 {
+                ieee80211::channel::require(ch)?;
+            }
+        }
         let _ = self.stop_current_task();
         let _ = self.transport.drain_events();
         self.command_ok_local(protocol::CMD_WIFI_SCAN, &opts.to_json())?;
@@ -156,6 +169,7 @@ impl Device {
         filter: &crate::monitor::MonitorFilter,
         associate: Option<(&str, &str)>,
     ) -> Result<()> {
+        ieee80211::channel::require(channel)?;
         let mut params = filter.to_json();
         params["channel"] = channel.into();
         if let Some((ssid, pass)) = associate {
@@ -174,6 +188,7 @@ impl Device {
         filter: &crate::monitor::MonitorFilter,
         saved_index: u8,
     ) -> Result<()> {
+        ieee80211::channel::require(channel)?;
         let mut params = filter.to_json();
         params["channel"] = channel.into();
         params["index"] = saved_index.into();
@@ -218,6 +233,7 @@ impl Device {
         count: u16,
         interval_ms: u16,
     ) -> Result<(u32, u32)> {
+        ieee80211::channel::require_tx(channel)?;
         if frame.is_empty() {
             return Err(Error::msg("empty 802.11 frame"));
         }
@@ -339,26 +355,30 @@ impl Device {
 
     /// Delete a file (only files the device marks deletable).
     pub fn file_delete(&mut self, path: &str) -> Result<()> {
+        let path = canonical_device_path(path);
         let args = serde_json::json!({ "path": path }).to_string();
-        self.json_command(protocol::CMD_FILES_DELETE, args.as_bytes())?;
-        Ok(())
+        match self.json_command(protocol::CMD_FILES_DELETE, args.as_bytes()) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(self.explain_file_error("delete", &path, e)),
+        }
     }
 
     /// Read a whole file, paging chunks until the device signals the end.
     pub fn file_read(&mut self, path: &str) -> Result<Vec<u8>> {
+        let path = canonical_device_path(path);
         // Device flash is small; cap the read so a bogus `total` can't drive host OOM.
         const MAX_FILE: usize = 8 * 1024 * 1024;
         let mut out: Vec<u8> = Vec::new();
         loop {
             let args = serde_json::json!({ "path": path, "offset": out.len() }).to_string();
-            let (hdr, data) = self
-                .transport
-                .transact_chunk(protocol::CMD_FILES_READ_CHUNK, args.as_bytes())?;
+            let (hdr, data) =
+                self.transact_chunk_retry(protocol::CMD_FILES_READ_CHUNK, args.as_bytes())?;
             if hdr.error != protocol::ERR_OK {
-                return Err(Error::Device {
+                let err = Error::Device {
                     code: hdr.error,
                     message: String::from_utf8_lossy(&data).into_owned(),
-                });
+                };
+                return Err(self.explain_file_error("read", &path, err));
             }
             // Each chunk leads with an 8-byte offset/total header.
             if data.len() < 8 {
@@ -378,6 +398,7 @@ impl Device {
 
     /// Upload bytes to a device file
     pub fn file_write(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        let path = canonical_device_path(path);
         if path.is_empty() || path.len() > 47 {
             bail!("device path must be 1..=47 bytes (got {})", path.len());
         }
@@ -391,8 +412,10 @@ impl Device {
             args.extend_from_slice(path.as_bytes());
             args.extend_from_slice(&(offset as u32).to_le_bytes());
             args.extend_from_slice(chunk);
-            let resp = self.transport.transact(protocol::CMD_FILES_WRITE, &args)?;
-            check(&resp)?;
+            let resp = self.transact_retry(protocol::CMD_FILES_WRITE, &args)?;
+            if let Err(e) = check(&resp) {
+                return Err(self.explain_file_error("write", &path, e));
+            }
             offset = end;
             if offset >= data.len() {
                 break;
@@ -407,10 +430,14 @@ impl Device {
         self.command_ok_local(protocol::CMD_BLE_SCAN, &opts.to_json())?;
         let mut devices: std::collections::BTreeMap<String, BleDevice> =
             std::collections::BTreeMap::new();
+        let dwell_ms = opts.duration_ms.unwrap_or(10_000) as u64;
+        let deadline = Instant::now() + Duration::from_millis(dwell_ms.saturating_add(5_000));
         loop {
-            let (id, payload) = self.transport.next_event()?;
-            match id {
-                protocol::EVT_BLE_DEVICE => {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match self.transport.next_event() {
+                Ok((protocol::EVT_BLE_DEVICE, payload)) => {
                     if let Ok(d) = serde_json::from_slice::<BleDevice>(&payload) {
                         devices
                             .entry(d.address.clone())
@@ -418,8 +445,10 @@ impl Device {
                             .or_insert(d);
                     }
                 }
-                protocol::EVT_SCAN_DONE => break,
-                _ => {}
+                Ok((protocol::EVT_SCAN_DONE, _)) => break,
+                Ok(_) => {}
+                Err(Error::Timeout) => continue,
+                Err(e) => return Err(e),
             }
         }
         Ok(devices.into_values().collect())
@@ -452,6 +481,7 @@ impl Device {
 
     /// Start a connectable GATT server from a table spec.
     pub fn ble_serve(&mut self, spec: &serde_json::Value) -> Result<()> {
+        reject_reserved_serve_uuids(spec)?;
         self.command_ok(protocol::CMD_BLE_SERVE, spec)
     }
 
@@ -497,7 +527,20 @@ impl Device {
     /// Connect to a peripheral as a GATT central. Holds the BLE radio until
     /// [`Device::gatt_disconnect`].
     pub fn gatt_connect(&mut self, address: &str, opts: &GattConnectOpts) -> Result<()> {
-        self.command_ok(protocol::CMD_BLE_GATT_CONNECT, &opts.to_json(address))
+        let args = opts.to_json(address);
+        let mut last = Error::msg("gatt connect failed");
+        for attempt in 0..4u32 {
+            match self.command_ok(protocol::CMD_BLE_GATT_CONNECT, &args) {
+                Ok(()) => return Ok(()),
+                Err(e) if gatt_connect_retryable(&e) && attempt < 3 => {
+                    let _ = self.stop_current_task();
+                    std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
+                    last = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
     }
 
     /// Discover and return the service/characteristic tree of the connected
@@ -509,7 +552,8 @@ impl Device {
 
     /// Read a characteristic value by UUID.
     pub fn gatt_read(&mut self, char_uuid: &str) -> Result<Vec<u8>> {
-        let args = serde_json::json!({ "char": char_uuid }).to_string();
+        let uuid = hex::bluetooth_uuid(char_uuid)?;
+        let args = serde_json::json!({ "char": uuid }).to_string();
         let v = self.json_command(protocol::CMD_BLE_GATT_READ, args.as_bytes())?;
         let h = v.get("hex").and_then(|x| x.as_str()).unwrap_or("");
         hex::decode(h)
@@ -517,10 +561,11 @@ impl Device {
 
     /// Write bytes to a characteristic by UUID.
     pub fn gatt_write(&mut self, char_uuid: &str, data: &[u8], with_response: bool) -> Result<()> {
+        let uuid = hex::bluetooth_uuid(char_uuid)?;
         self.command_ok(
             protocol::CMD_BLE_GATT_WRITE,
             &serde_json::json!({
-                "char": char_uuid,
+                "char": uuid,
                 "data": hex::encode(data),
                 "response": with_response,
             }),
@@ -529,17 +574,19 @@ impl Device {
 
     /// Enable notifications (or indications) on a characteristic.
     pub fn gatt_subscribe(&mut self, char_uuid: &str, indicate: bool) -> Result<()> {
+        let uuid = hex::bluetooth_uuid(char_uuid)?;
         self.command_ok(
             protocol::CMD_BLE_GATT_SUBSCRIBE,
-            &serde_json::json!({ "char": char_uuid, "indicate": indicate }),
+            &serde_json::json!({ "char": uuid, "indicate": indicate }),
         )
     }
 
     /// Stop notifications/indications on a characteristic.
     pub fn gatt_unsubscribe(&mut self, char_uuid: &str) -> Result<()> {
+        let uuid = hex::bluetooth_uuid(char_uuid)?;
         self.command_ok(
             protocol::CMD_BLE_GATT_UNSUBSCRIBE,
-            &serde_json::json!({ "char": char_uuid }),
+            &serde_json::json!({ "char": uuid }),
         )
     }
 
@@ -636,16 +683,14 @@ impl Device {
 
     /// Send a JSON command whose only reply is success/error (no body used).
     fn command_ok(&mut self, opcode: u16, spec: &serde_json::Value) -> Result<()> {
-        let resp = self
-            .transport
-            .transact(opcode, spec.to_string().as_bytes())?;
+        let resp = self.transact_retry(opcode, spec.to_string().as_bytes())?;
         check(&resp)
     }
 
     /// `command_ok` for a scopable command: wraps `params` with the local scope
     /// prefix.
     fn command_ok_local(&mut self, opcode: u16, params: &serde_json::Value) -> Result<()> {
-        let resp = self.transport.transact(opcode, &local_args(params))?;
+        let resp = self.transact_retry(opcode, &local_args(params))?;
         check(&resp)
     }
 
@@ -656,7 +701,7 @@ impl Device {
         opcode: u16,
         params: &serde_json::Value,
     ) -> Result<Option<String>> {
-        let resp = self.transport.transact(opcode, &local_args(params))?;
+        let resp = self.transact_retry(opcode, &local_args(params))?;
         check(&resp)?;
         if resp.body.is_empty() {
             return Ok(None);
@@ -665,6 +710,73 @@ impl Device {
         Ok(v.get("note")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()))
+    }
+
+    fn transact_retry(&mut self, opcode: u16, args: &[u8]) -> Result<Response> {
+        let mut delay_ms = 50u64;
+        let mut last = None;
+        for _ in 0..4 {
+            let resp = self.transport.transact(opcode, args)?;
+            if resp.error != protocol::ERR_BUSY {
+                return Ok(resp);
+            }
+            last = Some(resp);
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            delay_ms = (delay_ms * 2).min(400);
+        }
+        Ok(last.expect("BUSY retry left a response"))
+    }
+
+    fn transact_chunk_retry(
+        &mut self,
+        opcode: u16,
+        args: &[u8],
+    ) -> Result<(crate::response::ResponseHeader, Vec<u8>)> {
+        let mut delay_ms = 50u64;
+        for _ in 0..4 {
+            let (hdr, data) = self.transport.transact_chunk(opcode, args)?;
+            if hdr.error != protocol::ERR_BUSY {
+                return Ok((hdr, data));
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            delay_ms = (delay_ms * 2).min(400);
+        }
+        self.transport.transact_chunk(opcode, args)
+    }
+
+    fn explain_file_error(&mut self, op: &str, path: &str, err: Error) -> Error {
+        let Ok(list) = self.file_list() else {
+            return err;
+        };
+        let files = list
+            .get("files")
+            .and_then(|f| f.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let matches_path = |f: &serde_json::Value| {
+            f.get("path").and_then(|p| p.as_str()).is_some_and(|p| {
+                p == path || p.trim_start_matches('/') == path.trim_start_matches('/')
+            })
+        };
+        if !files.iter().any(matches_path) {
+            if op == "write" {
+                let writable: Vec<String> = files
+                    .iter()
+                    .filter(|f| f.get("write").and_then(|w| w.as_bool()) == Some(true))
+                    .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                    .collect();
+                return Error::msg(format!(
+                    "{path} is not a writable device path (aliases: remote1-5, ducky). writable: {}",
+                    if writable.is_empty() {
+                        "(none)".into()
+                    } else {
+                        writable.join(", ")
+                    }
+                ));
+            }
+            return Error::msg(format!("no such file {path}"));
+        }
+        err
     }
 
     /// Block (bounded by the open timeout) until an event with id `want`
@@ -679,12 +791,61 @@ impl Device {
     }
 
     fn json_command(&mut self, opcode: u16, args: &[u8]) -> Result<serde_json::Value> {
-        let resp = self.transport.transact(opcode, args)?;
+        let resp = self.transact_retry(opcode, args)?;
         check(&resp)?;
         if resp.body.is_empty() {
             return Ok(serde_json::json!({}));
         }
         Ok(serde_json::from_slice(&resp.body)?)
+    }
+}
+
+fn canonical_device_path(path: &str) -> String {
+    let p = path.trim();
+    if p.is_empty() {
+        return String::new();
+    }
+    if p.starts_with('/') {
+        return p.to_string();
+    }
+    if is_device_alias(p) {
+        return p.to_string();
+    }
+    format!("/{p}")
+}
+
+fn is_device_alias(p: &str) -> bool {
+    matches!(
+        p,
+        "ducky" | "remote1" | "remote2" | "remote3" | "remote4" | "remote5"
+    )
+}
+
+fn reject_reserved_serve_uuids(spec: &serde_json::Value) -> Result<()> {
+    let Some(svcs) = spec.get("services").and_then(|s| s.as_array()) else {
+        return Ok(());
+    };
+    for svc in svcs {
+        if let Some(u) = svc.get("uuid").and_then(|x| x.as_str()) {
+            if hex::reserved_sig_service(u) {
+                bail!(
+                    "service UUID {u} is a Bluetooth SIG reserved service (0x18xx); use a custom UUID such as 1234"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn gatt_connect_retryable(e: &Error) -> bool {
+    match e {
+        Error::Timeout => true,
+        Error::Device { code, message } => {
+            *code == protocol::ERR_BUSY
+                || *code == protocol::ERR_INTERNAL
+                || message.contains("connect failed")
+        }
+        _ => false,
     }
 }
 

@@ -1,5 +1,3 @@
-//! Opening the device's USB-CDC serial port and wrapping it in a Transport.
-
 use std::time::Duration;
 
 use crate::error::{Context, Result};
@@ -7,10 +5,13 @@ use serialport::{SerialPort, SerialPortType};
 
 use crate::transport::Transport;
 
-const ESPRESSIF_VID: u16 = 0x303A;
+pub const ESPRESSIF_VID: u16 = 0x303A;
 const BAUD: u32 = 921_600;
 
-pub fn open_device(port: Option<&str>, timeout_ms: u64) -> Result<Transport<Box<dyn SerialPort>>> {
+pub fn open_device(
+    port: Option<&str>,
+    timeout_ms: u64,
+) -> Result<(String, Transport<Box<dyn SerialPort>>)> {
     let path = match port {
         Some(p) => p.to_string(),
         None => auto_select()?,
@@ -19,10 +20,10 @@ pub fn open_device(port: Option<&str>, timeout_ms: u64) -> Result<Transport<Box<
         .timeout(Duration::from_millis(timeout_ms))
         .open()
         .with_context(|| format!("opening serial port {path}"))?;
-    Ok(Transport::new(stream))
+    Ok((path, Transport::new(stream)))
 }
 
-/// returns device-info JSON if a Nano answers else None
+/// Device-info JSON if a Nano answers on this path.
 pub fn probe_device_info(path: &str, timeout_ms: u64) -> Option<serde_json::Value> {
     let stream = serialport::new(path, BAUD)
         .timeout(Duration::from_millis(timeout_ms))
@@ -44,7 +45,12 @@ pub fn probe_device_info(path: &str, timeout_ms: u64) -> Option<serde_json::Valu
 // candidates and then confirm each is a Nano by probing its identity. A bare
 // JTAG/serial debug unit or ESP shares the VID but never answers the
 // device-info probe.
-fn auto_select() -> Result<String> {
+pub fn auto_port() -> Result<String> {
+    auto_select()
+}
+
+/// Espressif USB-CDC nodes, even if they do not answer device-info (bricked / setup).
+pub fn espressif_ports() -> Result<Vec<String>> {
     let ports = serialport::available_ports().context("listing serial ports")?;
     let mut espressif: Vec<String> = ports
         .into_iter()
@@ -54,7 +60,11 @@ fn auto_select() -> Result<String> {
         })
         .collect();
     espressif.sort();
-    let espressif = prefer_cu_over_tty(espressif);
+    Ok(prefer_cu_over_tty(espressif))
+}
+
+fn auto_select() -> Result<String> {
+    let espressif = espressif_ports()?;
     // one device can still answer on more than one node
     let mut devices: Vec<(String, String)> = Vec::new();
     for path in &espressif {
