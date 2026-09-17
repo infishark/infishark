@@ -6,10 +6,9 @@ use ieee80211::{Ctrl, Mac};
 use infishark::client::Device;
 use infishark::{hex, ieee80211};
 
-use crate::target::{Target, resolve_targets};
+use crate::target::Target;
 
-/// Named Mac Protocol Data Unit (MPDU) templates (clap lists them via
-/// ValueEnum).
+/// Named 802.11 MPDU templates.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Template {
     Deauth,
@@ -53,7 +52,7 @@ enum ApMode {
 impl Template {
     fn ap_mode(self) -> ApMode {
         match self {
-            Self::ProbeReq | Self::Cts | Self::Ack => ApMode::None,
+            Self::ProbeReq | Self::Cts | Self::Ack | Self::Rts | Self::Bar => ApMode::None,
             Self::Beacon => ApMode::Synthesize,
             _ => ApMode::Required,
         }
@@ -120,11 +119,7 @@ fn payload_bytes(o: &Opts) -> Result<Vec<u8>> {
 }
 
 fn require_2ghz(ch: u8) -> Result<u8> {
-    if ieee80211::channel::check_ch(ch) {
-        Ok(ch)
-    } else {
-        bail!("channel {ch} out of range (1-14)");
-    }
+    Ok(ieee80211::channel::require(ch)?)
 }
 
 #[derive(Debug)]
@@ -179,6 +174,20 @@ fn build_no_ap(t: Template, o: &Opts) -> Result<Vec<u8>> {
         .to_bytes(),
         Template::Ack => Ctrl::Ack {
             ra: require_mac("ra", o.ra.as_deref().or(o.sta.as_deref()))?,
+        }
+        .to_bytes(),
+        Template::Rts => Ctrl::Rts {
+            ra: require_mac("ra", o.ra.as_deref().or(o.sta.as_deref()))?,
+            ta: require_mac("ta", o.ta.as_deref())?,
+            duration: o.duration,
+        }
+        .to_bytes(),
+        Template::Bar => Ctrl::Bar {
+            ra: require_mac("ra", o.ra.as_deref().or(o.sta.as_deref()))?,
+            ta: require_mac("ta", o.ta.as_deref())?,
+            tid: o.tid,
+            ssn: o.ssn,
+            duration: o.duration,
         }
         .to_bytes(),
         _ => bail!("internal: template expects an AP"),
@@ -262,7 +271,7 @@ fn build_with_ap(t: Template, ap: Mac, o: &Opts, ssid_hint: &str, channel: u8) -
     })
 }
 
-fn resolve_ap(dev: &mut Device, o: &Opts, oui_db: Option<&str>) -> Result<Vec<Target>> {
+fn resolve_ap(dev: &mut Device, o: &Opts, oui_db: Option<&str>, json: bool) -> Result<Vec<Target>> {
     if let (Some(a), Some(b)) = (o.ap.as_deref(), o.bssid.as_deref()) {
         if !a.eq_ignore_ascii_case(b) {
             bail!("--ap and --bssid disagree");
@@ -273,7 +282,16 @@ fn resolve_ap(dev: &mut Device, o: &Opts, oui_db: Option<&str>) -> Result<Vec<Ta
     if bssid.is_none() && o.ssid.is_none() {
         eprintln!("no --ap/--bssid; scanning for targets...");
     }
-    let targets = resolve_targets(dev, o.ssid.as_deref(), bssid, channel, oui_db, |_| true)?;
+    let targets = crate::target::resolve_targets_ex(
+        dev,
+        o.ssid.as_deref(),
+        bssid,
+        channel,
+        oui_db,
+        |_| true,
+        crate::target::TargetPick::All,
+        !json,
+    )?;
     if targets.is_empty() {
         bail!("no matching networks");
     }
@@ -434,7 +452,7 @@ pub fn run(
 
     match t.ap_mode() {
         ApMode::Required => {
-            let targets = resolve_ap(dev, o, oui_db)?;
+            let targets = resolve_ap(dev, o, oui_db, json)?;
             targets_n = targets.len();
             for tgt in &targets {
                 let ch = tx_channel(o.channel, tgt)?;
@@ -566,5 +584,17 @@ mod tests {
         assert_eq!(planned_total(1, 19), 19);
         assert_eq!(planned_total(5, 3), 15);
         assert_eq!(planned_total(0, 19), 0);
+    }
+
+    #[test]
+    fn rts_with_ra_ta_does_not_need_an_ap() {
+        let mut o = opts();
+        o.template = Some(Template::Rts);
+        o.ra = Some("02:00:00:00:00:01".into());
+        o.ta = Some("02:00:00:00:00:02".into());
+        o.channel = 6;
+        assert!(matches!(Template::Rts.ap_mode(), ApMode::None));
+        let f = build_no_ap(Template::Rts, &o).unwrap();
+        assert_eq!(f.len(), 16);
     }
 }
