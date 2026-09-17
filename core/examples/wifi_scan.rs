@@ -6,11 +6,14 @@
 use infishark::{Device, WifiScanOpts};
 
 fn main() -> infishark::Result<()> {
-    let mut dev = Device::open(None, 12_000)?;
+    let mut dev = Device::open(None, 15_000)?;
     let mut nets = dev.wifi_scan(&WifiScanOpts::default())?;
     nets.sort_by_key(|n| std::cmp::Reverse(n.rssi));
     for n in nets {
-        println!("{:>4} dBm  ch{:<3} {}  {}", n.rssi, n.channel, n.bssid, n.ssid);
+        println!(
+            "{:>4} dBm  ch{:<3} {}  {}",
+            n.rssi, n.channel, n.bssid, n.ssid
+        );
     }
     Ok(())
 }

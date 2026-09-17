@@ -6,7 +6,7 @@
 use infishark::{BleScanOpts, Device};
 
 fn main() -> infishark::Result<()> {
-    let mut dev = Device::open(None, 12_000)?;
+    let mut dev = Device::open(None, 15_000)?;
     let mut devices = dev.ble_scan(&BleScanOpts::default())?;
     devices.sort_by_key(|d| std::cmp::Reverse(d.rssi));
     for d in devices {

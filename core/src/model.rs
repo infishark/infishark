@@ -288,7 +288,7 @@ impl WifiScanOpts {
         let mut m = serde_json::Map::new();
         insert_flag(&mut m, "active", self.active, true.into());
         insert_opt(&mut m, "dwell_ms", self.dwell_ms);
-        insert_opt(&mut m, "channel", self.channel);
+        insert_opt(&mut m, "channel", self.channel.filter(|&c| c != 0));
         insert_flag(&mut m, "show_hidden", self.hide_hidden, false.into());
         insert_opt(&mut m, "ssid", self.ssid.clone());
         insert_opt(&mut m, "bssid", self.bssid.clone());
@@ -307,8 +307,7 @@ pub struct BleScanOpts {
     pub interval: Option<u16>,
     pub window: Option<u16>,
     pub dedup: bool,
-    /// BLE PHY mask: 1 = 1M (device default), 2 = Coded, 3 = both.
-    /// Prefer 1M on ESP32-C3; dual-PHY has produced empty scans.
+    /// 1 = 1M, 2 = Coded, 3 = both.
     pub scan_phy: Option<u8>,
 }
 
@@ -489,6 +488,16 @@ mod tests {
         assert_eq!(j["addr_type"], 1);
         assert_eq!(j["passkey"], 123456);
         assert!(j.get("bond").is_none()); // default -> omitted
+    }
+
+    #[test]
+    fn wifi_opts_omit_channel_zero() {
+        let j = WifiScanOpts {
+            channel: Some(0),
+            ..Default::default()
+        }
+        .to_json();
+        assert!(j.get("channel").is_none());
     }
 
     #[test]
