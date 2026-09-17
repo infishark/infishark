@@ -59,10 +59,7 @@ pub fn run(
     as_json: bool,
 ) -> Result<()> {
     let bssid = ieee80211::parse_mac(&net.bssid)?;
-    let channel = net.channel;
-    if !ieee80211::channel::check_ch(channel) {
-        bail!("channel {channel} out of range (1-14)");
-    }
+    let channel = ieee80211::channel::require(net.channel)?;
 
     let filter = MonitorFilter::all();
 
@@ -118,7 +115,10 @@ pub fn run(
     let elapsed = start.elapsed();
 
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&stats_json(&stats, net, elapsed, oui_db))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&stats_json(&stats, net, elapsed, oui_db))?
+        );
     } else {
         print_human(&stats, net, elapsed, oui_db);
     }
@@ -180,12 +180,12 @@ fn ingest(stats: &mut ReconStats, bssid: [u8; 6], ap_ssid: &str, rssi: i8, raw: 
             // Infrastructure: station is the non-AP address.
             if fr.to_ds ^ fr.from_ds {
                 let sta = fr.station();
-                if sta != bssid && sta != ieee80211::BROADCAST {
+                if sta != bssid && ieee80211::is_unicast(sta) {
                     touch_station(stats, sta, rssi, !is_null, is_null);
                 }
             } else if !fr.to_ds && !fr.from_ds {
                 for mac in [fr.addr1, fr.addr2] {
-                    if mac != bssid && mac != ieee80211::BROADCAST {
+                    if mac != bssid && ieee80211::is_unicast(mac) {
                         touch_station(stats, mac, rssi, !is_null, is_null);
                     }
                 }
@@ -298,7 +298,10 @@ fn print_human(stats: &ReconStats, net: &Network, elapsed: Duration, oui_db: Opt
         ("channel".into(), net.channel.to_string()),
         ("rssi".into(), format!("{} dBm", net.rssi)),
         ("encryption".into(), net.encryption.clone()),
-        ("posture".into(), wifi_analysis::posture(net).as_str().into()),
+        (
+            "posture".into(),
+            wifi_analysis::posture(net).as_str().into(),
+        ),
     ];
     if let Some(v) = &net.vendor {
         rows.push(("vendor".into(), v.clone()));
@@ -498,10 +501,12 @@ pub fn resolve_from_cache(
             }
             let mut order: Vec<usize> = (0..nets.len()).collect();
             order.sort_by_key(|&i| std::cmp::Reverse(nets[i].rssi));
-            return order
-                .get(idx)
-                .map(|&i| nets[i].clone())
-                .with_context(|| format!("index {idx} out of range (0..{})", nets.len().saturating_sub(1)));
+            return order.get(idx).map(|&i| nets[i].clone()).with_context(|| {
+                format!(
+                    "index {idx} out of range (0..{})",
+                    nets.len().saturating_sub(1)
+                )
+            });
         }
         // Fall back: BSSID or exact SSID token.
         if tok.contains(':') || tok.contains('-') {
@@ -514,3 +519,56 @@ pub fn resolve_from_cache(
     bail!("specify a scan #, --ssid, --bssid, or pick interactively");
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn from_ds_data(bssid: [u8; 6], dest: [u8; 6], src: [u8; 6]) -> Vec<u8> {
+        let mut f = vec![0x08, 0x02, 0, 0]; // data, FromDS
+        f.extend_from_slice(&dest);
+        f.extend_from_slice(&bssid);
+        f.extend_from_slice(&src);
+        f.extend_from_slice(&[0, 0]);
+        f
+    }
+
+    #[test]
+    fn multicast_dest_is_not_a_station() {
+        let bssid = [0xB0, 0xE4, 0xD5, 0x0A, 0xC7, 0xD2];
+        let mut stats = ReconStats::default();
+        ingest(
+            &mut stats,
+            bssid,
+            "lab",
+            -50,
+            &from_ds_data(bssid, [0x01, 0x00, 0x5E, 0x7F, 0xFF, 0xFA], [0x11; 6]),
+        );
+        ingest(
+            &mut stats,
+            bssid,
+            "lab",
+            -50,
+            &from_ds_data(bssid, [0x33, 0x33, 0x00, 0x00, 0x00, 0xFB], [0x11; 6]),
+        );
+        assert!(
+            stats.stations.is_empty(),
+            "group dests counted as stations: {:?}",
+            stats.stations.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unicast_dest_is_a_station() {
+        let bssid = [0xB0, 0xE4, 0xD5, 0x0A, 0xC7, 0xD2];
+        let sta = [0x94, 0xB3, 0xF7, 0xDB, 0x82, 0xF2];
+        let mut stats = ReconStats::default();
+        ingest(
+            &mut stats,
+            bssid,
+            "lab",
+            -70,
+            &from_ds_data(bssid, sta, [0x22; 6]),
+        );
+        assert!(stats.stations.contains_key(&sta));
+    }
+}
