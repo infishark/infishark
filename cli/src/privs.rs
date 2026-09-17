@@ -9,7 +9,6 @@ pub fn require_root(feature: &str) -> Result<()> {
     #[cfg(unix)]
     {
         if unsafe { libc::geteuid() } != 0 {
-            // 0 = root euid
             let exe = std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "infishark".into());
@@ -113,11 +112,14 @@ mod tests {
 
     #[test]
     fn shell_quote_path_with_spaces() {
-        let p = "/home/user/documents/space space space/documents documents/ASCII char";
-        assert_eq!(shell_quote(p), "'/home/r00t/docs/shell direCtory'");
+        let p = "/home/user/My Documents/InfiShark CLI/infishark";
+        assert_eq!(
+            shell_quote(p),
+            "'/home/user/My Documents/InfiShark CLI/infishark'"
+        );
         assert_eq!(
             shell_join(&[p.into(), "wifi".into(), "adapter".into()]),
-            "'/home/1337/.local/bin/infishark' wifi adapter"
+            "'/home/user/My Documents/InfiShark CLI/infishark' wifi adapter"
         );
     }
 }

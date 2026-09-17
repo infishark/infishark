@@ -512,9 +512,17 @@ pub fn gatt_services(services: &[GattService]) {
     }
 }
 
+pub fn require_interactive(hint: &str) -> Result<()> {
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    bail!("{hint}");
+}
+
 /// Show the shared Wi-Fi table (same columns as `wifi scan`) and return the
 /// operator's selection. Multi-select: `n | n,n | a`.
 pub fn pick_networks(nets: &[Network]) -> Result<Vec<Network>> {
+    require_interactive("pass --ssid or --bssid to choose a target")?;
     let order = wifi_picker_table(nets)?;
     let picks = parse_selection(
         &prompt_line("select target(s) [n | n,n | a]: ")?,
@@ -525,6 +533,7 @@ pub fn pick_networks(nets: &[Network]) -> Result<Vec<Network>> {
 
 /// Same table as [`pick_networks`], single choice (for save / join flows).
 pub fn pick_network(nets: &[Network]) -> Result<Network> {
+    require_interactive("pass --ssid or --bssid to choose a network")?;
     let order = wifi_picker_table(nets)?;
     let picks = parse_selection(&prompt_line("select network [n]: ")?, order.len())?;
     if picks.len() != 1 {
@@ -615,6 +624,7 @@ pub fn pick_from_list<'a, T>(
     prompt: &str,
     label: impl Fn(&T) -> String,
 ) -> Result<&'a T> {
+    require_interactive("pass an explicit argument; need a terminal to pick")?;
     if items.is_empty() {
         bail!("nothing to choose from");
     }
@@ -627,6 +637,7 @@ pub fn pick_from_list<'a, T>(
 
 /// Show the BLE device table and return the operator's single selection.
 pub fn pick_ble_device(devs: &[BleDevice]) -> Result<BleDevice> {
+    require_interactive("pass a BLE address; need a terminal to pick")?;
     if devs.is_empty() {
         bail!("scan found no devices; pass an address");
     }

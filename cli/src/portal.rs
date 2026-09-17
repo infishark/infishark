@@ -106,7 +106,11 @@ fn handle_request(dev: &mut Device, root: &Path, payload: &[u8]) -> Result<()> {
         let rssi = s.get("rssi").and_then(|x| x.as_i64()).unwrap_or(0);
         eprintln!("    sta: {mac}  rssi={rssi} dBm");
     }
-    if let Some(ua) = v.get("ua").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(ua) = v
+        .get("ua")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+    {
         eprintln!("    ua: {ua}");
     }
     if let Some(h) = v.get("headers").and_then(|x| x.as_object()) {
