@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serialport::{SerialPortInfo, SerialPortType};
 
-const ESPRESSIF_VID: u16 = 0x303A;
+use infishark::serial::ESPRESSIF_VID;
 
 #[derive(Debug, Serialize)]
 pub struct PortEntry {
@@ -60,7 +60,6 @@ pub(crate) fn list(all: bool) -> Result<Vec<PortEntry>> {
         .filter(|port| all || !is_builtin_system_port(&port.name))
         .collect();
 
-    // keep one endpoint for macOS
     let keep: std::collections::HashSet<String> =
         infishark::serial::prefer_cu_over_tty(ports.iter().map(|p| p.name.clone()).collect())
             .into_iter()
@@ -74,7 +73,6 @@ pub(crate) fn list(all: bool) -> Result<Vec<PortEntry>> {
         }
     }
 
-    // Same device serial on two path names is one Nano (prefer callout path).
     ports = dedupe_confirmed_nanos(ports);
 
     ports.sort_by(|a, b| a.name.cmp(&b.name));
@@ -141,8 +139,7 @@ fn print_port(tag: &str, port: &PortEntry) {
         );
         return;
     }
-    // Not a confirmed Nano. An Espressif-VID port that didn't answer DEVICE_INFO
-    // is flagged so it's clear it's an Espressif device but not a BLEShark Nano.
+    // Espressif VID but no DEVICE_INFO.
     let note = if port.vid == Some(ESPRESSIF_VID) {
         "  (Espressif device, not a BLEShark Nano)"
     } else {

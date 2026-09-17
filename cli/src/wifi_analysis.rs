@@ -78,12 +78,7 @@ pub fn risk_flags(n: &Network) -> Vec<&'static str> {
 }
 
 fn mac6(addr: &str) -> Option<[u8; 6]> {
-    let mut n = addr.chars().filter_map(|c| c.to_digit(16));
-    let mut out = [0u8; 6];
-    for b in &mut out {
-        *b = ((n.next()? << 4) | n.next()?) as u8;
-    }
-    Some(out)
+    ieee80211::parse_mac(addr).ok()
 }
 
 /// A hidden AP that likely shares a radio with a named AP (same OUI, close

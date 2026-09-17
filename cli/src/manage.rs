@@ -154,7 +154,10 @@ fn print_lookup(results: &[serde_json::Value]) {
         {
             Some(name) => println!("{q}  {name}"),
             None => {
-                let note = r.get("error").and_then(|v| v.as_str()).unwrap_or("(unknown)");
+                let note = r
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)");
                 println!("{q}  {note}");
             }
         }

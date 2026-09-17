@@ -172,7 +172,7 @@ pub fn ascii_to_hid(c: char) -> Option<(u8, u8)> {
     })
 }
 
-/// Canonicalize + dedup a class set and assign 1-based report IDs by position.
+/// Dedup classes; assign 1-based report IDs in CANON order.
 pub fn assign(classes: &[HidClass]) -> Vec<(HidClass, u8)> {
     let mut out = Vec::new();
     let mut id = 1u8;
