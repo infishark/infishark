@@ -17,16 +17,26 @@ pub(crate) struct Target {
     pub(crate) rsn: Option<(Cipher, Cipher)>,
 }
 
-/// Resolve targets: a bare `--bssid`/`--channel`, an `--ssid` filter, or an
-/// interactive pick from a scan.
-pub(crate) fn resolve_targets(
+pub(crate) enum TargetPick {
+    All,
+    Strongest,
+}
+
+pub(crate) fn resolve_targets_ex(
     dev: &mut Device,
     ssid: Option<&str>,
     bssid: Option<&str>,
     channel: Option<u8>,
     oui_db: Option<&str>,
     keep: impl Fn(&Network) -> bool,
+    pick: TargetPick,
+    allow_interactive: bool,
 ) -> Result<Vec<Target>> {
+    if let Some(ch) = channel {
+        if ch != 0 {
+            ieee80211::channel::require(ch).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
     if let Some(bssid) = bssid {
         let channel = channel.context("--bssid needs --channel")?;
         return Ok(vec![Target {
@@ -51,17 +61,31 @@ pub(crate) fn resolve_targets(
     let mut nets = nets?;
     nets.retain(|n| keep(n));
     if let Some(ssid) = ssid {
-        return Ok(nets
-            .iter()
-            .filter(|n| n.ssid == ssid)
+        return Ok(ssid_hits(&nets, ssid, pick)
+            .into_iter()
             .filter_map(net_to_target)
             .collect());
     }
+    if !allow_interactive {
+        anyhow::bail!("pass --ssid or --bssid (no interactive picker under --json / a pipe)");
+    }
+    ui::require_interactive("pass --ssid or --bssid to choose a target")?;
     crate::enrich_wifi(oui_db, &mut nets); // vendor column in the picker
     Ok(ui::pick_networks(&nets)?
         .iter()
         .filter_map(net_to_target)
         .collect())
+}
+
+fn ssid_hits<'a>(nets: &'a [Network], ssid: &str, pick: TargetPick) -> Vec<&'a Network> {
+    let mut hits: Vec<&Network> = nets.iter().filter(|n| n.ssid == ssid).collect();
+    if matches!(pick, TargetPick::Strongest) {
+        if let Some(best) = hits.iter().copied().max_by_key(|n| n.rssi) {
+            let bssid = best.bssid.clone();
+            hits.retain(|n| n.bssid == bssid);
+        }
+    }
+    hits
 }
 
 fn net_to_target(n: &Network) -> Option<Target> {
@@ -86,4 +110,34 @@ fn net_to_target(n: &Network) -> Option<Target> {
             n.ssid.clone()
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net(ssid: &str, bssid: &str, rssi: i8, ch: u8) -> Network {
+        Network {
+            bssid: bssid.into(),
+            ssid: ssid.into(),
+            rssi,
+            channel: ch,
+            encryption: "WPA2_PSK".into(),
+            vendor: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn strongest_ssid_keeps_one_bssid() {
+        let nets = vec![
+            net("Office", "AA:AA:AA:AA:AA:01", -80, 6),
+            net("Office", "AA:AA:AA:AA:AA:02", -50, 1),
+            net("Other", "BB:BB:BB:BB:BB:BB", -20, 1),
+        ];
+        let hits = ssid_hits(&nets, "Office", TargetPick::Strongest);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bssid, "AA:AA:AA:AA:AA:02");
+        assert_eq!(ssid_hits(&nets, "Office", TargetPick::All).len(), 2);
+    }
 }

@@ -7,7 +7,6 @@ use anyhow::{Result, bail};
 use infishark::{Device, ieee80211};
 
 use crate::signals::{RUNNING, install_sigint};
-use crate::target::resolve_targets;
 use crate::ui;
 
 pub struct DeauthOpts {
@@ -17,6 +16,7 @@ pub struct DeauthOpts {
     pub client: Option<String>,
     pub reason: u16,
     pub interval_ms: u64,
+    pub interactive: bool,
 }
 
 pub fn run(dev: &mut Device, opts: &DeauthOpts, oui_db: Option<&str>) -> Result<()> {
@@ -24,13 +24,15 @@ pub fn run(dev: &mut Device, opts: &DeauthOpts, oui_db: Option<&str>) -> Result<
         Some(c) => ieee80211::parse_mac(c)?,
         None => ieee80211::BROADCAST,
     };
-    let targets = resolve_targets(
+    let targets = crate::target::resolve_targets_ex(
         dev,
         opts.ssid.as_deref(),
         opts.bssid.as_deref(),
         opts.channel,
         oui_db,
         |_| true, // deauth applies to any AP
+        crate::target::TargetPick::All,
+        opts.interactive,
     )?;
     if targets.is_empty() {
         bail!("no matching networks");

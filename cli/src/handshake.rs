@@ -33,6 +33,7 @@ pub struct HandshakeOpts {
     pub pcap_only: bool,
     pub crack: bool,
     pub wordlist: Option<String>,
+    pub interactive: bool,
 }
 
 const SUPPRESS_PROGRESS: Duration = Duration::from_secs(6);
@@ -49,13 +50,15 @@ pub fn run(dev: &mut Device, opts: &HandshakeOpts, oui_db: Option<&str>) -> Resu
         Some(c) => Some(ieee80211::parse_mac(c)?),
         None => None,
     };
-    let targets = target::resolve_targets(
+    let targets = target::resolve_targets_ex(
         dev,
         opts.ssid.as_deref(),
         opts.bssid.as_deref(),
         opts.channel,
         oui_db,
         is_psk,
+        target::TargetPick::Strongest,
+        opts.interactive,
     )?;
     if targets.is_empty() {
         anyhow::bail!("no matching networks");
@@ -321,9 +324,8 @@ fn status_lines(
     let mut warning = (hs.ap_rssi != 0 && hs.ap_rssi < WEAK_RSSI)
         .then(|| format!("weak signal ({} dBm) - move closer", hs.ap_rssi));
     if mon_dropped > 0 {
-        let drop = format!(
-            "device ring dropped {mon_dropped} frame(s). Move closer or quieter channel"
-        );
+        let drop =
+            format!("device ring dropped {mon_dropped} frame(s). Move closer or quieter channel");
         warning = Some(match warning {
             Some(w) => format!("{w}; {drop}"),
             None => drop,
