@@ -427,6 +427,13 @@ impl Device {
     /// Run a BLE scan, aggregating streamed sightings by address. Identity
     /// sticks across reports
     pub fn ble_scan(&mut self, opts: &BleScanOpts) -> Result<Vec<BleDevice>> {
+        let _ = self.stop_current_task();
+        let result = self.collect_ble_sightings(opts);
+        let _ = self.stop_current_task();
+        result
+    }
+
+    fn collect_ble_sightings(&mut self, opts: &BleScanOpts) -> Result<Vec<BleDevice>> {
         self.command_ok_local(protocol::CMD_BLE_SCAN, &opts.to_json())?;
         let mut devices: std::collections::BTreeMap<String, BleDevice> =
             std::collections::BTreeMap::new();
