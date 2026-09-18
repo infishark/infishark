@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "infishark"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "serde",
@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "infishark-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
