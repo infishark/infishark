@@ -146,6 +146,17 @@ impl Shell {
             if let Some(stats) = stats(&d.name, id) {
                 println!("{MARGIN}{}", style(stats).dim());
             }
+            if infishark::fw::is_outdated(&id.version) {
+                println!(
+                    "{MARGIN}{}",
+                    style(format!(
+                        "firmware {} is outdated (need {}); infishark device update",
+                        id.version,
+                        infishark::RECOMMENDED_FIRMWARE
+                    ))
+                    .yellow()
+                );
+            }
         }
         if self.devices.is_empty() {
             println!("{MARGIN}{}", style("no Nano connected").dim());
