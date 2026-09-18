@@ -132,15 +132,21 @@ mod tests {
             Version::parse("1.1.1").unwrap(),
             Version::parse("v1.1.1").unwrap()
         );
-        assert!(!is_outdated("1.1.1"));
-        assert!(!is_outdated("2.0.0"));
-        assert!(is_outdated("0.0"));
-        assert!(is_outdated("1.1.0"));
-        assert!(outdated_message("0.0").unwrap().contains(RECOMMENDED));
-        assert!(outdated_message("1.1.1").is_none());
         assert!(same("1.1.1", "v1.1.1"));
         assert!(same("1.1", "v1.1.0"));
         assert!(!same("1.1.0", "1.1.1"));
+    }
+
+    #[test]
+    fn recommended_gate_tracks_constant() {
+        let need = Version::parse(RECOMMENDED).expect("RECOMMENDED parses");
+        assert!(!is_outdated(RECOMMENDED));
+        assert!(!is_outdated(&format!("v{RECOMMENDED}")));
+        assert!(is_outdated("0.0"));
+        let newer = format!("{}.0.0", need.major + 1);
+        assert!(!is_outdated(&newer));
+        assert!(outdated_message("0.0").unwrap().contains(RECOMMENDED));
+        assert!(outdated_message(RECOMMENDED).is_none());
     }
 
     #[test]
