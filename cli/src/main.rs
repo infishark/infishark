@@ -2,6 +2,8 @@ mod adapter;
 mod bridge;
 mod crack;
 mod deauth;
+mod flash;
+mod fwota;
 mod handshake;
 mod hid;
 mod hidraw;
@@ -32,6 +34,7 @@ use infishark::ir_file::IrRemote;
 use infishark::model::{
     AdapterConfig, AdapterTarget, BleScanOpts, GattConnectOpts, PortalOpts, WifiScanOpts,
 };
+use infishark::json::insert_opt;
 use infishark::{company, hex, oui, pcap};
 
 // Host-held last scans (the device streams results; it doesn't retain them).
@@ -70,7 +73,24 @@ struct Cli {
 
 impl Cli {
     fn open(&self, timeout: u64) -> Result<Device> {
-        Ok(Device::open(self.port.as_deref(), timeout)?)
+        let mut dev = Device::open(self.port.as_deref(), timeout)?;
+        warn_firmware(&mut dev);
+        Ok(dev)
+    }
+}
+
+fn warn_firmware(dev: &mut Device) {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(id) = dev.firmware_identity() {
+        if let Some(w) = id.warning() {
+            eprintln!("warning: {w}");
+            eprintln!(
+                "         update with `infishark device update` or `infishark flash latest`."
+            );
+        }
     }
 }
 
@@ -93,7 +113,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Device-level queries.
+    /// Device info, status, and USB firmware update.
     Device {
         #[command(subcommand)]
         action: DeviceCmd,
@@ -130,8 +150,13 @@ enum Command {
         #[command(subcommand)]
         action: manage::ManageCmd,
     },
-    /// Update infishark to the latest published release.
+    /// Update the infishark CLI binary to the latest published release.
     Update,
+    /// Flash Nano firmware over USB.
+    Flash {
+        #[command(subcommand)]
+        action: Option<FlashCmd>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,6 +165,49 @@ enum DeviceCmd {
     Info,
     /// Live status: uptime, heap, battery, mesh.
     Status,
+    /// Flash latest firmware (same as `flash latest`).
+    Update {
+        #[command(flatten)]
+        ch: FlashChannel,
+    },
+}
+
+#[derive(Debug, Args)]
+struct FlashChannel {
+    /// Use the beta channel.
+    #[arg(long)]
+    beta: bool,
+    /// Skip the confirm prompt.
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum FlashCmd {
+    /// List firmware channels and latest tags.
+    Versions,
+    /// Install latest firmware.
+    Latest {
+        #[command(flatten)]
+        ch: FlashChannel,
+    },
+    /// Install BLEShark Setup.
+    Setup {
+        /// Setup tag (default: latest).
+        tag: Option<String>,
+        /// Skip the confirm prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Keep on-device files and settings (skip full flash erase).
+        #[arg(long)]
+        keep_storage: bool,
+    },
+    /// Install a specific tag.
+    Install {
+        tag: String,
+        #[command(flatten)]
+        ch: FlashChannel,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -235,7 +303,7 @@ enum WifiCmd {
         #[arg(long)]
         dwell: Option<u32>,
         /// Restrict to a single channel (1-14); 0/omitted = all.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=14))]
         channel: Option<u8>,
         /// Exclude hidden-SSID APs (default includes them).
         #[arg(long)]
@@ -325,7 +393,7 @@ enum WifiCmd {
     Monitor {
         /// Channel to capture on (1-14). Default is 1. Ignored when
         /// associating (--ssid / --index); the AP's channel is used.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=14))]
         channel: u8,
         /// Join this SSID before enabling promisc (stay associated).
         #[arg(long, conflicts_with = "index")]
@@ -412,7 +480,7 @@ enum WifiCmd {
         hex: Option<String>,
         /// Channel (1-14). 0 = device current, or AP channel after a scan pick.
         /// Beacon: 0 = channel 6 when synthesizing.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=14))]
         channel: u8,
         /// TX attempts per target (0 = until Ctrl-C). Runs on-device.
         #[arg(long, default_value_t = 1)]
@@ -468,7 +536,7 @@ enum WifiCmd {
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
         /// Channel of --bssid.
-        #[arg(long, requires = "bssid")]
+        #[arg(long, requires = "bssid", value_parser = clap::value_parser!(u8).range(1..=14))]
         channel: Option<u8>,
         /// Deauth one station (default: broadcast to all clients).
         #[arg(long)]
@@ -489,7 +557,7 @@ enum WifiCmd {
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
         /// Channel of --bssid.
-        #[arg(long, requires = "bssid")]
+        #[arg(long, requires = "bssid", value_parser = clap::value_parser!(u8).range(1..=14))]
         channel: Option<u8>,
         /// Deauth one station (default: broadcast until a client is seen).
         #[arg(long)]
@@ -555,7 +623,7 @@ enum WifiCmd {
         #[arg(long)]
         pass: Option<String>,
         /// SoftAP channel 1-13 (default 1).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=13))]
         channel: Option<u8>,
         /// Hide the SSID in beacons.
         #[arg(long)]
@@ -980,7 +1048,6 @@ fn main() -> ExitCode {
             if cli.json {
                 println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
             } else {
-                // Multi-line root hints from privs::require_root.
                 eprintln!("Error: {e:#}");
             }
             ExitCode::FAILURE
@@ -1005,10 +1072,21 @@ fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
         Command::Files { action } => cmd_files(cli, action),
         Command::Manage { db, action } => manage::run(cli.json, db, action),
         Command::Update => cmd_update(),
+        Command::Flash { action } => match action {
+            None | Some(FlashCmd::Versions) => flash::catalog(cli.json, cli.port.as_deref()),
+            Some(FlashCmd::Latest { ch }) => flash_install(cli, "latest", ch.beta, ch.yes),
+            Some(FlashCmd::Setup { tag, yes, keep_storage }) => flash::setup(flash::Setup {
+                tag: tag.clone(),
+                yes: *yes,
+                json: cli.json,
+                port: cli.port.clone(),
+                keep_storage: *keep_storage,
+            }),
+            Some(FlashCmd::Install { tag, ch }) => flash_install(cli, tag.clone(), ch.beta, ch.yes),
+        },
     }
 }
 
-/// Replace the running binary with the latest release for this platform.
 fn cmd_update() -> Result<()> {
     let status = self_update::backends::github::Update::configure()
         .repo_owner("infishark")
@@ -1026,11 +1104,35 @@ fn cmd_update() -> Result<()> {
     Ok(())
 }
 
+fn flash_install(cli: &Cli, tag: impl Into<String>, beta: bool, yes: bool) -> Result<()> {
+    flash::install(flash::Install {
+        tag: tag.into(),
+        kind: if beta { "beta" } else { "main" },
+        yes,
+        json: cli.json,
+        port: cli.port.clone(),
+        timeout_ms: cli.timeout_ms,
+    })
+}
+
 fn cmd_device(cli: &Cli, action: &DeviceCmd) -> Result<()> {
+    if let DeviceCmd::Update { ch } = action {
+        return flash_install(cli, "latest", ch.beta, ch.yes);
+    }
     let mut dev = cli.open(cli.timeout_ms)?;
     let v = match action {
-        DeviceCmd::Info => dev.device_info()?,
+        DeviceCmd::Info => {
+            let mut info = dev.device_info()?;
+            if let Some(obj) = info.as_object_mut() {
+                obj.insert(
+                    "recommended_firmware".into(),
+                    infishark::RECOMMENDED_FIRMWARE.into(),
+                );
+            }
+            info
+        }
         DeviceCmd::Status => dev.system_status()?,
+        DeviceCmd::Update { .. } => unreachable!(),
     };
     if cli.json {
         print_value(&v, true)
@@ -1146,8 +1248,9 @@ fn cmd_files(cli: &Cli, action: &FilesCmd) -> Result<()> {
         }
         FilesCmd::Push { src, dest } => {
             let bytes = std::fs::read(src).with_context(|| format!("read {}", src.display()))?;
+            let dest = canonical_cli_path(dest);
             // refuse a file that can't fit
-            if let Some(free) = device_free_bytes(&dev.file_list()?, dest) {
+            if let Some(free) = device_free_bytes(&dev.file_list()?, &dest) {
                 if bytes.len() as u64 > free {
                     bail!(
                         "{} is {} bytes but only {free} free on device",
@@ -1156,7 +1259,7 @@ fn cmd_files(cli: &Cli, action: &FilesCmd) -> Result<()> {
                     );
                 }
             }
-            dev.file_write(dest, &bytes)?;
+            dev.file_write(&dest, &bytes)?;
             print_action(
                 serde_json::json!({ "dest": dest, "bytes": bytes.len() }),
                 format!("Pushed {} byte(s) to {dest}.", bytes.len()),
@@ -1190,7 +1293,21 @@ fn resolve_file_target(arg: &str) -> Result<String> {
             .map(String::from)
             .context("cached entry has no path");
     }
-    Ok(cached_path_for(arg).unwrap_or_else(|| arg.to_string()))
+    Ok(cached_path_for(arg).unwrap_or_else(|| canonical_cli_path(arg)))
+}
+
+fn canonical_cli_path(arg: &str) -> String {
+    let p = arg.trim();
+    if p.is_empty() || p.starts_with('/') {
+        return p.to_string();
+    }
+    if matches!(
+        p,
+        "ducky" | "remote1" | "remote2" | "remote3" | "remote4" | "remote5"
+    ) {
+        return p.to_string();
+    }
+    format!("/{p}")
 }
 
 // Match a name against cached `files ls` paths (exact path or basename).
@@ -1569,17 +1686,28 @@ fn cmd_ir_rx(
 
 fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
     if let WifiCmd::List { verbose } = action {
-        let nets = LAST_WIFI.lock().unwrap().clone();
-        if nets.is_empty() && !cli.json {
-            println!("no cached scan; run `wifi scan` first");
-            return Ok(());
+        let mut nets = LAST_WIFI.lock().unwrap().clone();
+        if nets.is_empty() {
+            let mut dev = cli.open(cli.timeout_ms.max(15_000))?;
+            let sp = ui::Spinner::start("scanning networks");
+            let scanned = dev.wifi_scan(&WifiScanOpts::default());
+            sp.stop();
+            nets = scanned?;
+            enrich_wifi(oui_db, &mut nets);
+            *LAST_WIFI.lock().unwrap() = nets.clone();
         }
         return print_networks(&nets, cli.json, *verbose);
     }
     if let WifiCmd::Show { target } = action {
-        let nets = LAST_WIFI.lock().unwrap().clone();
+        let mut nets = LAST_WIFI.lock().unwrap().clone();
         if nets.is_empty() {
-            bail!("no cached scan; run `wifi scan` first");
+            let mut dev = cli.open(cli.timeout_ms.max(15_000))?;
+            let sp = ui::Spinner::start("scanning networks");
+            let scanned = dev.wifi_scan(&WifiScanOpts::default());
+            sp.stop();
+            nets = scanned?;
+            enrich_wifi(oui_db, &mut nets);
+            *LAST_WIFI.lock().unwrap() = nets.clone();
         }
         let n = recon::resolve_from_cache(&nets, Some(target), None, None)?;
         if cli.json {
@@ -1688,6 +1816,9 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 *LAST_WIFI.lock().unwrap() = nets.clone();
             }
             let net = if interactive {
+                if cli.json {
+                    bail!("pass a target, --ssid, or --bssid (no interactive picker under --json)");
+                }
                 ui::pick_network(&nets)?
             } else {
                 recon::resolve_from_cache(
@@ -1894,6 +2025,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 client: client.clone(),
                 reason: *reason,
                 interval_ms: *interval_ms,
+                interactive: !cli.json,
             },
             oui_db,
         ),
@@ -1939,6 +2071,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 pcap_only: *pcap_only,
                 crack: *crack,
                 wordlist: wordlist.clone(),
+                interactive: !cli.json,
             },
             oui_db,
         ),
@@ -2017,6 +2150,9 @@ fn cmd_wifi_add(
     pass: Option<String>,
     scan_ms: u32,
 ) -> Result<()> {
+    if cli.json && (ssid.is_none() || pass.is_none()) {
+        bail!("wifi saved add under --json needs --ssid and --pass");
+    }
     let ssid = match ssid {
         Some(s) => s,
         None => pick_ssid_interactively(dev, oui_db, scan_ms)?,
@@ -2117,9 +2253,17 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
         BleCmd::List => {
             let mut devices = LAST_BLE.lock().unwrap().clone();
             if devices.is_empty() {
-                let mut dev = cli.open(cli.timeout_ms)?;
-                devices = dev.ble_list()?;
+                let opts = BleScanOpts {
+                    duration_ms: Some(10_000),
+                    ..Default::default()
+                };
+                let mut dev = cli.open(cli.timeout_ms.max(15_000))?;
+                let sp = ui::Spinner::start("scanning BLE");
+                let scanned = dev.ble_scan(&opts);
+                sp.stop();
+                devices = scanned?;
                 enrich_ble(db, &mut devices);
+                *LAST_BLE.lock().unwrap() = devices.clone();
             }
             print_devices(&devices, cli.json)
         }
@@ -2381,11 +2525,6 @@ fn hid_summary(ident: &serde_json::Value) -> String {
 
 type JsonMap = serde_json::Map<String, serde_json::Value>;
 
-/// Insert `key: value` only when the option is set.
-fn insert_opt<T: Into<serde_json::Value>>(m: &mut JsonMap, key: &str, value: Option<T>) {
-    infishark::json::insert_opt(m, key, value);
-}
-
 /// Insert the shared spoof-MAC fields used by every peripheral spec.
 fn insert_mac(m: &mut JsonMap, mac: &Option<String>, random_mac: bool) {
     insert_opt(m, "mac", mac.as_deref());
@@ -2553,6 +2692,11 @@ fn build_serve_spec(
         if let Some(v) = value {
             cobj.insert("value".into(), serde_json::json!(v));
         }
+        if hex::reserved_sig_service(svc) {
+            anyhow::bail!(
+                "service UUID {svc} is a Bluetooth SIG reserved service (0x18xx); use a custom UUID such as 1234"
+            );
+        }
         if !by_svc.contains_key(svc) {
             order.push(svc.to_string());
         }
@@ -2638,16 +2782,29 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
             warn_if_mesh_active(&mut dev);
             match dev.gatt_connect(&address, &opts) {
                 Ok(()) => print_ok(cli.json),
-                Err(e) => {
-                    if !cli.json && matches!(addr_type, 0 | 1) {
-                        let alt = if addr_type == 0 { 1 } else { 0 };
-                        eprintln!(
-                            "hint: link-layer connect failed before GATT. \
+                Err(e) if matches!(addr_type, 0 | 1) => {
+                    let alt = if addr_type == 0 { 1 } else { 0 };
+                    let mut flipped = opts.clone();
+                    flipped.addr_type = alt;
+                    match dev.gatt_connect(&address, &flipped) {
+                        Ok(()) => {
+                            if !cli.json {
+                                eprintln!("connected with --addr-type {alt}");
+                            }
+                            print_ok(cli.json)
+                        }
+                        Err(_) => {
+                            if !cli.json {
+                                eprintln!(
+                                    "hint: link-layer connect failed before GATT. \
 retry {address} with --addr-type {alt}"
-                        );
+                                );
+                            }
+                            Err(e.into())
+                        }
                     }
-                    Err(e.into())
                 }
+                Err(e) => Err(e.into()),
             }
         }
         GattCmd::Enum => {
