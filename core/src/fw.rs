@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use crate::error::{Error, Result};
 use crate::hex;
 
-pub const RECOMMENDED: &str = "1.1.1";
+pub const RECOMMENDED: &str = "1.2.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Version {
@@ -113,7 +113,6 @@ impl DeviceFw {
     }
 }
 
-/// True when both strings parse as the same dotted version (`1.1.1` == `v1.1.1`).
 pub fn same(a: &str, b: &str) -> bool {
     match (Version::parse(a), Version::parse(b)) {
         (Some(x), Some(y)) => x == y,
