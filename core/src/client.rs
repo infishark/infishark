@@ -510,6 +510,13 @@ impl Device {
         self.command_ok(protocol::CMD_BLE_HID_SEND, spec)
     }
 
+    /// Dual-link GATT proxy: connect to `spec.address`, clone its table, advertise.
+    /// Out: cloned identity (`name`, `mac`, `peer`, `chars`). ATT traffic then
+    /// arrives as [`protocol::EVT_BLE_MITM`].
+    pub fn ble_mitm_start(&mut self, spec: &serde_json::Value) -> Result<serde_json::Value> {
+        self.json_command(protocol::CMD_BLE_MITM, spec.to_string().as_bytes())
+    }
+
     /// Block for the next peripheral event (a central write/connect/subscribe),
     /// returning its JSON tagged with an `event` field.
     pub fn next_ble_event(&mut self) -> Result<serde_json::Value> {
@@ -520,6 +527,7 @@ impl Device {
                 protocol::EVT_BLE_CONNECT => "connect",
                 protocol::EVT_BLE_SUBSCRIBE => "subscribe",
                 protocol::EVT_BLE_HID_OUTPUT => "hid_output",
+                protocol::EVT_BLE_MITM => "mitm",
                 _ => continue,
             };
             let mut v: serde_json::Value =
