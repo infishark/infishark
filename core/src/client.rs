@@ -511,10 +511,31 @@ impl Device {
     }
 
     /// Dual-link GATT proxy: connect to `spec.address`, clone its table, advertise.
-    /// Out: cloned identity (`name`, `mac`, `peer`, `chars`). ATT traffic then
-    /// arrives as [`protocol::EVT_BLE_MITM`].
-    pub fn ble_mitm_start(&mut self, spec: &serde_json::Value) -> Result<serde_json::Value> {
-        self.json_command(protocol::CMD_BLE_MITM, spec.to_string().as_bytes())
+    /// Out: cloned identity (`name`, `mac`, `peer`, `chars`). Progress and ATT
+    /// traffic arrive as [`protocol::EVT_BLE_MITM`]; `on_event` is called for
+    /// progress frames that arrive before the command completes.
+    pub fn ble_mitm_start(
+        &mut self,
+        spec: &serde_json::Value,
+        mut on_event: impl FnMut(serde_json::Value),
+    ) -> Result<serde_json::Value> {
+        let args = spec.to_string();
+        let resp = self.transport.transact_with_events(
+            protocol::CMD_BLE_MITM,
+            args.as_bytes(),
+            |id, payload| {
+                if id == protocol::EVT_BLE_MITM {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                        on_event(v);
+                    }
+                }
+            },
+        )?;
+        check(&resp)?;
+        if resp.body.is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        Ok(serde_json::from_slice(&resp.body)?)
     }
 
     /// Block for the next peripheral event (a central write/connect/subscribe),

@@ -184,6 +184,58 @@ impl<S: Read + Write> Transport<S> {
         }
     }
 
+    /// Like [`Self::transact`], but delivers EVENT frames to `on_event` as they
+    /// arrive instead of buffering them. Used by long commands (BLE MITM) that
+    /// emit progress while the response is still outstanding.
+    pub fn transact_with_events(
+        &mut self,
+        opcode: u16,
+        args: &[u8],
+        mut on_event: impl FnMut(u16, &[u8]),
+    ) -> Result<Response> {
+        let seq = self.next_seq();
+        let frame = frame::encode_command(seq, opcode, args);
+        self.stream.write_all(&frame)?;
+        self.stream.flush()?;
+
+        let mut acc: Vec<u8> = Vec::new();
+        let mut cmd = opcode;
+        let mut error = ERR_OK;
+        let mut have_header = false;
+        loop {
+            let f = self.next_inbound()?;
+            if (f.typ == PKT_RESPONSE || f.typ == PKT_ERROR) && f.seq == seq {
+                let Some((h, data)) = parse_response_header(&f.payload) else {
+                    bail!("malformed response header (seq {seq})");
+                };
+                if !have_header {
+                    cmd = h.cmd;
+                    error = h.error;
+                    have_header = true;
+                }
+                acc.extend_from_slice(data);
+                if acc.len() > MAX_REASSEMBLY {
+                    bail!("response reassembly exceeded {MAX_REASSEMBLY} bytes");
+                }
+                if !h.has_more() {
+                    return Ok(Response {
+                        cmd,
+                        error,
+                        body: acc,
+                    });
+                }
+            } else if f.typ == PKT_EVENT && f.payload.len() >= 3 {
+                let id = u16::from_le_bytes([f.payload[0], f.payload[1]]);
+                on_event(id, &f.payload[3..]);
+            } else {
+                self.events.push(f);
+                if self.events.len() > MAX_BUFFERED_EVENTS {
+                    bail!("too many buffered events ({})", self.events.len());
+                }
+            }
+        }
+    }
+
     /// Send a command and return the first correlated response frame.
     pub fn transact_chunk(
         &mut self,
@@ -282,6 +334,28 @@ mod tests {
         let mut t = Transport::new(MockStream::new(wire));
         let r = t.transact(CMD_WIFI_SCAN, b"").unwrap();
         assert_eq!(r.json(), "{\"count\":2}");
+    }
+
+    #[test]
+    fn transact_with_events_delivers_progress_before_response() {
+        let mut ev_payload = Vec::new();
+        ev_payload.extend_from_slice(&EVT_SCAN_DONE.to_le_bytes());
+        ev_payload.push(RESP_JSON);
+        ev_payload.extend_from_slice(b"{\"step\":\"connect\"}");
+        let mut wire = frame::encode(PKT_EVENT, 99, &ev_payload);
+        wire.extend(resp(0, CMD_WIFI_SCAN, ERR_OK, RESP_JSON, b"{\"ok\":true}"));
+        let mut t = Transport::new(MockStream::new(wire));
+        let mut seen = Vec::new();
+        let r = t
+            .transact_with_events(CMD_WIFI_SCAN, b"", |id, body| {
+                seen.push((id, body.to_vec()));
+            })
+            .unwrap();
+        assert_eq!(r.json(), "{\"ok\":true}");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, EVT_SCAN_DONE);
+        assert_eq!(seen[0].1, b"{\"step\":\"connect\"}");
+        assert!(t.drain_events().is_empty());
     }
 
     #[test]

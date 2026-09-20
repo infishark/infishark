@@ -2820,7 +2820,7 @@ fn cmd_mitm(
 ) -> Result<()> {
     let timeout = cli
         .timeout_ms
-        .max(connect_timeout_ms.unwrap_or(0) as u64 + 15_000);
+        .max(connect_timeout_ms.unwrap_or(0) as u64 + 30_000);
     let mut dev = cli.open(timeout)?;
     let (address, addr_type) = match address {
         Some(a) => (a.clone(), addr_type),
@@ -2845,7 +2845,28 @@ fn cmd_mitm(
     insert_opt(&mut spec, "passkey", passkey);
     insert_opt(&mut spec, "timeout_ms", connect_timeout_ms);
     warn_if_mesh_active(&mut dev);
-    let ident = dev.ble_mitm_start(&serde_json::Value::Object(spec))?;
+    let label = LAST_BLE
+        .lock()
+        .ok()
+        .and_then(|devs| {
+            devs.iter()
+                .find(|d| d.address.eq_ignore_ascii_case(&address))
+                .and_then(|d| d.name.clone())
+        })
+        .filter(|s| !s.is_empty());
+    if !cli.json {
+        match &label {
+            Some(n) => eprintln!("connecting to {n} ({address}, addr-type {addr_type})..."),
+            None => eprintln!("connecting to {address} (addr-type {addr_type})..."),
+        }
+    }
+    let ident = dev.ble_mitm_start(&serde_json::Value::Object(spec), |v| {
+        if cli.json {
+            let _ = writeln!(std::io::stdout(), "{}", v);
+        } else {
+            print_mitm_event(&v);
+        }
+    })?;
     if cli.json {
         println!("{}", serde_json::to_string(&ident)?);
     } else {
@@ -2889,8 +2910,23 @@ fn cmd_mitm(
 }
 
 fn print_mitm_event(v: &serde_json::Value) {
-    let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or("?");
     let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("?");
+    if op == "status" {
+        let step = v.get("step").and_then(|x| x.as_str()).unwrap_or("?");
+        let heap = v.get("heap").and_then(|x| x.as_u64());
+        let heap_s = heap.map(|h| format!("  heap={h}")).unwrap_or_default();
+        let msg = match step {
+            "connect" => "connecting to peripheral...",
+            "connected" => "connected to peripheral",
+            "clone" => "cloning GATT table...",
+            "advertise" => "advertising as the clone...",
+            "ready" => "ready — waiting for a central",
+            other => other,
+        };
+        eprintln!("  {msg}{heap_s}");
+        return;
+    }
+    let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or("?");
     let chr = v.get("char").and_then(|x| x.as_str()).unwrap_or("");
     let hex = v.get("hex").and_then(|x| x.as_str()).unwrap_or("");
     let addr = v.get("addr").and_then(|x| x.as_str()).unwrap_or("");
