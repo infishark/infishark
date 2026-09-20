@@ -125,7 +125,8 @@ pub fn bluetooth_uuid(s: &str) -> Result<String> {
     ))
 }
 
-/// SIG 0x18xx service UUID (`ble serve` rejects these).
+/// SIG 0x18xx service UUID (`ble serve` rejects these), except HID (`0x1812`)
+/// which is allowed for impersonation and MITM clone.
 pub fn reserved_sig_service(uuid: &str) -> bool {
     let Ok(n) = bluetooth_uuid(uuid) else {
         return false;
@@ -133,7 +134,7 @@ pub fn reserved_sig_service(uuid: &str) -> bool {
     if !n.ends_with(BT_BASE_TAIL) || !n.starts_with("0000") {
         return false;
     }
-    u16::from_str_radix(&n[4..8], 16).is_ok_and(|u| (0x1800..=0x18ff).contains(&u))
+    u16::from_str_radix(&n[4..8], 16).is_ok_and(|u| (0x1800..=0x18ff).contains(&u) && u != 0x1812)
 }
 
 #[cfg(test)]
@@ -201,7 +202,8 @@ mod tests {
     fn reserved_sig_service_flags_gap_and_dis() {
         assert!(reserved_sig_service("180a"));
         assert!(reserved_sig_service("0x1800"));
-        assert!(reserved_sig_service("1812"));
+        assert!(!reserved_sig_service("1812"));
+        assert!(!reserved_sig_service("0x1812"));
         assert!(!reserved_sig_service("1234"));
         assert!(!reserved_sig_service("2a00"));
     }
