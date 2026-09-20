@@ -63,6 +63,7 @@ pub const CMD_BLE_GATT_READ: u16 = 0x0222;
 pub const CMD_BLE_GATT_WRITE: u16 = 0x0223;
 pub const CMD_BLE_GATT_SUBSCRIBE: u16 = 0x0224;
 pub const CMD_BLE_GATT_UNSUBSCRIBE: u16 = 0x0225;
+pub const CMD_BLE_MITM: u16 = 0x0226;
 // 0x03 IR
 pub const CMD_IR_RX: u16 = 0x0300;
 pub const CMD_IR_TX: u16 = 0x0310;
@@ -118,3 +119,4 @@ pub const EVT_WIFI_DEVICE: u16 = 0x000C;
 pub const EVT_IR: u16 = 0x000D;
 pub const EVT_PORTAL_REQUEST: u16 = 0x000E;
 pub const EVT_WIFI_TX: u16 = 0x000F;
+pub const EVT_BLE_MITM: u16 = 0x0010;

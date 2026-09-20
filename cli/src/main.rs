@@ -31,10 +31,10 @@ use serde::Serialize;
 use infishark::client::Device;
 use infishark::ir::IrCapture;
 use infishark::ir_file::IrRemote;
+use infishark::json::insert_opt;
 use infishark::model::{
     AdapterConfig, AdapterTarget, BleScanOpts, GattConnectOpts, PortalOpts, WifiScanOpts,
 };
-use infishark::json::insert_opt;
 use infishark::{company, hex, oui, pcap};
 
 // Host-held last scans (the device streams results; it doesn't retain them).
@@ -830,6 +830,44 @@ enum BleCmd {
         #[command(subcommand)]
         action: HidCmd,
     },
+    /// Dual-link GATT proxy: clone a peripheral, wait for a central, relay ATT.
+    Mitm {
+        /// Target address, e.g. AA:BB:CC:DD:EE:FF (omit to scan and pick).
+        address: Option<String>,
+        /// Address type: 0=public, 1=random.
+        #[arg(long, default_value_t = 0)]
+        addr_type: u8,
+        /// Advertised name (default: the target's GAP name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Advertiser MAC (default: the target's address).
+        #[arg(long)]
+        mac: Option<String>,
+        /// Keep the Nano's own MAC instead of spoofing the target.
+        #[arg(long)]
+        no_spoof: bool,
+        /// Initiate pairing/encryption with the target after connecting.
+        #[arg(long)]
+        secure: bool,
+        /// Persist keys with the target.
+        #[arg(long)]
+        bond: bool,
+        /// Require MITM protection when pairing to the target.
+        #[arg(long)]
+        mitm: bool,
+        /// Use LE Secure Connections with the target.
+        #[arg(long)]
+        sc: bool,
+        /// Pairing IO capability for the target link.
+        #[arg(long)]
+        io_cap: Option<u8>,
+        /// Passkey to supply if the target requests one.
+        #[arg(long)]
+        passkey: Option<u32>,
+        /// BLE connection-attempt timeout in ms.
+        #[arg(long)]
+        connect_timeout_ms: Option<u32>,
+    },
     /// Stop the peripheral (advertiser or GATT server).
     Stop,
     /// Keep the device's BLE stack initialized across commands (on), or release
@@ -1075,7 +1113,11 @@ fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
         Command::Flash { action } => match action {
             None | Some(FlashCmd::Versions) => flash::catalog(cli.json, cli.port.as_deref()),
             Some(FlashCmd::Latest { ch }) => flash_install(cli, "latest", ch.beta, ch.yes),
-            Some(FlashCmd::Setup { tag, yes, keep_storage }) => flash::setup(flash::Setup {
+            Some(FlashCmd::Setup {
+                tag,
+                yes,
+                keep_storage,
+            }) => flash::setup(flash::Setup {
                 tag: tag.clone(),
                 yes: *yes,
                 json: cli.json,
@@ -2392,6 +2434,35 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             print_ok(cli.json)
         }
         BleCmd::Hid { action } => cmd_hid(cli, action),
+        BleCmd::Mitm {
+            address,
+            addr_type,
+            name,
+            mac,
+            no_spoof,
+            secure,
+            bond,
+            mitm,
+            sc,
+            io_cap,
+            passkey,
+            connect_timeout_ms,
+        } => cmd_mitm(
+            cli,
+            db,
+            address,
+            *addr_type,
+            name,
+            mac,
+            *no_spoof,
+            *secure,
+            *bond,
+            *mitm,
+            *sc,
+            *io_cap,
+            *passkey,
+            *connect_timeout_ms,
+        ),
         BleCmd::Stop => {
             let mut dev = cli.open(cli.timeout_ms)?;
             dev.stop_current_task()?;
@@ -2727,6 +2798,108 @@ fn warn_if_mesh_active(dev: &mut Device) {
                 "note: mesh is active; it is suspended for the duration of this connection and may reduce link stability"
             );
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_mitm(
+    cli: &Cli,
+    db: &DbOpts,
+    address: &Option<String>,
+    addr_type: u8,
+    name: &Option<String>,
+    mac: &Option<String>,
+    no_spoof: bool,
+    secure: bool,
+    bond: bool,
+    mitm: bool,
+    sc: bool,
+    io_cap: Option<u8>,
+    passkey: Option<u32>,
+    connect_timeout_ms: Option<u32>,
+) -> Result<()> {
+    let timeout = cli
+        .timeout_ms
+        .max(connect_timeout_ms.unwrap_or(0) as u64 + 15_000);
+    let mut dev = cli.open(timeout)?;
+    let (address, addr_type) = match address {
+        Some(a) => (a.clone(), addr_type),
+        None => pick_ble_target(&mut dev, db)?,
+    };
+    let mut spec = serde_json::Map::new();
+    spec.insert("address".into(), address.clone().into());
+    infishark::json::insert_flag(&mut spec, "addr_type", addr_type != 0, addr_type.into());
+    insert_opt(&mut spec, "name", name.as_deref());
+    if no_spoof {
+        spec.insert("spoof".into(), false.into());
+    } else if let Some(m) = mac {
+        spec.insert("mac".into(), m.clone().into());
+    } else {
+        spec.insert("mac".into(), address.clone().into());
+    }
+    infishark::json::insert_flag(&mut spec, "secure", secure, true.into());
+    infishark::json::insert_flag(&mut spec, "bond", bond, true.into());
+    infishark::json::insert_flag(&mut spec, "mitm", mitm, true.into());
+    infishark::json::insert_flag(&mut spec, "sc", sc, true.into());
+    insert_opt(&mut spec, "io_cap", io_cap);
+    insert_opt(&mut spec, "passkey", passkey);
+    insert_opt(&mut spec, "timeout_ms", connect_timeout_ms);
+    warn_if_mesh_active(&mut dev);
+    let ident = dev.ble_mitm_start(&serde_json::Value::Object(spec))?;
+    if cli.json {
+        println!("{}", serde_json::to_string(&ident)?);
+    } else {
+        let n = ident.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        let m = ident.get("mac").and_then(|x| x.as_str()).unwrap_or("?");
+        let chars = ident.get("chars").and_then(|x| x.as_u64()).unwrap_or(0);
+        eprintln!("cloned {n} {m}  {chars} chars  peer={address}");
+        eprintln!("waiting for a central... Ctrl-C stops");
+    }
+
+    crate::signals::install_sigint();
+    crate::signals::RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
+    dev.set_read_timeout(std::time::Duration::from_millis(300))?;
+    loop {
+        if !crate::signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        match dev.next_event() {
+            Ok((id, payload)) if id == infishark::protocol::EVT_BLE_MITM => {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&payload).unwrap_or_else(|_| serde_json::json!({}));
+                if cli.json {
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    print_mitm_event(&v);
+                }
+            }
+            Ok(_) => {}
+            Err(infishark::Error::Timeout) => continue,
+            Err(e) => {
+                let _ = dev.stop_current_task();
+                return Err(e.into());
+            }
+        }
+    }
+    let _ = dev.stop_current_task();
+    if !cli.json {
+        eprintln!("mitm stopped");
+    }
+    Ok(())
+}
+
+fn print_mitm_event(v: &serde_json::Value) {
+    let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or("?");
+    let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("?");
+    let chr = v.get("char").and_then(|x| x.as_str()).unwrap_or("");
+    let hex = v.get("hex").and_then(|x| x.as_str()).unwrap_or("");
+    let addr = v.get("addr").and_then(|x| x.as_str()).unwrap_or("");
+    if !chr.is_empty() {
+        eprintln!("{dir:<6} {op:<12} {chr}  {hex}");
+    } else if !addr.is_empty() {
+        eprintln!("{dir:<6} {op:<12} {addr}");
+    } else {
+        eprintln!("{dir:<6} {op}");
     }
 }
 
