@@ -867,7 +867,8 @@ enum BleCmd {
         /// `ble-mitm-<unix>.pcap` in the current directory.
         #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "AUTO")]
         pcap: Option<String>,
-        /// Hold each ATT PDU for the host (SDK callback / auto-allow).
+        /// Hold each ATT PDU until the SDK answers, or until
+        /// --intercept-timeout-ms (default 40) auto-allows it.
         #[arg(long)]
         intercept: bool,
         /// Auto-allow timeout in ms when intercepting (default 40).
@@ -2328,7 +2329,13 @@ fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
 }
 
 fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
-    let mut devices = dev.ble_bonds().unwrap_or_default();
+    let mut devices = match dev.ble_bonds() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("note: saved BLE devices unavailable ({e})");
+            Vec::new()
+        }
+    };
     for d in &mut devices {
         d.paired = true;
     }
@@ -2346,14 +2353,9 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
                     .iter_mut()
                     .find(|b| b.address.eq_ignore_ascii_case(&d.address))
                 {
-                    ex.rssi = d.rssi;
-                    if ex.name.is_none() {
-                        ex.name = d.name.clone();
-                    }
-                    ex.paired = true;
-                    if ex.addr_type.is_none() {
-                        ex.addr_type = d.addr_type;
-                    }
+                    let paired = true;
+                    ex.merge_from(&d);
+                    ex.paired = paired;
                 } else {
                     devices.push(d);
                 }
@@ -3309,13 +3311,6 @@ fn cmd_mitm(
                     w.flush()?;
                     pcap_n += 1;
                 }
-                if intercept {
-                    if let Some(ix) = v.get("id").and_then(|x| x.as_u64()) {
-                        if (1..256).contains(&ix) {
-                            let _ = dev.ble_mitm_action(ix as u8, infishark::MitmAction::Allow);
-                        }
-                    }
-                }
                 if cli.json {
                     if pcap_path.as_deref() != Some("-") {
                         println!("{}", serde_json::to_string(&v)?);
@@ -3380,8 +3375,10 @@ fn print_mitm_event(v: &serde_json::Value) {
     let chr = v.get("char").and_then(|x| x.as_str()).unwrap_or("");
     let hex = v.get("hex").and_then(|x| x.as_str()).unwrap_or("");
     let addr = v.get("addr").and_then(|x| x.as_str()).unwrap_or("");
+    let id = v.get("id").and_then(|x| x.as_u64());
+    let id_s = id.map(|n| format!("  id={n}")).unwrap_or_default();
     if !chr.is_empty() {
-        eprintln!("{dir:<6} {op:<12} {chr}  {hex}");
+        eprintln!("{dir:<6} {op:<12} {chr}  {hex}{id_s}");
     } else if !addr.is_empty() {
         if let Some(r) = v.get("reason").and_then(|x| x.as_i64()) {
             eprintln!("{dir:<6} {op:<12} {addr}  reason={r}");
