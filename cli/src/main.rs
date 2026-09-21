@@ -2930,7 +2930,11 @@ fn print_mitm_event(v: &serde_json::Value) {
     if !chr.is_empty() {
         eprintln!("{dir:<6} {op:<12} {chr}  {hex}");
     } else if !addr.is_empty() {
-        eprintln!("{dir:<6} {op:<12} {addr}");
+        if let Some(r) = v.get("reason").and_then(|x| x.as_i64()) {
+            eprintln!("{dir:<6} {op:<12} {addr}  reason={r}");
+        } else {
+            eprintln!("{dir:<6} {op:<12} {addr}");
+        }
     } else {
         eprintln!("{dir:<6} {op}");
     }
