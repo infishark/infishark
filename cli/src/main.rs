@@ -2966,6 +2966,7 @@ fn print_mitm_event(v: &serde_json::Value) {
             "snapshot" => "reading GATT table...",
             "gatts" => "building local GATT server...",
             "reconnect" => "reconnecting to peripheral...",
+            "bonded" => "using stored bond (no PIN)",
             "pair" => "waiting for pairing (type the PIN on the keyboard)...",
             "advertise" => "advertising as the clone...",
             "ready" => "ready — waiting for a central",
