@@ -182,6 +182,9 @@ pub struct BleDevice {
     /// Host-resolved Bluetooth SIG manufacturer name; omitted until enriched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company: Option<String>,
+    /// Saved on the Nano (paired); may not be advertising.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paired: bool,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -529,6 +532,7 @@ mod tests {
             company_id: Some(0x004c),
             vendor: None,
             company: None,
+            paired: false,
             extra: BTreeMap::from([("connectable".into(), serde_json::json!(true))]),
         };
         let later = BleDevice {
@@ -539,6 +543,7 @@ mod tests {
             company_id: None,
             vendor: None,
             company: None,
+            paired: false,
             extra: BTreeMap::from([
                 ("connectable".into(), serde_json::json!(false)),
                 ("rssi_ema".into(), serde_json::json!(-60)),
@@ -562,6 +567,7 @@ mod tests {
             company_id: None,
             vendor: None,
             company: None,
+            paired: false,
             extra: BTreeMap::new(),
         };
         let later = BleDevice {
@@ -572,6 +578,7 @@ mod tests {
             company_id: None,
             vendor: None,
             company: None,
+            paired: false,
             extra: BTreeMap::new(),
         };
         d.merge_from(&later);

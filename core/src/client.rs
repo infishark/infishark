@@ -476,6 +476,39 @@ impl Device {
         )
     }
 
+    /// Saved/paired BLE peers (name + address). Connect by address even if
+    /// they are not advertising.
+    pub fn ble_bonds(&mut self) -> Result<Vec<crate::BleDevice>> {
+        let v = self.json_command(protocol::CMD_BLE_BONDS_LIST, b"")?;
+        parse_array(&v, "devices")
+    }
+
+    pub fn ble_bond_remember(
+        &mut self,
+        address: &str,
+        addr_type: u8,
+        name: Option<&str>,
+    ) -> Result<()> {
+        let mut spec = serde_json::Map::new();
+        spec.insert("address".into(), address.into());
+        spec.insert("addr_type".into(), addr_type.into());
+        if let Some(n) = name {
+            spec.insert("name".into(), n.into());
+        }
+        self.command_ok(
+            protocol::CMD_BLE_BONDS_REMEMBER,
+            &serde_json::Value::Object(spec),
+        )
+    }
+
+    pub fn ble_bond_forget(&mut self, address: Option<&str>) -> Result<()> {
+        let spec = match address {
+            None => serde_json::json!({ "all": true }),
+            Some(a) => serde_json::json!({ "address": a }),
+        };
+        self.command_ok(protocol::CMD_BLE_BONDS_FORGET, &spec)
+    }
+
     /// Force a clean BLE stack reset on the device
     pub fn ble_reset(&mut self) -> Result<()> {
         self.json_command(protocol::CMD_BLE_RESET, b"").map(|_| ())

@@ -22,6 +22,16 @@ pub fn fmt_elapsed(d: Duration) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+/// Paired/saved devices first, then nearby by RSSI.
+fn ble_display_order(devs: &[BleDevice]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..devs.len()).collect();
+    idx.sort_by_key(|&i| {
+        let d = &devs[i];
+        (if d.paired { 0u8 } else { 1 }, std::cmp::Reverse(d.rssi))
+    });
+    idx
+}
+
 // Item indices ordered by strongest signal first.
 fn order_by_rssi<T, R: Ord + Copy>(items: &[T], rssi: impl Fn(&T) -> R) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..items.len()).collect();
@@ -359,7 +369,7 @@ pub fn ble_table(devs: &[BleDevice]) {
         },
         Col {
             head: "rssi",
-            width: 4,
+            width: 6,
             right: true,
         },
         Col {
@@ -368,7 +378,7 @@ pub fn ble_table(devs: &[BleDevice]) {
             right: false,
         },
     ];
-    let rows: Vec<Row> = order_by_rssi(devs, |d| d.rssi)
+    let rows: Vec<Row> = ble_display_order(devs)
         .iter()
         .enumerate()
         .map(|(row, &i)| {
@@ -379,15 +389,14 @@ pub fn ble_table(devs: &[BleDevice]) {
                 .clone()
                 .or_else(|| d.company.clone())
                 .unwrap_or_default();
+            let rssi = if d.paired && d.rssi == 0 {
+                "saved".to_string()
+            } else {
+                d.rssi.to_string()
+            };
             Row {
                 shade: rssi_shade(d.rssi),
-                cells: vec![
-                    row.to_string(),
-                    name,
-                    d.address.clone(),
-                    d.rssi.to_string(),
-                    vendor,
-                ],
+                cells: vec![row.to_string(), name, d.address.clone(), rssi, vendor],
             }
         })
         .collect();
@@ -641,7 +650,7 @@ pub fn pick_ble_device(devs: &[BleDevice]) -> Result<BleDevice> {
     if devs.is_empty() {
         bail!("scan found no devices; pass an address");
     }
-    let order = order_by_rssi(devs, |d| d.rssi);
+    let order = ble_display_order(devs);
     ble_table(devs);
     let picks = parse_selection(&prompt_line("select device [n]: ")?, order.len())?;
     Ok(devs[order[picks[0]]].clone())

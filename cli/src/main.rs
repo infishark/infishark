@@ -723,6 +723,11 @@ enum BleCmd {
     },
     /// Print the last BLE scan results.
     List,
+    /// Saved/paired BLE devices (connect even when they are not advertising).
+    Bonds {
+        #[command(subcommand)]
+        action: Option<BondsCmd>,
+    },
     /// Show full detail for one device from the last scan (by list number).
     Show {
         /// Device number from `ble scan`/`ble list` (omit to re-list).
@@ -901,6 +906,18 @@ impl HidPreset {
             HidPreset::Combo => vec![Keyboard, Mouse],
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum BondsCmd {
+    /// List saved peers (default).
+    List,
+    /// Remove one address, or --all.
+    Forget {
+        address: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2240,14 +2257,76 @@ fn pick_saved_index(dev: &mut Device) -> Result<u8> {
 
 /// Scan briefly, then pick a BLE peer by number. Returns its address and the
 /// address type to connect with (so a random-address peer resolves correctly).
+fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
+    let mut dev = cli.open(cli.timeout_ms.max(8_000))?;
+    match action {
+        None | Some(BondsCmd::List) => {
+            let mut devices = dev.ble_bonds()?;
+            for d in &mut devices {
+                d.paired = true;
+            }
+            if cli.json {
+                println!("{}", serde_json::to_string(&devices)?);
+            } else if devices.is_empty() {
+                eprintln!("no saved BLE devices");
+            } else {
+                ui::ble_table(&devices);
+            }
+            Ok(())
+        }
+        Some(BondsCmd::Forget { address, all }) => {
+            if *all {
+                dev.ble_bond_forget(None)?;
+            } else {
+                let addr = address
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("pass an address or --all"))?;
+                dev.ble_bond_forget(Some(&addr))?;
+            }
+            print_ok(cli.json)
+        }
+    }
+}
+
 fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
+    let mut devices = dev.ble_bonds().unwrap_or_default();
+    for d in &mut devices {
+        d.paired = true;
+    }
     eprintln!("Scanning for BLE devices (~5s)...");
     let opts = BleScanOpts {
         duration_ms: Some(5000),
         ..Default::default()
     };
-    let mut devices = dev.ble_scan(&opts)?;
-    enrich_ble(db, &mut devices);
+    let nearby = dev.ble_scan(&opts);
+    match nearby {
+        Ok(mut scan) => {
+            enrich_ble(db, &mut scan);
+            for d in scan {
+                if let Some(ex) = devices
+                    .iter_mut()
+                    .find(|b| b.address.eq_ignore_ascii_case(&d.address))
+                {
+                    ex.rssi = d.rssi;
+                    if ex.name.is_none() {
+                        ex.name = d.name.clone();
+                    }
+                    ex.paired = true;
+                    if ex.addr_type.is_none() {
+                        ex.addr_type = d.addr_type;
+                    }
+                } else {
+                    devices.push(d);
+                }
+            }
+        }
+        Err(e) => {
+            if devices.is_empty() {
+                return Err(e.into());
+            }
+            eprintln!("note: scan failed ({e}); showing saved devices only");
+        }
+    }
     let pick = ui::pick_ble_device(&devices)?;
     Ok((pick.address.clone(), pick.addr_type.unwrap_or(0)))
 }
@@ -2287,6 +2366,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             *LAST_BLE.lock().unwrap() = devices.clone();
             print_devices(&devices, cli.json)
         }
+        BleCmd::Bonds { action } => cmd_bonds(cli, action.as_ref()),
         BleCmd::List => {
             let mut devices = LAST_BLE.lock().unwrap().clone();
             if devices.is_empty() {
@@ -3043,7 +3123,15 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
             };
             warn_if_mesh_active(&mut dev);
             match dev.gatt_connect(&address, &opts) {
-                Ok(()) => print_ok(cli.json),
+                Ok(()) => {
+                    let name = LAST_BLE.lock().ok().and_then(|devs| {
+                        devs.iter()
+                            .find(|d| d.address.eq_ignore_ascii_case(&address))
+                            .and_then(|d| d.name.clone())
+                    });
+                    let _ = dev.ble_bond_remember(&address, addr_type, name.as_deref());
+                    print_ok(cli.json)
+                }
                 Err(e) if matches!(addr_type, 0 | 1) => {
                     let alt = if addr_type == 0 { 1 } else { 0 };
                     let mut flipped = opts.clone();
