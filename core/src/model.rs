@@ -233,6 +233,9 @@ impl BleDevice {
         if newer.company.as_ref().is_some_and(|s| !s.is_empty()) {
             self.company = newer.company.clone();
         }
+        if newer.paired {
+            self.paired = true;
+        }
         for (k, v) in &newer.extra {
             merge_extra_field(&mut self.extra, k, v);
         }
