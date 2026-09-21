@@ -64,6 +64,9 @@ pub const CMD_BLE_GATT_WRITE: u16 = 0x0223;
 pub const CMD_BLE_GATT_SUBSCRIBE: u16 = 0x0224;
 pub const CMD_BLE_GATT_UNSUBSCRIBE: u16 = 0x0225;
 pub const CMD_BLE_MITM: u16 = 0x0226;
+pub const CMD_BLE_BONDS_LIST: u16 = 0x0227;
+pub const CMD_BLE_BONDS_REMEMBER: u16 = 0x0228;
+pub const CMD_BLE_BONDS_FORGET: u16 = 0x0229;
 // 0x03 IR
 pub const CMD_IR_RX: u16 = 0x0300;
 pub const CMD_IR_TX: u16 = 0x0310;
