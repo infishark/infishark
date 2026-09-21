@@ -858,6 +858,10 @@ enum BleCmd {
         /// BLE connection-attempt timeout in ms.
         #[arg(long)]
         connect_timeout_ms: Option<u32>,
+        /// Write ATT traffic to a Bluetooth HCI pcap (Wireshark). Omit FILE for
+        /// `ble-mitm-<unix>.pcap` in the current directory.
+        #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "AUTO")]
+        pcap: Option<String>,
     },
     /// Stop the peripheral (advertiser or GATT server).
     Stop,
@@ -2435,6 +2439,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             io_cap,
             passkey,
             connect_timeout_ms,
+            pcap,
         } => cmd_mitm(
             cli,
             db,
@@ -2447,6 +2452,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             *io_cap,
             *passkey,
             *connect_timeout_ms,
+            pcap.as_deref(),
         ),
         BleCmd::Stop => {
             let mut dev = cli.open(cli.timeout_ms)?;
@@ -2799,6 +2805,7 @@ fn cmd_mitm(
     io_cap: Option<u8>,
     passkey: Option<u32>,
     connect_timeout_ms: Option<u32>,
+    pcap_arg: Option<&str>,
 ) -> Result<()> {
     let timeout = cli
         .timeout_ms
@@ -2860,6 +2867,38 @@ fn cmd_mitm(
         eprintln!("waiting for a central... Ctrl-C stops");
     }
 
+    let pcap_path = pcap_arg.map(|s| {
+        if s.is_empty() || s == "AUTO" {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            format!("ble-mitm-{t}.pcap")
+        } else {
+            s.to_string()
+        }
+    });
+    let mut pcap_out: Option<Box<dyn std::io::Write>> = match pcap_path.as_deref() {
+        Some("-") => Some(Box::new(std::io::stdout())),
+        Some(path) => {
+            let mut f = std::io::BufWriter::new(ui::create_secure(path)?);
+            pcap::write_global_header(&mut f, pcap::LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR)?;
+            f.flush()?;
+            if !cli.json {
+                eprintln!("writing ATT pcap to {path}");
+            }
+            Some(Box::new(f))
+        }
+        None => None,
+    };
+    if pcap_path.as_deref() == Some("-") {
+        if let Some(w) = pcap_out.as_mut() {
+            pcap::write_global_header(w, pcap::LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR)?;
+            w.flush()?;
+        }
+    }
+    let mut pcap_n: u64 = 0;
+
     crate::signals::install_sigint();
     crate::signals::RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
     dev.set_read_timeout(std::time::Duration::from_millis(300))?;
@@ -2871,8 +2910,15 @@ fn cmd_mitm(
             Ok((id, payload)) if id == infishark::protocol::EVT_BLE_MITM => {
                 let v: serde_json::Value =
                     serde_json::from_slice(&payload).unwrap_or_else(|_| serde_json::json!({}));
+                if let (Some(w), Some(frame)) = (pcap_out.as_mut(), pcap::mitm_event_to_hci(&v)) {
+                    pcap::write_record(w, &frame)?;
+                    w.flush()?;
+                    pcap_n += 1;
+                }
                 if cli.json {
-                    println!("{}", serde_json::to_string(&v)?);
+                    if pcap_path.as_deref() != Some("-") {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
                 } else {
                     print_mitm_event(&v);
                 }
@@ -2887,6 +2933,11 @@ fn cmd_mitm(
     }
     let _ = dev.stop_current_task();
     if !cli.json {
+        if let Some(path) = pcap_path.as_deref() {
+            if path != "-" {
+                eprintln!("wrote {pcap_n} ATT PDUs to {path}");
+            }
+        }
         eprintln!("mitm stopped");
     }
     Ok(())
