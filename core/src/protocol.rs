@@ -67,6 +67,7 @@ pub const CMD_BLE_MITM: u16 = 0x0226;
 pub const CMD_BLE_BONDS_LIST: u16 = 0x0227;
 pub const CMD_BLE_BONDS_REMEMBER: u16 = 0x0228;
 pub const CMD_BLE_BONDS_FORGET: u16 = 0x0229;
+pub const CMD_BLE_MITM_ACTION: u16 = 0x022A;
 // 0x03 IR
 pub const CMD_IR_RX: u16 = 0x0300;
 pub const CMD_IR_TX: u16 = 0x0310;

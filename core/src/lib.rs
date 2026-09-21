@@ -46,7 +46,7 @@ pub use ir::{IrCapture, IrCode, Protocol, RawIr};
 pub use ir_file::{IrButton, IrRemote};
 pub use model::{
     AdapterConfig, AdapterTarget, BleDevice, BleScanOpts, GattChar, GattConnectOpts,
-    GattNotification, GattService, Network, PortalOpts, SavedNetwork, WifiScanOpts,
+    GattNotification, GattService, MitmAction, Network, PortalOpts, SavedNetwork, WifiScanOpts,
 };
 pub use monitor::MonitorFilter;
 pub use transport::Response;

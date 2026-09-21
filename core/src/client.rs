@@ -571,6 +571,30 @@ impl Device {
         Ok(serde_json::from_slice(&resp.body)?)
     }
 
+    /// Reply to an intercepted ATT PDU (`id` from [`protocol::EVT_BLE_MITM`]).
+    /// If the host does not reply before `intercept_timeout_ms`, the device
+    /// auto-allows.
+    pub fn ble_mitm_action(&mut self, id: u8, action: crate::MitmAction) -> Result<()> {
+        let mut spec = serde_json::Map::new();
+        spec.insert("id".into(), id.into());
+        match action {
+            crate::MitmAction::Allow => {
+                spec.insert("action".into(), "allow".into());
+            }
+            crate::MitmAction::Drop => {
+                spec.insert("action".into(), "drop".into());
+            }
+            crate::MitmAction::Replace(bytes) => {
+                spec.insert("action".into(), "replace".into());
+                spec.insert("hex".into(), crate::hex::encode(&bytes).into());
+            }
+        }
+        self.command_ok(
+            protocol::CMD_BLE_MITM_ACTION,
+            &serde_json::Value::Object(spec),
+        )
+    }
+
     /// Block for the next peripheral event (a central write/connect/subscribe),
     /// returning its JSON tagged with an `event` field.
     pub fn next_ble_event(&mut self) -> Result<serde_json::Value> {

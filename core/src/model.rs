@@ -409,6 +409,14 @@ impl GattConnectOpts {
     }
 }
 
+/// Host decision for one intercepted ATT PDU (`ble mitm --intercept`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MitmAction {
+    Allow,
+    Drop,
+    Replace(Vec<u8>),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

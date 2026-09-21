@@ -867,6 +867,12 @@ enum BleCmd {
         /// `ble-mitm-<unix>.pcap` in the current directory.
         #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "AUTO")]
         pcap: Option<String>,
+        /// Hold each ATT PDU for the host (SDK callback / auto-allow).
+        #[arg(long)]
+        intercept: bool,
+        /// Auto-allow timeout in ms when intercepting (default 40).
+        #[arg(long)]
+        intercept_timeout_ms: Option<u32>,
     },
     /// Stop the peripheral (advertiser or GATT server).
     Stop,
@@ -978,6 +984,39 @@ enum HidCmd {
         /// Delay between keystrokes in ms.
         #[arg(long, default_value_t = 8)]
         delay_ms: u64,
+    },
+    /// Replay HID input reports recorded by `ble mitm --pcap`, in real time.
+    ///
+    /// The captured keystroke timeline is re-transmitted through the BLE
+    /// keyboard with its original inter-report gaps (optionally scaled), so the
+    /// paired host sees the session played back as it happened.
+    Replay {
+        /// HCI pcap to read (written by `ble mitm --pcap`).
+        pcap: String,
+        /// Playback speed multiplier (2 = twice as fast, 0 = as fast as possible).
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// ATT handle of the HID input report characteristic. Default: the
+        /// handle with the most notifications in the capture.
+        #[arg(long)]
+        handle: Option<u16>,
+        /// Report ID of the keyboard input report (preset keyboard = 1).
+        #[arg(long, default_value_t = 1)]
+        id: u8,
+        /// Print the decoded keystroke timeline and exit; send nothing.
+        #[arg(long)]
+        decode: bool,
+        /// Watch the session live in the terminal: keystrokes appear paced by
+        /// the capture clock. Sends nothing over BLE.
+        #[arg(long, conflicts_with = "decode")]
+        view: bool,
+        /// With --view: compress idle gaps longer than this many seconds of
+        /// playback time (showing an [idle] marker instead).
+        #[arg(long, requires = "view")]
+        max_gap: Option<f64>,
+        /// Attach to an already-running HID keyboard instead of starting one.
+        #[arg(long)]
+        no_start: bool,
     },
     /// Grab host HID inputs (keyboard, mouse, touchpad, gamepad, tablet,
     /// system) and drive the paired device over BLE. Selected inputs merge into
@@ -2520,6 +2559,8 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             passkey,
             connect_timeout_ms,
             pcap,
+            intercept,
+            intercept_timeout_ms,
         } => cmd_mitm(
             cli,
             db,
@@ -2533,6 +2574,8 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             *passkey,
             *connect_timeout_ms,
             pcap.as_deref(),
+            *intercept,
+            *intercept_timeout_ms,
         ),
         BleCmd::Stop => {
             let mut dev = cli.open(cli.timeout_ms)?;
@@ -2614,6 +2657,28 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
             }
             print_ok(cli.json)
         }
+        HidCmd::Replay {
+            pcap: pcap_path,
+            speed,
+            handle,
+            id,
+            decode,
+            view,
+            max_gap,
+            no_start,
+        } => {
+            let (handle, timeline) = hid_timeline_from_pcap(pcap_path, *handle)?;
+            if *decode {
+                print_hid_timeline(&timeline);
+                return Ok(());
+            }
+            if *view {
+                view_hid_timeline(&timeline, *speed, *max_gap)?;
+                return Ok(());
+            }
+            replay_hid_timeline(&timeline, handle, *speed, *id, *no_start, cli)?;
+            print_ok(cli.json)
+        }
         HidCmd::Bridge {
             release,
             devices,
@@ -2648,6 +2713,249 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
             )
         }
     }
+}
+
+/// ATT opcode for Handle Value Notification (HID input reports arrive as these).
+const ATT_OP_NOTIFY: u8 = 0x1b;
+
+/// Extract one handle's HID input-report timeline from a MITM HCI pcap:
+/// `(seconds since capture start, report value)` in capture order.
+#[allow(clippy::type_complexity)]
+fn hid_timeline_from_pcap(path: &str, handle: Option<u16>) -> Result<(u16, Vec<(f64, Vec<u8>)>)> {
+    let file = std::fs::File::open(path).with_context(|| format!("cannot open pcap {path:?}"))?;
+    let records =
+        pcap::read_hci_att_pcap(file).with_context(|| format!("cannot parse pcap {path:?}"))?;
+
+    // Notifications on each handle; default to the chattiest one, which is the
+    // input-report characteristic in a keyboard capture.
+    let mut counts: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    for r in &records {
+        if r.host_to_controller && r.pdu.first() == Some(&ATT_OP_NOTIFY) && r.pdu.len() >= 3 {
+            let h = u16::from_le_bytes([r.pdu[1], r.pdu[2]]);
+            *counts.entry(h).or_default() += 1;
+        }
+    }
+    let handle = match handle {
+        Some(h) => h,
+        None => *counts
+            .iter()
+            .max_by_key(|(_, c)| **c)
+            .map(|(h, _)| h)
+            .ok_or_else(|| anyhow::anyhow!("no ATT notifications in {path:?}"))?,
+    };
+
+    let mut timeline: Vec<(f64, Vec<u8>)> = Vec::new();
+    for r in &records {
+        if !r.host_to_controller || r.pdu.first() != Some(&ATT_OP_NOTIFY) || r.pdu.len() < 3 {
+            continue;
+        }
+        let h = u16::from_le_bytes([r.pdu[1], r.pdu[2]]);
+        if h != handle {
+            continue;
+        }
+        timeline.push((r.ts_us as f64 / 1e6, r.pdu[3..].to_vec()));
+    }
+    if timeline.is_empty() {
+        bail!("handle 0x{handle:04x} has no notifications in {path:?}");
+    }
+    let t0 = timeline[0].0;
+    for (t, _) in &mut timeline {
+        *t -= t0;
+    }
+    Ok((handle, timeline))
+}
+
+/// Newly-pressed usages in one report: `(usage, modifier byte)`.
+fn new_presses(prev: &mut [u8; 6], rep: &[u8]) -> Vec<(u8, u8)> {
+    // Captured reports may be 7 bytes (modifier + 6 keys) or 8 bytes
+    // (modifier + reserved + 6 keys); normalize to modifier + 6 keys.
+    let (modifier, keys): (u8, &[u8]) = match rep.len() {
+        7 => (rep[0], &rep[1..7]),
+        len if len >= 8 => (rep[0], &rep[2..8]),
+        _ => (rep.first().copied().unwrap_or(0), &[]),
+    };
+    let mut out = Vec::new();
+    for k in keys.iter().copied().filter(|k| *k != 0) {
+        if !prev.contains(&k) {
+            out.push((k, modifier));
+        }
+    }
+    *prev = if keys.len() == 6 {
+        keys.try_into().expect("6 keys")
+    } else {
+        [0; 6]
+    };
+    out
+}
+
+/// Print label for a non-printing usage (shift picks shifted glyphs for chords).
+fn key_label(k: u8, shift: bool) -> String {
+    match k {
+        0x2a => "<BS>".into(),
+        0x29 => "<ESC>".into(),
+        0x39 => "<CAPS>".into(),
+        0x4c => "<DEL>".into(),
+        0x4f => "<RIGHT>".into(),
+        0x50 => "<LEFT>".into(),
+        0x51 => "<DOWN>".into(),
+        0x52 => "<UP>".into(),
+        _ => match hid::hid_usage_to_ascii(k, shift) {
+            Some('\n') => "\\n".into(),
+            Some('\t') => "\\t".into(),
+            Some(c) => c.to_string(),
+            None => format!("<{k:02x}>"),
+        },
+    }
+}
+
+/// Print a keystroke timeline: one line per newly-pressed key, then the net
+/// typed text (backspaces applied).
+fn print_hid_timeline(timeline: &[(f64, Vec<u8>)]) {
+    const BS: u8 = 0x2a;
+    let mut prev: [u8; 6] = [0; 6];
+    let mut text = String::new();
+    for (t, rep) in timeline {
+        for (k, modifier) in new_presses(&mut prev, rep) {
+            let shift = modifier & 0x22 != 0;
+            println!("{t:9.3}s  {}", key_label(k, shift));
+            if k == BS {
+                text.pop();
+            } else if let Some(c) = hid::hid_usage_to_ascii(k, shift) {
+                text.push(c);
+            }
+        }
+    }
+    println!("\ntyped: {text:?}");
+}
+
+/// Play a captured keystroke timeline in the terminal, paced by the capture
+/// clock: characters appear as they were typed, backspaces erase. Nothing is
+/// sent over BLE.
+fn view_hid_timeline(timeline: &[(f64, Vec<u8>)], speed: f64, max_gap: Option<f64>) -> Result<()> {
+    let duration = timeline.last().map(|(t, _)| *t).unwrap_or(0.0);
+    let n = timeline.len();
+    let pace = if speed > 0.0 {
+        format!("{speed}x speed")
+    } else {
+        "as fast as possible".into()
+    };
+    eprintln!("Playing back {n} reports over {duration:.1}s of capture at {pace}. Ctrl-C stops.");
+    let dim = if unsafe { libc::isatty(1) } == 1 {
+        "\x1b[2m"
+    } else {
+        ""
+    };
+    let reset = if dim.is_empty() { "" } else { "\x1b[0m" };
+
+    let speed = if speed > 0.0 { speed } else { f64::INFINITY };
+    let mut prev: [u8; 6] = [0; 6];
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut last_t = 0.0f64;
+    for (t, rep) in timeline {
+        // Pace incrementally so idle compression stays simple.
+        let mut wait = (t - last_t) / speed;
+        last_t = *t;
+        if let Some(mg) = max_gap {
+            if wait > mg {
+                writeln!(out, "{dim}[idle {wait:.1}s]{reset}")?;
+                wait = mg;
+            }
+        }
+        if wait.is_finite() && wait > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+        }
+        for (k, modifier) in new_presses(&mut prev, rep) {
+            let shift = modifier & 0x22 != 0;
+            match hid::hid_usage_to_ascii(k, shift) {
+                Some('\n') => writeln!(out)?,
+                Some(c) => {
+                    if modifier & !(0x02 | 0x20) != 0 {
+                        // Ctrl/Alt/GUI chord, e.g. Ctrl+T: show it, don't inject it.
+                        let chord = if modifier & 0x11 != 0 {
+                            "ctrl+"
+                        } else if modifier & 0x44 != 0 {
+                            "alt+"
+                        } else {
+                            "gui+"
+                        };
+                        write!(out, "{dim}[{chord}{}]{reset}", c)?;
+                    } else {
+                        write!(out, "{c}")?;
+                    }
+                }
+                None if k == 0x2a => write!(out, "\u{8}\u{20}\u{8}")?, // erase
+                None => write!(out, "{dim}{}{reset}", key_label(k, shift))?,
+            }
+        }
+        out.flush()?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Re-transmit a captured HID report timeline over the BLE keyboard.
+fn replay_hid_timeline(
+    timeline: &[(f64, Vec<u8>)],
+    handle: u16,
+    speed: f64,
+    id: u8,
+    no_start: bool,
+    cli: &Cli,
+) -> Result<()> {
+    let duration = timeline.last().map(|(t, _)| *t).unwrap_or(0.0);
+    let n = timeline.len();
+    if speed > 0.0 {
+        eprintln!(
+            "Replaying {n} reports from handle 0x{handle:04x} over {duration:.1}s at {speed}x speed."
+        );
+    } else {
+        eprintln!("Replaying {n} reports from handle 0x{handle:04x} as fast as possible.");
+    }
+
+    let timeout = cli.timeout_ms.max(8_000);
+    let mut dev = cli.open(timeout)?;
+    if !no_start {
+        let spec = build_hid_spec(
+            Some(HidPreset::Keyboard),
+            &None,
+            &[],
+            &None,
+            None,
+            &None,
+            None,
+            &None,
+            false,
+        )?;
+        dev.ble_hid_start(&spec)?;
+        // A notify is only delivered once a central has bonded, connected, and
+        // subscribed, so hold until the first subscribe event arrives.
+        eprintln!("Waiting for a host to connect and subscribe (Ctrl-C to abort)…");
+        loop {
+            let ev = dev.next_ble_event()?;
+            if ev.get("event").and_then(|x| x.as_str()) == Some("subscribe") {
+                break;
+            }
+        }
+    }
+
+    let speed = if speed > 0.0 { speed } else { f64::INFINITY };
+    let start = std::time::Instant::now();
+    for (t, rep) in timeline {
+        let target = std::time::Duration::from_secs_f64(t / speed);
+        if start.elapsed() < target {
+            std::thread::sleep(target - start.elapsed());
+        }
+        let mut bytes = rep.clone();
+        if bytes.len() == 7 {
+            bytes.insert(1, 0); // 6KRO w/o reserved byte → boot-keyboard layout
+        }
+        dev.ble_hid_send(&hid::input_report(id, &bytes))?;
+    }
+    // Clear anything left held by the last report.
+    dev.ble_hid_send(&hid::input_report(id, &[0u8; 8]))?;
+    eprintln!("Replay complete.");
+    Ok(())
 }
 
 fn hid_summary(ident: &serde_json::Value) -> String {
@@ -2886,6 +3194,8 @@ fn cmd_mitm(
     passkey: Option<u32>,
     connect_timeout_ms: Option<u32>,
     pcap_arg: Option<&str>,
+    intercept: bool,
+    intercept_timeout_ms: Option<u32>,
 ) -> Result<()> {
     let timeout = cli
         .timeout_ms
@@ -2914,6 +3224,10 @@ fn cmd_mitm(
     insert_opt(&mut spec, "io_cap", io_cap);
     insert_opt(&mut spec, "passkey", passkey);
     insert_opt(&mut spec, "timeout_ms", connect_timeout_ms);
+    if intercept {
+        spec.insert("intercept".into(), true.into());
+        insert_opt(&mut spec, "intercept_timeout_ms", intercept_timeout_ms);
+    }
     warn_if_mesh_active(&mut dev);
     let label = LAST_BLE
         .lock()
@@ -2994,6 +3308,13 @@ fn cmd_mitm(
                     pcap::write_record(w, &frame)?;
                     w.flush()?;
                     pcap_n += 1;
+                }
+                if intercept {
+                    if let Some(ix) = v.get("id").and_then(|x| x.as_u64()) {
+                        if (1..256).contains(&ix) {
+                            let _ = dev.ble_mitm_action(ix as u8, infishark::MitmAction::Allow);
+                        }
+                    }
                 }
                 if cli.json {
                     if pcap_path.as_deref() != Some("-") {
