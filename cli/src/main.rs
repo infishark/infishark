@@ -846,18 +846,9 @@ enum BleCmd {
         /// Keep the Nano's own MAC instead of spoofing the target.
         #[arg(long)]
         no_spoof: bool,
-        /// Initiate pairing/encryption with the target after connecting.
+        /// Skip pairing (default is bond + LE Secure Connections + passkey).
         #[arg(long)]
-        secure: bool,
-        /// Persist keys with the target.
-        #[arg(long)]
-        bond: bool,
-        /// Require MITM protection when pairing to the target.
-        #[arg(long)]
-        mitm: bool,
-        /// Use LE Secure Connections with the target.
-        #[arg(long)]
-        sc: bool,
+        no_pair: bool,
         /// Pairing IO capability for the target link.
         #[arg(long)]
         io_cap: Option<u8>,
@@ -2440,10 +2431,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             name,
             mac,
             no_spoof,
-            secure,
-            bond,
-            mitm,
-            sc,
+            no_pair,
             io_cap,
             passkey,
             connect_timeout_ms,
@@ -2455,10 +2443,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             name,
             mac,
             *no_spoof,
-            *secure,
-            *bond,
-            *mitm,
-            *sc,
+            *no_pair,
             *io_cap,
             *passkey,
             *connect_timeout_ms,
@@ -2810,17 +2795,14 @@ fn cmd_mitm(
     name: &Option<String>,
     mac: &Option<String>,
     no_spoof: bool,
-    secure: bool,
-    bond: bool,
-    mitm: bool,
-    sc: bool,
+    no_pair: bool,
     io_cap: Option<u8>,
     passkey: Option<u32>,
     connect_timeout_ms: Option<u32>,
 ) -> Result<()> {
     let timeout = cli
         .timeout_ms
-        .max(connect_timeout_ms.unwrap_or(0) as u64 + 30_000);
+        .max(connect_timeout_ms.unwrap_or(0) as u64 + 120_000);
     let mut dev = cli.open(timeout)?;
     let (address, addr_type) = match address {
         Some(a) => (a.clone(), addr_type),
@@ -2837,10 +2819,11 @@ fn cmd_mitm(
     } else {
         spec.insert("mac".into(), address.clone().into());
     }
-    infishark::json::insert_flag(&mut spec, "secure", secure, true.into());
-    infishark::json::insert_flag(&mut spec, "bond", bond, true.into());
-    infishark::json::insert_flag(&mut spec, "mitm", mitm, true.into());
-    infishark::json::insert_flag(&mut spec, "sc", sc, true.into());
+    if no_pair {
+        spec.insert("bond".into(), false.into());
+        spec.insert("mitm".into(), false.into());
+        spec.insert("sc".into(), false.into());
+    }
     insert_opt(&mut spec, "io_cap", io_cap);
     insert_opt(&mut spec, "passkey", passkey);
     insert_opt(&mut spec, "timeout_ms", connect_timeout_ms);
@@ -2915,12 +2898,24 @@ fn print_mitm_event(v: &serde_json::Value) {
         let step = v.get("step").and_then(|x| x.as_str()).unwrap_or("?");
         let heap = v.get("heap").and_then(|x| x.as_u64());
         let heap_s = heap.map(|h| format!("  heap={h}")).unwrap_or_default();
+        if step == "passkey" {
+            if let Some(pin) = v.get("pin").and_then(|x| x.as_u64()) {
+                let compare = v.get("compare").and_then(|x| x.as_bool()).unwrap_or(false);
+                if compare {
+                    eprintln!("  confirm this PIN (or type it on the keyboard): {pin:06}");
+                } else {
+                    eprintln!("  type this PIN on the keyboard: {pin:06}");
+                }
+                return;
+            }
+        }
         let msg = match step {
             "connect" => "connecting to peripheral...",
             "connected" => "connected to peripheral",
             "snapshot" => "reading GATT table...",
             "gatts" => "building local GATT server...",
             "reconnect" => "reconnecting to peripheral...",
+            "pair" => "waiting for pairing (type the PIN on the keyboard)...",
             "advertise" => "advertising as the clone...",
             "ready" => "ready — waiting for a central",
             other => other,
