@@ -2918,7 +2918,9 @@ fn print_mitm_event(v: &serde_json::Value) {
         let msg = match step {
             "connect" => "connecting to peripheral...",
             "connected" => "connected to peripheral",
-            "clone" => "cloning GATT table...",
+            "snapshot" => "reading GATT table...",
+            "gatts" => "building local GATT server...",
+            "reconnect" => "reconnecting to peripheral...",
             "advertise" => "advertising as the clone...",
             "ready" => "ready — waiting for a central",
             other => other,
