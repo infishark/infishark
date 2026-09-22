@@ -34,7 +34,7 @@ pub fn run(all: bool, json: bool) -> Result<()> {
     }
 
     if ports.is_empty() {
-        println!("No serial ports found.");
+        crate::log::info("no serial ports found");
         return Ok(());
     }
 

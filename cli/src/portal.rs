@@ -57,7 +57,7 @@ pub fn run(mut dev: Device, dir: Option<PathBuf>, opts: PortalOpts) -> Result<()
     }
 
     let _ = dev.stop_current_task();
-    eprintln!("portal stopped");
+    crate::log::ok("portal stopped");
     Ok(())
 }
 
@@ -72,12 +72,12 @@ fn print_effective(eff: &serde_json::Value, root: Option<&PathBuf>) {
     } else {
         "on-device HTML"
     };
-    eprintln!(
-        "captive portal up ({mode}) - SSID={ssid:?} ch={ch} mac={mac} ip={ip} {} - Ctrl-C to stop",
+    crate::log::info(format!(
+        "captive portal up ({mode})  SSID={ssid:?} ch={ch} mac={mac} ip={ip} {}  ctrl-c to stop",
         if open { "open" } else { "WPA2" }
-    );
+    ));
     if let Some(r) = root {
-        eprintln!("  streaming pages from {}", r.display());
+        crate::log::info(format!("streaming pages from {}", r.display()));
     }
 }
 

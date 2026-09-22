@@ -52,7 +52,7 @@ pub fn run(dev: &mut Device, opts: &DeauthOpts, oui_db: Option<&str>) -> Result<
         .collect::<Vec<_>>()
         .join("  ");
 
-    println!("deauthing {} target(s)", targets.len());
+    crate::log::info(format!("deauthing {} target(s)", targets.len()));
     let mut status = ui::StatusBlock::new();
     install_sigint();
     let start = Instant::now();
@@ -91,9 +91,9 @@ pub fn run(dev: &mut Device, opts: &DeauthOpts, oui_db: Option<&str>) -> Result<
 
     dev.stop_current_task()?;
     status.clear();
-    println!(
-        "stopped: {sent} sent, {failed} failed in {}",
+    crate::log::ok(format!(
+        "stopped  {sent} sent, {failed} failed in {}",
         ui::fmt_elapsed(start.elapsed())
-    );
+    ));
     Ok(())
 }
