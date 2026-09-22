@@ -7,6 +7,7 @@ mod fwota;
 mod handshake;
 mod hid;
 mod hidraw;
+mod log;
 mod manage;
 mod monitor;
 mod portal;
@@ -86,10 +87,8 @@ fn warn_firmware(dev: &mut Device) {
     }
     if let Ok(id) = dev.firmware_identity() {
         if let Some(w) = id.warning() {
-            eprintln!("warning: {w}");
-            eprintln!(
-                "         update with `infishark device update` or `infishark flash latest`."
-            );
+            log::warn(w);
+            log::info("update with `infishark device update` or `infishark flash latest`");
         }
     }
 }
@@ -1136,9 +1135,9 @@ fn main() -> ExitCode {
             // Keep the failure path machine-parseable under --json; anyhow's
             // default would print plain text even there.
             if cli.json {
-                println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
+                eprintln!("{}", serde_json::json!({ "error": format!("{e:#}") }));
             } else {
-                eprintln!("Error: {e:#}");
+                log::err(format!("{e:#}"));
             }
             ExitCode::FAILURE
         }
@@ -1266,7 +1265,7 @@ fn print_ir_note(note: Option<String>, json: bool) {
         if json {
             eprintln!("{}", serde_json::json!({ "note": n }));
         } else {
-            eprintln!("note: {n}");
+            log::info(n);
         }
     }
 }
@@ -1723,7 +1722,7 @@ fn cmd_ir_rx(
     // Short reads so Ctrl-C is noticed between captures.
     dev.set_read_timeout(Duration::from_millis(300))?;
     if !cli.json {
-        eprintln!("Listening for IR... (Ctrl-C to stop)");
+        log::info("listening for IR (ctrl-c to stop)");
         ui::ir_header(verbose);
     }
     let mut caps: Vec<IrCapture> = Vec::new();
@@ -1751,7 +1750,7 @@ fn cmd_ir_rx(
             // Transport/serial failure: stop listening, keep what we have.
             Err(e) => {
                 if !cli.json {
-                    eprintln!("warning: IR stream ended ({e:#})");
+                    log::warn(format!("IR stream ended ({e:#})"));
                 }
                 break;
             }
@@ -1773,7 +1772,9 @@ fn cmd_ir_rx(
         }
     }
     if !cli.json && !once {
-        eprintln!("Stopped.  {n_code} code, {n_raw} raw (use `ir show <n>` for detail).");
+        log::ok(format!(
+            "stopped  {n_code} code, {n_raw} raw (`ir show <n>` for detail)"
+        ));
     }
     Ok(())
 }
@@ -2308,7 +2309,7 @@ fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string(&devices)?);
             } else if devices.is_empty() {
-                eprintln!("no saved BLE devices");
+                log::info("no saved BLE devices");
             } else {
                 ui::ble_table(&devices);
             }
@@ -2332,14 +2333,14 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
     let mut devices = match dev.ble_bonds() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("note: saved BLE devices unavailable ({e})");
+            log::warn(format!("saved BLE devices unavailable ({e})"));
             Vec::new()
         }
     };
     for d in &mut devices {
         d.paired = true;
     }
-    eprintln!("Scanning for BLE devices (~5s)...");
+    log::info("scanning for BLE devices (~5s)");
     let opts = BleScanOpts {
         duration_ms: Some(5000),
         ..Default::default()
@@ -2365,7 +2366,7 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
             if devices.is_empty() {
                 return Err(e.into());
             }
-            eprintln!("note: scan failed ({e}); showing saved devices only");
+            log::warn(format!("scan failed ({e}); showing saved devices only"));
         }
     }
     let pick = ui::pick_ble_device(&devices)?;
@@ -2494,13 +2495,13 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             let mut dev = cli.open(cli.timeout_ms)?;
             dev.ble_adv(&spec)?;
             if matches!(phy.as_deref(), Some("coded") | Some("2m")) {
-                eprintln!(
-                    "note: extended-PHY advertising is invisible to normal scanners; only `ble scan --phy coded` (or 2m) sees it."
+                log::info(
+                    "extended-PHY advertising is invisible to normal scanners; only `ble scan --phy coded` (or 2m) sees it",
                 );
             }
             print_action(
                 serde_json::json!({ "ok": true }),
-                "Advertising. Run `infishark ble stop` to stop.",
+                "advertising (`ble stop` to stop)",
                 cli.json,
             )
         }
@@ -2513,8 +2514,8 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             let spec = build_serve_spec(chars, name, mac, *random_mac)?;
             let mut dev = cli.open(cli.timeout_ms.max(3_600_000))?;
             dev.ble_serve(&spec)?;
-            eprintln!(
-                "Serving. Central activity streams below (NDJSON). Ctrl-C detaches; run `infishark ble stop` to stop the device."
+            log::info(
+                "serving; central activity streams below (ndjson). ctrl-c detaches; `ble stop` stops the device",
             );
             stream_ndjson(|| dev.next_ble_event().map_err(Into::into))
         }
@@ -2530,7 +2531,9 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
         }
         BleCmd::Stream { char, interval_ms } => {
             let mut dev = cli.open(cli.timeout_ms)?;
-            eprintln!("Streaming stdin -> notify {char}. One hex value per line; Ctrl-D to end.");
+            log::info(format!(
+                "streaming stdin to notify {char} (one hex value per line, ctrl-d to end)"
+            ));
             let stdin = std::io::stdin();
             let mut line = String::new();
             loop {
@@ -2633,7 +2636,7 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
             let ident = dev.ble_hid_start(&spec)?;
             if *watch {
                 eprintln!("{}", hid_summary(&ident));
-                eprintln!("Events stream below (NDJSON). Ctrl-C detaches.");
+                log::info("events stream below (ndjson). ctrl-c detaches");
                 stream_ndjson(|| dev.next_ble_event().map_err(Into::into))
             } else {
                 let summary = hid_summary(&ident);
@@ -3175,8 +3178,8 @@ fn build_serve_spec(
 fn warn_if_mesh_active(dev: &mut Device) {
     if let Ok(v) = dev.mesh_status() {
         if v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
-            eprintln!(
-                "note: mesh is active; it is suspended for the duration of this connection and may reduce link stability"
+            log::info(
+                "mesh is active; it is suspended for this connection and may reduce link stability",
             );
         }
     }
@@ -3242,8 +3245,10 @@ fn cmd_mitm(
         .filter(|s| !s.is_empty());
     if !cli.json {
         match &label {
-            Some(n) => eprintln!("connecting to {n} ({address}, addr-type {addr_type})..."),
-            None => eprintln!("connecting to {address} (addr-type {addr_type})..."),
+            Some(n) => log::info(format!(
+                "connecting to {n} ({address}, addr-type {addr_type})"
+            )),
+            None => log::info(format!("connecting to {address} (addr-type {addr_type})")),
         }
     }
     let ident = dev.ble_mitm_start(&serde_json::Value::Object(spec), |v| {
@@ -3259,8 +3264,8 @@ fn cmd_mitm(
         let n = ident.get("name").and_then(|x| x.as_str()).unwrap_or("");
         let m = ident.get("mac").and_then(|x| x.as_str()).unwrap_or("?");
         let chars = ident.get("chars").and_then(|x| x.as_u64()).unwrap_or(0);
-        eprintln!("cloned {n} {m}  {chars} chars  peer={address}");
-        eprintln!("waiting for a central... Ctrl-C stops");
+        log::ok(format!("cloned {n} {m}  {chars} chars  peer={address}"));
+        log::info("waiting for a central (ctrl-c stops)");
     }
 
     let pcap_path = pcap_arg.map(|s| {
@@ -3281,7 +3286,7 @@ fn cmd_mitm(
             pcap::write_global_header(&mut f, pcap::LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR)?;
             f.flush()?;
             if !cli.json {
-                eprintln!("writing ATT pcap to {path}");
+                log::info(format!("writing ATT pcap to {path}"));
             }
             Some(Box::new(f))
         }
@@ -3331,10 +3336,10 @@ fn cmd_mitm(
     if !cli.json {
         if let Some(path) = pcap_path.as_deref() {
             if path != "-" {
-                eprintln!("wrote {pcap_n} ATT PDUs to {path}");
+                log::ok(format!("wrote {pcap_n} ATT PDUs to {path}"));
             }
         }
-        eprintln!("mitm stopped");
+        log::ok("mitm stopped");
     }
     Ok(())
 }
@@ -3349,9 +3354,11 @@ fn print_mitm_event(v: &serde_json::Value) {
             if let Some(pin) = v.get("pin").and_then(|x| x.as_u64()) {
                 let compare = v.get("compare").and_then(|x| x.as_bool()).unwrap_or(false);
                 if compare {
-                    eprintln!("  confirm this PIN (or type it on the keyboard): {pin:06}");
+                    log::info(format!(
+                        "confirm this PIN (or type it on the keyboard): {pin:06}"
+                    ));
                 } else {
-                    eprintln!("  type this PIN on the keyboard: {pin:06}");
+                    log::info(format!("type this PIN on the keyboard: {pin:06}"));
                 }
                 return;
             }
@@ -3368,7 +3375,7 @@ fn print_mitm_event(v: &serde_json::Value) {
             "ready" => "ready — waiting for a central",
             other => other,
         };
-        eprintln!("  {msg}{heap_s}");
+        log::info(format!("{msg}{heap_s}"));
         return;
     }
     let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or("?");
@@ -3676,7 +3683,7 @@ fn print_action(v: serde_json::Value, human: impl std::fmt::Display, as_json: bo
     if as_json {
         println!("{v}");
     } else {
-        println!("{human}");
+        log::ok(human);
     }
     Ok(())
 }

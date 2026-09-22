@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::{Arg, Command, CommandFactory, Parser};
@@ -18,18 +17,6 @@ use crate::{Cli, dispatch, ports};
 const SHARK: &str = include_str!("art/shark.txt");
 const WORDMARK: &str = include_str!("art/wordmark.txt");
 const MARGIN: &str = "   ";
-
-// A rotating line under the banner: mostly useful tips, a little dry humor.
-const TIPS: &[&str] = &[
-    "tip: 'select N' switches device; '--port' still overrides per command.",
-    "tip: add '--help' to any command to see its options.",
-    "tip: bare 'wifi deauth' scans, then lets you pick targets.",
-    "tip: 'wifi scan' and 'ble scan' share the same live table.",
-    "the 'S' in IoT stands for security.",
-    "security is like an airbag: ignored until the moment you need it.",
-    "there are two kinds of networks: compromised, and not yet.",
-    "a firewall is only as sharp as the rule someone forgot to write.",
-];
 
 pub fn run(base: &Cli) -> Result<()> {
     if !std::io::stdin().is_terminal() {
@@ -47,14 +34,6 @@ fn utf8_locale() -> bool {
             .map(|v| v.to_ascii_uppercase().replace('-', "").contains("UTF8"))
             .unwrap_or(false)
     })
-}
-
-fn tip() -> &'static str {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as usize)
-        .unwrap_or(0);
-    TIPS[n % TIPS.len()]
 }
 
 fn fmt_uptime(secs: u64) -> String {
@@ -162,11 +141,10 @@ impl Shell {
             println!("{MARGIN}{}", style("no Nano connected").dim());
         }
         println!();
-        println!("{MARGIN}{}", style(tip()).dim());
         println!(
             "{MARGIN}{}   {}",
             style("https://docs.infishark.com").dim(),
-            style("'help' for commands, 'exit' to quit").dim()
+            style("help for commands, exit to quit").dim()
         );
         println!();
     }
@@ -191,7 +169,7 @@ impl Shell {
                 Ok(Signal::CtrlC) => continue,
                 Ok(Signal::CtrlD) => break,
                 Err(e) => {
-                    eprintln!("input error: {e}");
+                    crate::log::err(format!("input: {e}"));
                     break;
                 }
             }
@@ -211,7 +189,7 @@ impl Shell {
                     let root = Cli::command();
                     match resolve(&root, &rest) {
                         Some(cmd) => render_help(cmd, &rest),
-                        None => eprintln!("no such command"),
+                        None => crate::log::err("no such command"),
                     }
                 }
             }
@@ -246,7 +224,7 @@ impl Shell {
         } else if self.index_of(arg).is_some() || port_exists(arg) {
             self.selected = Some(arg.to_string());
         } else {
-            eprintln!("no such device '{arg}' (try 'ports' or 'select')");
+            crate::log::err(format!("no such device '{arg}' (try 'ports' or 'select')"));
         }
     }
 
@@ -266,7 +244,7 @@ impl Shell {
 
     fn exec(&mut self, line: &str) {
         let Some(toks) = shlex::split(line) else {
-            eprintln!("unbalanced quotes");
+            crate::log::err("unbalanced quotes");
             return;
         };
         let is_help = toks.iter().any(|t| matches!(t.as_str(), "--help" | "-h"));
@@ -286,7 +264,7 @@ impl Shell {
                 .collect();
             match resolve(&root, &path) {
                 Some(cmd) => render_help(cmd, &path),
-                None => eprintln!("no such command"),
+                None => crate::log::err("no such command"),
             }
             return;
         }
@@ -310,7 +288,7 @@ impl Shell {
                     RUNNING.store(true, Ordering::SeqCst);
                     match dispatch(&cli, command) {
                         Ok(()) => self.track_peripheral(&path),
-                        Err(e) => eprintln!("{}", style(format!("error: {e:#}")).red()),
+                        Err(e) => crate::log::err(format!("{e:#}")),
                     }
                 }
             }
@@ -332,7 +310,7 @@ impl Shell {
 
     fn run_external(&self, line: &str) {
         let Ok(exe) = std::env::current_exe() else {
-            eprintln!("cannot locate the infishark binary");
+            crate::log::err("cannot locate the infishark binary");
             return;
         };
         let port = match &self.selected {
@@ -348,7 +326,7 @@ impl Shell {
             .arg(cmd)
             .status()
         {
-            eprintln!("failed to run: {e}");
+            crate::log::err(format!("failed to run: {e}"));
         }
     }
 

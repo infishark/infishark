@@ -83,7 +83,7 @@ pub fn catalog(json: bool, port: Option<&str>) -> Result<()> {
     if let Some(d) = &device {
         println!("device  {}  fw {}  ({})", d.serial, d.version, d.mode);
         if let Some(w) = d.warning() {
-            eprintln!("warning: {w}");
+            crate::log::warn(w);
         }
         println!();
     } else {
@@ -134,7 +134,7 @@ pub fn install(opts: Install) -> Result<()> {
     drop(dev);
 
     if let Some(w) = ident.warning() {
-        eprintln!("warning: {w}");
+        crate::log::warn(w);
         eprintln!("         run `infishark flash latest` to flash over USB.");
     }
 
@@ -202,7 +202,7 @@ pub fn install(opts: Install) -> Result<()> {
     } else {
         println!("now running {new_ver} (was {})", ident.version);
         if let Some(w) = fw::outdated_message(&new_ver) {
-            eprintln!("warning: {w}");
+            crate::log::warn(w);
         }
     }
     Ok(())

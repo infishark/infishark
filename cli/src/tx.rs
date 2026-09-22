@@ -280,7 +280,7 @@ fn resolve_ap(dev: &mut Device, o: &Opts, oui_db: Option<&str>, json: bool) -> R
     let bssid = o.ap.as_deref().or(o.bssid.as_deref());
     let channel = (o.channel != 0).then_some(o.channel);
     if bssid.is_none() && o.ssid.is_none() {
-        eprintln!("no --ap/--bssid; scanning for targets...");
+        crate::log::info("no --ap/--bssid; scanning for targets");
     }
     let targets = crate::target::resolve_targets_ex(
         dev,

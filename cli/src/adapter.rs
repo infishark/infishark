@@ -190,10 +190,12 @@ mod linux {
         config: AdapterConfig,
         opts: AdapterOpts,
     ) -> Result<()> {
-        eprintln!("Starting adapter on {target} (BLE goes down while active)...");
+        crate::log::info(format!(
+            "starting adapter on {target} (BLE goes down while active)"
+        ));
         let up = dev.wifi_adapter_start(target, &config)?;
         if let Some(ip) = up.get("sta_ip").and_then(|v| v.as_str()) {
-            eprintln!("Device associated (STA {ip}). Tunnel is live.");
+            crate::log::ok(format!("associated (STA {ip}), tunnel is live"));
         }
         let port = dev.into_port();
         pump(port, opts)
@@ -208,14 +210,16 @@ mod linux {
         let saved_default = if opts.route_all {
             let saved = current_default();
             set_default_route(&ifname)?;
-            eprintln!(
-                "Routing all traffic through {ifname}. (DNS: if your resolver was on the old LAN, set a public one.)"
-            );
+            crate::log::info(format!(
+                "routing all traffic through {ifname} (if DNS was on the old LAN, set a public resolver)"
+            ));
             saved
         } else {
-            eprintln!(
-                "Interface {ifname} is up. To route traffic through it:\n  sudo ip route add <dest> via {DEVICE_GW} dev {ifname}\nor re-run with --route-all."
-            );
+            crate::log::info(format!("interface {ifname} is up"));
+            crate::log::info(format!(
+                "route with: sudo ip route add <dest> via {DEVICE_GW} dev {ifname}"
+            ));
+            crate::log::info("or re-run with --route-all");
             None
         };
 
@@ -235,9 +239,9 @@ mod linux {
             send_oled(&writer, false);
         }
         if saved_tty.is_some() {
-            eprintln!("Adapter running. [d] toggles the device screen, Ctrl-C stops.");
+            crate::log::info("adapter running ([d] toggles the device screen, ctrl-c stops)");
         } else {
-            eprintln!("Adapter running. Ctrl-C stops.");
+            crate::log::info("adapter running (ctrl-c stops)");
         }
 
         while RUNNING.load(Ordering::SeqCst) {
@@ -247,7 +251,10 @@ mod linux {
                 if nr == 1 && (b[0] == b'd' || b[0] == b'D') {
                     oled_on = !oled_on;
                     send_oled(&writer, oled_on);
-                    eprintln!("device screen {}", if oled_on { "on" } else { "off" });
+                    crate::log::info(format!(
+                        "device screen {}",
+                        if oled_on { "on" } else { "off" }
+                    ));
                 }
             } else if saved_tty.is_none() {
                 std::thread::sleep(Duration::from_millis(150));
@@ -256,7 +263,7 @@ mod linux {
         restore_stdin(&saved_tty);
 
         // Best-effort clean teardown: tell the device to stop
-        eprintln!("\nStopping adapter...");
+        crate::log::info("stopping adapter");
         if let Ok(mut w) = writer.lock() {
             let _ = w.write_all(&slip_encode(&[CTRL_MAGIC, CTRL_STOP]));
             let _ = w.flush();
