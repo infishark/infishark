@@ -6,7 +6,8 @@ use crate::ui;
 use anyhow::{Context, Result, bail};
 use infishark::fw::{self, DeviceFw};
 use infishark::{Device, hex};
-use std::io::{self, IsTerminal};
+use sha2::{Digest, Sha256};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -582,17 +583,83 @@ impl Flasher {
     }
 }
 
+const ESPFLASH_RELEASE: &str = "https://github.com/esp-rs/espflash/releases/download/v4.6.0";
+
+const MISSING_FLASHER: &str = "\
+need espflash or esptool to write firmware over USB.\n\
+install one of:\n\
+  cargo install espflash\n\
+  pip install esptool";
+
+struct EspflashAsset {
+    archive: &'static str,
+    sha256: &'static str,
+}
+
+/// Host builds we ship. x86_64 Linux uses the musl binary so an older glibc still runs it.
+fn espflash_asset(os: &str, arch: &str) -> Option<EspflashAsset> {
+    let (archive, sha256) = match (os, arch) {
+        ("linux", "x86_64") => (
+            "espflash-x86_64-unknown-linux-musl.zip",
+            "d515ee13ae44ba913c31a2ca58dc5fd72d3362994ee1d7487a16b289dfbb6e4a",
+        ),
+        ("linux", "aarch64") => (
+            "espflash-aarch64-unknown-linux-gnu.zip",
+            "560c690ce28c7fe2b31709eeaf1fcc6717cfa832798b68287dddca1e3a3b65d6",
+        ),
+        ("linux", "arm") => (
+            "espflash-armv7-unknown-linux-gnueabihf.zip",
+            "7a6fa2890db206cd6495823ba2218b1ae55fd0f7dcafc1f8783427afcd9cdcc0",
+        ),
+        ("macos", "x86_64") => (
+            "espflash-x86_64-apple-darwin.zip",
+            "e945685fe62e45a120487b79ccecc5ac3586bbf5f4e7d78f95cc09e2227bf32d",
+        ),
+        ("macos", "aarch64") => (
+            "espflash-aarch64-apple-darwin.zip",
+            "f39bff252a181a6e345991f603d7606cf9762550e557073c1282eada46d8c757",
+        ),
+        ("windows", "x86_64") => (
+            "espflash-x86_64-pc-windows-msvc.zip",
+            "b2cb4656b067716fe2b3794cf0604b461b2476d06dee7f481704cb6c8495b11c",
+        ),
+        _ => return None,
+    };
+    Some(EspflashAsset { archive, sha256 })
+}
+
+fn espflash_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "espflash.exe"
+    } else {
+        "espflash"
+    }
+}
+
 fn find_flasher() -> Result<Flasher> {
+    if let Some(found) = locate_flasher() {
+        return Ok(found);
+    }
+    let Some(asset) = espflash_asset(std::env::consts::OS, std::env::consts::ARCH) else {
+        bail!("{MISSING_FLASHER}");
+    };
+    match fetch_espflash(&asset) {
+        Ok(path) => Ok(Flasher::Espflash(path)),
+        Err(e) => bail!("{e:#}\n{MISSING_FLASHER}"),
+    }
+}
+
+fn locate_flasher() -> Option<Flasher> {
     if let Some(p) = std::env::var_os("INFISHARK_ESPTOOL").map(PathBuf::from) {
-        return Ok(classify(p));
+        return Some(classify(p));
     }
     for name in ["espflash", "esptool.py", "esptool"] {
         if let Some(p) = look_in_path(name) {
-            return Ok(classify(p));
+            return Some(classify(p));
         }
         let t = privs::tool_path(name);
         if t.exists() {
-            return Ok(classify(t));
+            return Some(classify(t));
         }
     }
     for py in ["python3", "python"] {
@@ -603,18 +670,96 @@ fn find_flasher() -> Result<Flasher> {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if ok {
-            return Ok(Flasher::Esptool {
+            return Some(Flasher::Esptool {
                 cmd: t,
                 module: true,
             });
         }
     }
-    bail!(
-        "need espflash or esptool to write firmware over USB.\n\
-         install one of:\n\
-           cargo install espflash\n\
-           pip install esptool"
-    )
+    if let Ok(dir) = infishark::paths::infishark_dir() {
+        let installed = dir.join("tools").join(espflash_bin_name());
+        if installed.is_file() {
+            return Some(Flasher::Espflash(installed));
+        }
+    }
+    None
+}
+
+fn fetch_espflash(asset: &EspflashAsset) -> Result<PathBuf> {
+    let dir = infishark::paths::infishark_dir()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .join("tools");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dest = dir.join(espflash_bin_name());
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    eprintln!("espflash not found; installing it...");
+    let zip_path = dir.join(format!("{}.download", asset.archive));
+    let staged = dir.join(format!("{}.new", espflash_bin_name()));
+    let url = format!("{ESPFLASH_RELEASE}/{}", asset.archive);
+    fwota::download(&url, &zip_path).context("downloading espflash")?;
+    let result = (|| {
+        verify_sha256(&zip_path, asset.sha256)?;
+        extract_espflash(&zip_path, &staged)?;
+        let output = Command::new(&staged)
+            .arg("--version")
+            .output()
+            .context("running downloaded espflash")?;
+        if !output.status.success() {
+            bail!("downloaded espflash --version failed ({})", output.status);
+        }
+        std::fs::rename(&staged, &dest).context("installing espflash")?;
+        Ok(dest)
+    })();
+    let _ = std::fs::remove_file(&zip_path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let mut file = std::fs::File::open(path).context("opening espflash download")?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = file.read(&mut buf).context("reading espflash download")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let got = hex::encode_lower(&hasher.finalize());
+    if got != expected {
+        bail!("espflash download SHA-256 mismatch (got {got})");
+    }
+    Ok(())
+}
+
+fn extract_espflash(zip_path: &Path, dest: &Path) -> Result<()> {
+    let file = std::fs::File::open(zip_path).context("opening espflash archive")?;
+    let mut archive = zip::ZipArchive::new(file).context("reading espflash archive")?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).context("reading espflash archive")?;
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        if name != "espflash" && name != "espflash.exe" {
+            continue;
+        }
+        let mut out =
+            std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+        std::io::copy(&mut entry, &mut out).context("extracting espflash")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
+        }
+        return Ok(());
+    }
+    bail!("espflash archive did not contain the espflash binary")
 }
 
 fn classify(p: PathBuf) -> Flasher {
@@ -679,6 +824,33 @@ mod tests {
         let v3 = setup_parts("v0.3");
         assert_eq!(v3[3].url, "https://cdn.infishark.com/v0.3-nano-setup.bin");
         assert_eq!(v3[0].url, parts[0].url);
+    }
+
+    #[test]
+    fn espflash_assets_cover_release_hosts() {
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("linux", "arm"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
+            let asset = espflash_asset(os, arch).expect(os);
+            assert!(asset.archive.ends_with(".zip"), "{}", asset.archive);
+            assert_eq!(asset.sha256.len(), 64, "{os}-{arch}");
+            assert!(
+                asset.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{os}-{arch}"
+            );
+        }
+        assert!(espflash_asset("linux", "riscv64").is_none());
+        assert!(
+            espflash_asset("linux", "x86_64")
+                .unwrap()
+                .archive
+                .contains("musl")
+        );
     }
 
     #[test]
