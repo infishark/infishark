@@ -1,6 +1,6 @@
-//! HID report descriptors, parameterized by report ID. Presets and the live-input bridge assemble
-//! the same composite maps from these, so a single device can carry keyboard + mouse + gamepad on
-//! distinct report IDs.
+//! HID report descriptors, parameterized by report ID. Presets and the
+//! live-input bridge assemble the same composite maps from these, so a single
+//! device can carry keyboard + mouse + gamepad on distinct report IDs.
 
 use infishark::hex;
 
@@ -15,8 +15,8 @@ pub enum HidClass {
     System,
 }
 
-// report IDs are assigned by position in this list, so a standalone preset stays report 1 and
-// `keyboard+mouse` stays 1,2.
+// report IDs are assigned by position in this list, so a standalone preset
+// stays report 1 and `keyboard+mouse` stays 1,2.
 const CANON: [HidClass; 6] = [
     HidClass::Keyboard,
     HidClass::Mouse,
@@ -57,8 +57,8 @@ impl HidClass {
         }
     }
 
-    // The report-map collection (hex) for this class, minus the report-ID byte. `collection(id)`
-    // inserts `85 <id>` right after the top-level collection.
+    // The report-map collection (hex) for this class, minus the report-ID byte.
+    // `collection(id)` inserts `85 <id>` right after the top-level collection.
     fn descriptor(self) -> (&'static str, &'static str) {
         match self {
             // 8-byte keyboard input (modifier + reserved + 6 keys) + 1-byte LED output.
@@ -104,7 +104,9 @@ impl HidClass {
     }
 }
 
-/// Name for a GAP HID appearance code. Emulated classes come from the single source in `HidClass`; joystick/tablet are recognized for display but aren't emulated.
+/// Name for a GAP HID appearance code. Emulated classes come from the single
+/// source in `HidClass`; joystick/tablet are recognized for display but aren't
+/// emulated.
 pub fn appearance_label(appearance: u16) -> &'static str {
     if let Some(c) = CANON.iter().find(|c| c.appearance() == appearance) {
         return c.label();
@@ -172,6 +174,56 @@ pub fn ascii_to_hid(c: char) -> Option<(u8, u8)> {
     })
 }
 
+/// Map a HID keyboard usage back to its printed character (US layout), the
+/// inverse of [`ascii_to_hid`]. `shift` picks the shifted glyph; modifiers,
+/// backspace and other non-printing keys return `None`.
+pub fn hid_usage_to_ascii(usage: u8, shift: bool) -> Option<char> {
+    Some(match (usage, shift) {
+        // letters
+        (0x04..=0x1d, false) => (b'a' + usage - 0x04) as char,
+        (0x04..=0x1d, true) => (b'A' + usage - 0x04) as char,
+        // digits
+        (0x1e..=0x26, false) => (b'1' + usage - 0x1e) as char,
+        (0x27, false) => '0',
+        (0x1e, true) => '!',
+        (0x1f, true) => '@',
+        (0x20, true) => '#',
+        (0x21, true) => '$',
+        (0x22, true) => '%',
+        (0x23, true) => '^',
+        (0x24, true) => '&',
+        (0x25, true) => '*',
+        (0x26, true) => '(',
+        (0x27, true) => ')',
+        (0x2c, _) => ' ',
+        (0x2d, false) => '-',
+        (0x2d, true) => '_',
+        (0x2e, false) => '=',
+        (0x2e, true) => '+',
+        (0x2f, false) => '[',
+        (0x2f, true) => '{',
+        (0x30, false) => ']',
+        (0x30, true) => '}',
+        (0x31, false) => '\\',
+        (0x31, true) => '|',
+        (0x33, false) => ';',
+        (0x33, true) => ':',
+        (0x34, false) => '\'',
+        (0x34, true) => '"',
+        (0x35, false) => '`',
+        (0x35, true) => '~',
+        (0x36, false) => ',',
+        (0x36, true) => '<',
+        (0x37, false) => '.',
+        (0x37, true) => '>',
+        (0x38, false) => '/',
+        (0x38, true) => '?',
+        (0x28, _) => '\n',
+        (0x2b, _) => '\t',
+        _ => return None,
+    })
+}
+
 /// Dedup classes; assign 1-based report IDs in CANON order.
 pub fn assign(classes: &[HidClass]) -> Vec<(HidClass, u8)> {
     let mut out = Vec::new();
@@ -185,8 +237,8 @@ pub fn assign(classes: &[HidClass]) -> Vec<(HidClass, u8)> {
     out
 }
 
-/// Assemble a composite spec of (report_map_hex, reports, appearance) for the given classes.
-/// Appearance follows the first (highest-priority) class.
+/// Assemble a composite spec of (report_map_hex, reports, appearance) for the
+/// given classes. Appearance follows the first (highest-priority) class.
 pub fn composite(classes: &[HidClass]) -> (String, Vec<serde_json::Value>, u16) {
     let assigned = assign(classes);
     let mut map = String::new();
@@ -238,7 +290,8 @@ mod tests {
         let (map, reports, appearance) =
             composite(&[HidClass::Keyboard, HidClass::Tablet, HidClass::System]);
         assert_eq!(appearance, HidClass::Keyboard.appearance());
-        // keyboard input(1) + keyboard LED output(1) + tablet input(2) + system input(3)
+        // keyboard input(1) + keyboard LED output(1) + tablet input(2) + system
+        // input(3)
         assert_eq!(reports.len(), 4);
         assert!(map.contains("050d0902a1018502"));
         assert!(map.contains("05010980a1018503"));
