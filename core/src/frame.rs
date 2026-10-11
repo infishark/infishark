@@ -35,7 +35,8 @@ pub fn encode(typ: u8, seq: u16, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Encode a `PKT_COMMAND`: a little-endian `u16` opcode followed by raw JSON argument bytes (empty for argument-less commands).
+/// Encode a `PKT_COMMAND`: a little-endian `u16` opcode followed by raw JSON
+/// argument bytes (empty for argument-less commands).
 pub fn encode_command(seq: u16, opcode: u16, json: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(2 + json.len());
     payload.extend_from_slice(&opcode.to_le_bytes());

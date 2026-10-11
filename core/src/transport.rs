@@ -34,7 +34,8 @@ impl Response {
     }
 }
 
-// Ceilings that bound host memory if a hostile or malfunctioning device never ends a multi-frame stream.
+// Ceilings that bound host memory if a hostile or malfunctioning device never
+// ends a multi-frame stream.
 const MAX_REASSEMBLY: usize = 4 * 1024 * 1024;
 const MAX_BUFFERED_EVENTS: usize = 1024;
 

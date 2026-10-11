@@ -10,7 +10,8 @@ pub fn insert_opt<T: Into<Value>>(m: &mut Map<String, Value>, key: &str, value: 
     }
 }
 
-/// Insert `key: value` only when `cond` holds (for emitting a non-default flag).
+/// Insert `key: value` only when `cond` holds (for emitting a non-default
+/// flag).
 pub fn insert_flag(m: &mut Map<String, Value>, key: &str, cond: bool, value: Value) {
     if cond {
         m.insert(key.to_string(), value);

@@ -993,7 +993,8 @@ enum HidCmd {
     Replay {
         /// HCI pcap to read (written by `ble mitm --pcap`).
         pcap: String,
-        /// Playback speed multiplier (2 = twice as fast, 0 = as fast as possible).
+        /// Playback speed multiplier (2 = twice as fast, 0 = as fast as
+        /// possible).
         #[arg(long, default_value_t = 1.0)]
         speed: f64,
         /// ATT handle of the HID input report characteristic. Default: the
@@ -2720,7 +2721,8 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
     }
 }
 
-/// ATT opcode for Handle Value Notification (HID input reports arrive as these).
+/// ATT opcode for Handle Value Notification (HID input reports arrive as
+/// these).
 const ATT_OP_NOTIFY: u8 = 0x1b;
 
 /// Extract one handle's HID input-report timeline from a MITM HCI pcap:
@@ -2793,7 +2795,8 @@ fn new_presses(prev: &mut [u8; 6], rep: &[u8]) -> Vec<(u8, u8)> {
     out
 }
 
-/// Print label for a non-printing usage (shift picks shifted glyphs for chords).
+/// Print label for a non-printing usage (shift picks shifted glyphs for
+/// chords).
 fn key_label(k: u8, shift: bool) -> String {
     match k {
         0x2a => "<BS>".into(),

@@ -66,7 +66,8 @@ pub fn parse_u64(s: &str) -> Result<u64> {
     u64::from_str_radix(hex_digits(s), 16).with_context(|| format!("bad hex u64 '{s}'"))
 }
 
-/// Parse 1-4 little-endian space-separated hex bytes into a `u32` (`.ir` address/command).
+/// Parse 1-4 little-endian space-separated hex bytes into a `u32` (`.ir`
+/// address/command).
 pub fn parse_le_u32_bytes(s: &str) -> Result<u32> {
     let mut bytes = [0u8; 4];
     let parts: Vec<&str> = s.split_whitespace().collect();

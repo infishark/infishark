@@ -596,7 +596,8 @@ struct EspflashAsset {
     sha256: &'static str,
 }
 
-/// Host builds we ship. x86_64 Linux uses the musl binary so an older glibc still runs it.
+/// Host builds we ship. x86_64 Linux uses the musl binary so an older glibc
+/// still runs it.
 fn espflash_asset(os: &str, arch: &str) -> Option<EspflashAsset> {
     let (archive, sha256) = match (os, arch) {
         ("linux", "x86_64") => (

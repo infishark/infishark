@@ -543,10 +543,11 @@ impl Device {
         self.command_ok(protocol::CMD_BLE_HID_SEND, spec)
     }
 
-    /// Dual-link GATT proxy: connect to `spec.address`, clone its table, advertise.
-    /// Out: cloned identity (`name`, `mac`, `peer`, `chars`). Progress and ATT
-    /// traffic arrive as [`protocol::EVT_BLE_MITM`]; `on_event` is called for
-    /// progress frames that arrive before the command completes.
+    /// Dual-link GATT proxy: connect to `spec.address`, clone its table,
+    /// advertise. Out: cloned identity (`name`, `mac`, `peer`, `chars`).
+    /// Progress and ATT traffic arrive as [`protocol::EVT_BLE_MITM`];
+    /// `on_event` is called for progress frames that arrive before the
+    /// command completes.
     pub fn ble_mitm_start(
         &mut self,
         spec: &serde_json::Value,

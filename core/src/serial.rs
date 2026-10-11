@@ -49,7 +49,8 @@ pub fn auto_port() -> Result<String> {
     auto_select()
 }
 
-/// Espressif USB-CDC nodes, even if they do not answer device-info (bricked / setup).
+/// Espressif USB-CDC nodes, even if they do not answer device-info (bricked /
+/// setup).
 pub fn espressif_ports() -> Result<Vec<String>> {
     let ports = serialport::available_ports().context("listing serial ports")?;
     let mut espressif: Vec<String> = ports

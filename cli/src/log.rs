@@ -2,7 +2,7 @@
 //! so they can be piped. Marks go to stderr.
 //!
 //!   ·  progress
-//!   +  finished
+//!   + finished
 //!   !  failure or warning
 
 use std::fmt::Display;

@@ -1,8 +1,9 @@
 //! Streaming demuxer for the device -> host direction.
 //!
-//! The USB-CDC stream has three different channels. There are the framed control packets (magic B5
-//! 5A C1), the display stream (magic AA 55 F0), and bare debug text. This demuxer extracts control
-//! frames and emits everything else as log bytes
+//! The USB-CDC stream has three different channels. There are the framed
+//! control packets (magic B5 5A C1), the display stream (magic AA 55 F0), and
+//! bare debug text. This demuxer extracts control frames and emits everything
+//! else as log bytes
 
 #![allow(dead_code)]
 
@@ -192,7 +193,8 @@ mod tests {
     #[test]
     fn resyncs_past_false_magic_with_bad_version() {
         let (bytes, want) = sample_frame();
-        // B5 5A C1 followed by a, for example, non-0x01 version byte is not in fact a real frame
+        // B5 5A C1 followed by a, for example, non-0x01 version byte is not in fact a
+        // real frame
         let mut input = vec![0xB5, 0x5A, 0xC1, 0x99];
         input.extend_from_slice(&bytes);
         let mut d = Demuxer::new();

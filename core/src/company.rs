@@ -1,4 +1,5 @@
-//! Bluetooth SIG company-identifier resolution (the 16-bit IDs in BLE manufacturer data). Mirrors the oui module but for the SIG registry.
+//! Bluetooth SIG company-identifier resolution (the 16-bit IDs in BLE
+//! manufacturer data). Mirrors the oui module but for the SIG registry.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

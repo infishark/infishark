@@ -240,7 +240,8 @@ fn wifi_rows(nets: &[Network], order: &[usize], verbose: bool) -> Vec<Row> {
         .collect()
 }
 
-/// Borderless network table, strongest first. `verbose` adds ciphers/bandwidth/flags.
+/// Borderless network table, strongest first. `verbose` adds
+/// ciphers/bandwidth/flags.
 pub fn network_table(nets: &[Network], verbose: bool) {
     if nets.is_empty() {
         println!("no networks found");
@@ -254,7 +255,8 @@ pub fn network_table(nets: &[Network], verbose: bool) {
     print_scan_summary(nets);
 }
 
-/// Host-only post-table notes: hidden SSIDs that likely share a radio with a named AP.
+/// Host-only post-table notes: hidden SSIDs that likely share a radio with a
+/// named AP.
 fn print_hidden_correlations(nets: &[Network]) {
     let hits = crate::wifi_analysis::hidden_correlations(nets, 8);
     if hits.is_empty() {
