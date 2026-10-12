@@ -1063,16 +1063,16 @@ enum HidCmd {
 
 #[derive(Debug, Subcommand)]
 enum GattCmd {
-    /// Connect to a peripheral by address (omit to scan and pick
+    /// Connect to a peripheral by address or table row (omit to scan and pick
     /// interactively).
     Connect {
-        /// Target address, e.g. AA:BB:CC:DD:EE:FF.
+        /// Target address, or a row # from the last `ble scan` / `ble bonds`
+        /// table.
         address: Option<String>,
-        /// Address type: 0=public, 1=random. Prefer the type from `ble scan`
-        /// (interactive pick uses it). Wrong type is a common cause of
-        /// connect timeout / HCI 0x3E.
-        #[arg(long, default_value_t = 0)]
-        addr_type: u8,
+        /// Address type: 0=public, 1=random. Omit to use the type
+        /// from that row.
+        #[arg(long)]
+        addr_type: Option<u8>,
         /// BLE connection-attempt timeout in ms (distinct from the global
         /// --timeout-ms).
         #[arg(long)]
@@ -1089,35 +1089,44 @@ enum GattCmd {
         /// Supervision timeout (10 ms units).
         #[arg(long)]
         supervision_timeout: Option<u16>,
-        /// Initiate pairing/encryption right after connecting.
+        /// Force Just Works pairing. A HID advertisement already pairs with
+        /// a PIN; other peers pair when they refuse access until encrypted.
         #[arg(long)]
         secure: bool,
-        /// Persist keys (bond/trust across reconnects).
+        /// Connect without pairing.
+        #[arg(long)]
+        no_pair: bool,
+        /// Persist keys (bond/trust across reconnects). On for --secure and
+        /// --mitm.
         #[arg(long)]
         bond: bool,
-        /// Require MITM protection (passkey / numeric comparison).
+        /// Require MITM protection. The method comes from --io-cap.
+        /// Default is 0: the Nano shows a PIN for the peer to type.
         #[arg(long)]
         mitm: bool,
-        /// Use LE Secure Connections.
+        /// Use LE Secure Connections. On for --secure and --mitm.
         #[arg(long)]
         sc: bool,
-        /// Pairing IO capability (3=Just Works, 2=Keyboard for passkey entry).
+        /// Pairing IO capability. 0 = Nano shows a PIN for the peer to type.
+        /// 1 = both sides show the same number; nothing to type.
+        /// 2 = peer shows a PIN; pass it with --passkey.
+        /// 3 = Just Works. Default is 0 with --mitm, and 3 otherwise.
         #[arg(long)]
         io_cap: Option<u8>,
         /// Passkey to supply when the peer requests one.
         #[arg(long)]
         passkey: Option<u32>,
     },
-    /// Discover and print the service/characteristic tree.
+    /// Discover characteristics and print them as a numbered table.
     Enum,
-    /// Read a characteristic value by UUID.
+    /// Read one characteristic, or every readable row with `all`.
     Read {
-        /// Characteristic UUID.
+        /// UUID, a row # from the last `ble gatt enum`, or `all`.
         uuid: String,
     },
-    /// Write a hex value to a characteristic by UUID.
+    /// Write a hex value to a characteristic by UUID or enum row.
     Write {
-        /// Characteristic UUID.
+        /// Characteristic UUID, or a row # from the last `ble gatt enum`.
         uuid: String,
         /// Value as hex, e.g. AF or 01020304.
         data: String,
@@ -1125,19 +1134,21 @@ enum GattCmd {
         #[arg(long)]
         no_response: bool,
     },
-    /// Subscribe to one or more characteristics and stream values (NDJSON)
-    /// until interrupted.
+    /// Subscribe and stream values until interrupted. In the shell, return
+    /// immediately and keep listening. `all` subscribes every notify or
+    /// indicate row.
     Subscribe {
-        /// Characteristic UUID(s) to subscribe to.
+        /// UUID(s), row #s from the last `ble gatt enum`, or `all`.
         #[arg(required = true)]
         uuids: Vec<String>,
-        /// Use indications (acked) instead of notifications.
+        /// Use indications. With `all`, only indicatable rows. An indicate-only
+        /// row uses indications without this flag.
         #[arg(long)]
         indicate: bool,
     },
     /// Stop notifications/indications on a characteristic.
     Unsubscribe {
-        /// Characteristic UUID.
+        /// Characteristic UUID, or a row # from the last `ble gatt enum`.
         uuid: String,
     },
     /// Disconnect the current GATT session.
@@ -2340,6 +2351,151 @@ fn resolve_ble_arg(token: &str, explicit_type: Option<u8>) -> Result<ui::Resolve
     ui::resolve_ble_target(&rows, token, explicit_type)
 }
 
+fn gatt_table() -> Vec<ui::GattRow> {
+    LAST_GATT.lock().unwrap().clone()
+}
+
+fn gatt_select(tokens: &[String], op: ui::GattOp) -> Result<ui::GattSelection> {
+    ui::select_gatt(&gatt_table(), tokens, op)
+}
+
+fn gatt_subscribe_selection(uuids: &[String], indicate: bool) -> Result<ui::GattSelection> {
+    gatt_select(uuids, ui::GattOp::Subscribe { indicate })
+}
+
+fn watch_pair(cli: &Cli, v: &serde_json::Value) {
+    if cli.json {
+        let _ = writeln!(std::io::stdout(), "{v}");
+    } else {
+        print_pair_event(v);
+    }
+}
+
+fn report_selection_misses(cli: &Cli, sel: &ui::GattSelection) {
+    for r in &sel.rejected {
+        report_gatt_miss(cli, &ui::gatt_rejection_line(r), r.row, &r.name);
+    }
+}
+
+fn report_gatt_miss(cli: &Cli, line: &str, row: Option<usize>, name: &str) {
+    if cli.json {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            serde_json::json!({ "n": row, "name": name, "error": line })
+        );
+    } else {
+        log::err(line);
+    }
+}
+
+fn report_target_err(cli: &Cli, t: &ui::GattTarget, err: &str) {
+    if cli.json {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            serde_json::json!({
+                "n": t.row,
+                "name": t.name,
+                "uuid": t.uuid,
+                "handle": t.handle,
+                "error": err,
+            })
+        );
+    } else {
+        log::err(format!("{}  {err}", ui::gatt_target_label(t)));
+    }
+}
+
+fn apply_gatt_read(cli: &Cli, dev: &mut Device, sel: &ui::GattSelection) -> Result<()> {
+    report_selection_misses(cli, sel);
+    if !sel.bulk {
+        let Some(t) = sel.targets.first() else {
+            bail!("no characteristic could be read");
+        };
+        let bytes = dev.gatt_read_at_with(&t.uuid, t.handle, |v| watch_pair(cli, v))?;
+        let hex_s = hex::encode(&bytes);
+        if cli.json {
+            return print_value(&serde_json::json!({ "hex": hex_s }), true);
+        }
+        println!("{hex_s}");
+        return Ok(());
+    }
+    let mut values = Vec::new();
+    let mut ok = 0usize;
+    for t in &sel.targets {
+        match dev.gatt_read_at_with(&t.uuid, t.handle, |v| watch_pair(cli, v)) {
+            Ok(bytes) => {
+                ok += 1;
+                let hex_s = hex::encode(&bytes);
+                if !cli.json {
+                    println!("{}  {hex_s}", ui::gatt_target_label(t));
+                }
+                values.push(serde_json::json!({
+                    "n": t.row,
+                    "name": t.name,
+                    "uuid": t.uuid,
+                    "handle": t.handle,
+                    "hex": hex_s,
+                }));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                report_target_err(cli, t, &msg);
+                values.push(serde_json::json!({
+                    "n": t.row,
+                    "name": t.name,
+                    "uuid": t.uuid,
+                    "handle": t.handle,
+                    "error": msg,
+                }));
+            }
+        }
+    }
+    if ok == 0 {
+        if cli.json {
+            let _ = print_value(
+                &serde_json::json!({ "count": values.len(), "values": values }),
+                true,
+            );
+        }
+        bail!("no characteristic could be read");
+    }
+    if cli.json {
+        print_value(
+            &serde_json::json!({ "count": values.len(), "values": values }),
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_gatt_subscribe(cli: &Cli, dev: &mut Device, sel: &ui::GattSelection) -> Result<()> {
+    report_selection_misses(cli, sel);
+    let mut ok = 0usize;
+    for t in &sel.targets {
+        match dev.gatt_subscribe_at(&t.uuid, t.handle, t.indicate) {
+            Ok(()) => {
+                ok += 1;
+                if sel.bulk && !cli.json {
+                    let mode = if t.indicate { "indicate" } else { "notify" };
+                    log::info(format!("{}  {mode}", ui::gatt_target_label(t)));
+                }
+            }
+            Err(e) => {
+                if !sel.bulk {
+                    return Err(e.into());
+                }
+                report_target_err(cli, t, &e.to_string());
+            }
+        }
+    }
+    if ok == 0 {
+        bail!("subscribe failed");
+    }
+    Ok(())
+}
+
 fn log_ble_connecting(address: &str, addr_type: u8) {
     match ble_cached_name(address) {
         Some(n) => log::info(format!(
@@ -3424,6 +3580,32 @@ fn cmd_mitm(
     Ok(())
 }
 
+fn print_pair_event(v: &serde_json::Value) {
+    let step = v.get("step").and_then(|x| x.as_str()).unwrap_or("");
+    if step == "passkey" {
+        if let Some(pin) = v.get("pin").and_then(|x| x.as_u64()) {
+            let compare = v.get("compare").and_then(|x| x.as_bool()).unwrap_or(false);
+            if compare {
+                log::info(format!(
+                    "confirm this PIN (or type it on the keyboard): {pin:06}"
+                ));
+            } else {
+                log::info(format!("type this PIN on the keyboard: {pin:06}"));
+            }
+        }
+        return;
+    }
+    let msg = match step {
+        "need" => "peer requires pairing",
+        "pair" => "waiting for pairing...",
+        "bonded" => "using stored bond (no PIN)",
+        other => other,
+    };
+    if !msg.is_empty() {
+        log::info(msg);
+    }
+}
+
 fn print_mitm_event(v: &serde_json::Value) {
     let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("?");
     if op == "status" {
@@ -3477,21 +3659,33 @@ fn print_mitm_event(v: &serde_json::Value) {
     }
 }
 
-fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
+fn gatt_timeout(cli: &Cli, action: &GattCmd) -> u64 {
     // connect/enum can take a few seconds (cold discovery); later ATT ops use
     // the on-device cache and should be fast.
     let base = cli.timeout_ms.max(12_000);
-    let timeout = match action {
+    match action {
         GattCmd::Connect {
             connect_timeout_ms, ..
-        } => base.max(connect_timeout_ms.unwrap_or(0) as u64 + 3_000),
+        } => {
+            let link = connect_timeout_ms.unwrap_or(12_000) as u64;
+            // Auto-pair can still end in a 90s PIN after a short Just Works try.
+            base.max(2 * (link + 4_000) + 110_000)
+        }
+        GattCmd::Read { .. } | GattCmd::Write { .. } => base.max(110_000),
         GattCmd::Enum => base.max(30_000),
         // A subscription streams indefinitely; wait a long time between values
-        // (Ctrl-C ends it).
+        // (Ctrl-C ends it). The shell does not use this path.
         GattCmd::Subscribe { .. } => 3_600_000,
         _ => base,
-    };
-    let mut dev = cli.open(timeout)?;
+    }
+}
+
+fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
+    let mut dev = cli.open(gatt_timeout(cli, action))?;
+    gatt_on(cli, db, action, &mut dev)
+}
+
+fn gatt_on(cli: &Cli, db: &DbOpts, action: &GattCmd, mut dev: &mut Device) -> Result<()> {
     match action {
         GattCmd::Connect {
             address,
@@ -3502,16 +3696,46 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
             latency,
             supervision_timeout,
             secure,
+            no_pair,
             bond,
             mitm,
             sc,
             io_cap,
             passkey,
         } => {
-            let (address, addr_type, _) = match address {
-                Some(a) => (a.clone(), *addr_type, true),
-                None => pick_ble_target(&mut dev, db)?,
+            let resolved = match address {
+                Some(a) => resolve_ble_arg(a, *addr_type)?,
+                None => {
+                    let (address, addr_type, type_known) = pick_ble_target(&mut dev, db)?;
+                    ui::ResolvedBle {
+                        address,
+                        addr_type,
+                        type_known,
+                    }
+                }
             };
+            let address = resolved.address;
+            let addr_type = resolved.addr_type;
+            {
+                let rows = LAST_BLE_ROWS.lock().unwrap();
+                let scan = LAST_BLE.lock().unwrap();
+                ui::refuse_unconnectable(&rows, &scan, &address)?;
+            }
+            *LAST_GATT.lock().unwrap() = Vec::new();
+            let hid = ble_cached(&address).is_some_and(|d| ui::ble_prefers_passkey(&d));
+            let mode = if *no_pair {
+                "off"
+            } else if *mitm || matches!(*io_cap, Some(0)) {
+                "passkey"
+            } else if *secure || io_cap.is_some() {
+                "justworks"
+            } else if hid {
+                "passkey"
+            } else {
+                "auto"
+            };
+            let hid_notice = hid && mode == "passkey" && !*mitm && !*secure;
+            let forced = mode == "passkey" || mode == "justworks";
             let opts = GattConnectOpts {
                 addr_type,
                 timeout_ms: *connect_timeout_ms,
@@ -3519,43 +3743,94 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
                 max_interval: *max_interval,
                 latency: *latency,
                 supervision_timeout: *supervision_timeout,
-                secure: *secure,
-                pair: false,
-                pair_mode: None,
-                bond: *bond,
-                mitm: *mitm,
-                sc: *sc,
-                io_cap: *io_cap,
+                secure: false,
+                pair: forced,
+                bond: if mode != "off" { true } else { *bond },
+                mitm: mode == "passkey",
+                sc: if mode != "off" { true } else { *sc },
+                io_cap: match mode {
+                    "passkey" => Some((*io_cap).unwrap_or(0)),
+                    "justworks" => Some((*io_cap).unwrap_or(3)),
+                    _ => *io_cap,
+                },
                 passkey: *passkey,
+                pair_mode: Some(mode.to_string()),
             };
             warn_if_mesh_active(&mut dev);
-            match dev.gatt_connect(&address, &opts) {
+            if hid_notice && !cli.json {
+                log::info("HID peripheral; pairing (--no-pair to skip)");
+            }
+            let json = cli.json;
+            let saw_pair = std::cell::Cell::new(false);
+            // Known type, and no pairing wait: one retry. Otherwise one try
+            // per address type so a PIN is not started twice.
+            let tries = if resolved.type_known && mode == "off" {
+                2
+            } else {
+                1
+            };
+            let connect = |dev: &mut Device, opts: &GattConnectOpts| {
+                if !json {
+                    log_ble_connecting(&address, opts.addr_type);
+                }
+                let sp = ui::Spinner::start("connecting");
+                let result = dev.gatt_connect_tries(&address, opts, tries, |v| {
+                    saw_pair.set(true);
+                    if json {
+                        let _ = writeln!(std::io::stdout(), "{v}");
+                    } else {
+                        print_pair_event(v);
+                    }
+                });
+                sp.stop();
+                result
+            };
+            let remember = |dev: &mut Device, used_type: u8| {
+                let name = ble_cached_name(&address);
+                let _ = dev.ble_bond_remember(&address, used_type, name.as_deref());
+            };
+            match connect(&mut dev, &opts) {
+                Err(e @ infishark::Error::Interrupted) => {
+                    let _ = dev.stop_current_task();
+                    return Err(e.into());
+                }
                 Ok(()) => {
-                    let name = LAST_BLE.lock().ok().and_then(|devs| {
-                        devs.iter()
-                            .find(|d| d.address.eq_ignore_ascii_case(&address))
-                            .and_then(|d| d.name.clone())
-                    });
-                    let _ = dev.ble_bond_remember(&address, addr_type, name.as_deref());
+                    remember(&mut dev, addr_type);
+                    if forced && !saw_pair.get() && !cli.json {
+                        log::warn(
+                            "connected, but this firmware did not start pairing; flash the Nano to use --secure",
+                        );
+                    }
                     print_ok(cli.json)
                 }
-                Err(e) if matches!(addr_type, 0 | 1) => {
+                Err(e)
+                    if !resolved.type_known
+                        && matches!(addr_type, 0 | 1)
+                        && !bad_ble_address(&e)
+                        && !is_pairing_failure(&e) =>
+                {
                     let alt = if addr_type == 0 { 1 } else { 0 };
                     let mut flipped = opts.clone();
                     flipped.addr_type = alt;
-                    match dev.gatt_connect(&address, &flipped) {
+                    match connect(&mut dev, &flipped) {
+                        Err(e2 @ infishark::Error::Interrupted) => {
+                            let _ = dev.stop_current_task();
+                            return Err(e2.into());
+                        }
                         Ok(()) => {
-                            if !cli.json {
-                                eprintln!("connected with --addr-type {alt}");
+                            remember(&mut dev, alt);
+                            if forced && !saw_pair.get() && !cli.json {
+                                log::warn(
+                                    "connected, but this firmware did not start pairing; flash the Nano to use --secure",
+                                );
                             }
                             print_ok(cli.json)
                         }
                         Err(_) => {
                             if !cli.json {
-                                eprintln!(
-                                    "hint: link-layer connect failed before GATT. \
-retry {address} with --addr-type {alt}"
-                                );
+                                log::warn(format!(
+                                    "{address} did not connect as addr-type {addr_type} or {alt}"
+                                ));
                             }
                             Err(e.into())
                         }
@@ -3565,44 +3840,58 @@ retry {address} with --addr-type {alt}"
             }
         }
         GattCmd::Enum => {
-            let services = dev.gatt_enum()?;
+            let sp = ui::Spinner::start("discovering services");
+            let services = dev.gatt_enum();
+            sp.stop();
+            let services = services?;
+            *LAST_GATT.lock().unwrap() = ui::gatt_rows(&services);
             if cli.json {
-                print_items("services", &services, true)
+                print_value(&gatt_names::named_services(&services)?, true)
             } else {
                 ui::gatt_services(&services);
                 Ok(())
             }
         }
         GattCmd::Read { uuid } => {
-            let bytes = dev.gatt_read(uuid)?;
-            if cli.json {
-                print_value(&serde_json::json!({ "hex": hex::encode(&bytes) }), true)
-            } else {
-                println!("{}", hex::encode(&bytes));
-                Ok(())
-            }
+            let sel = gatt_select(std::slice::from_ref(uuid), ui::GattOp::Read)?;
+            apply_gatt_read(cli, dev, &sel)
         }
         GattCmd::Write {
             uuid,
             data,
             no_response,
         } => {
+            let sel = gatt_select(std::slice::from_ref(uuid), ui::GattOp::Write)?;
+            let Some(t) = sel.targets.first() else {
+                bail!("not writable");
+            };
             let bytes = hex::decode(data)?;
-            dev.gatt_write(uuid, &bytes, !no_response)?;
+            dev.gatt_write_at_with(&t.uuid, t.handle, &bytes, !no_response, |v| {
+                watch_pair(cli, v)
+            })?;
             print_ok(cli.json)
         }
         GattCmd::Subscribe { uuids, indicate } => {
-            for u in uuids {
-                dev.gatt_subscribe(u, *indicate)?;
-            }
+            let sel = gatt_select(
+                uuids,
+                ui::GattOp::Subscribe {
+                    indicate: *indicate,
+                },
+            )?;
+            apply_gatt_subscribe(cli, dev, &sel)?;
             stream_ndjson(|| dev.next_notification().map_err(Into::into))
         }
         GattCmd::Unsubscribe { uuid } => {
-            dev.gatt_unsubscribe(uuid)?;
+            let sel = gatt_select(std::slice::from_ref(uuid), ui::GattOp::Unsubscribe)?;
+            let Some(t) = sel.targets.first() else {
+                bail!("pass a row number or a characteristic UUID");
+            };
+            dev.gatt_unsubscribe_at(&t.uuid, t.handle)?;
             print_ok(cli.json)
         }
         GattCmd::Disconnect => {
             dev.gatt_disconnect()?;
+            *LAST_GATT.lock().unwrap() = Vec::new();
             print_ok(cli.json)
         }
     }
