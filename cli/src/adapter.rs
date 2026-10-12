@@ -193,7 +193,10 @@ mod linux {
         crate::log::info(format!(
             "starting adapter on {target} (BLE goes down while active)"
         ));
-        let up = dev.wifi_adapter_start(target, &config)?;
+        let sp = crate::ui::Spinner::start("associating");
+        let up = dev.wifi_adapter_start(target, &config);
+        sp.stop();
+        let up = up?;
         if let Some(ip) = up.get("sta_ip").and_then(|v| v.as_str()) {
             crate::log::ok(format!("associated (STA {ip}), tunnel is live"));
         }
@@ -225,8 +228,6 @@ mod linux {
 
         install_sigint();
 
-        // Serial writer is shared (tun pump, Ctrl-C stop, OLED toggle); the mutex keeps
-        // SLIP frames from interleaving on the wire.
         let reader = port.try_clone().context("cloning serial port")?;
         let writer = Arc::new(Mutex::new(port));
 
@@ -262,7 +263,6 @@ mod linux {
         }
         restore_stdin(&saved_tty);
 
-        // Best-effort clean teardown: tell the device to stop
         crate::log::info("stopping adapter");
         if let Ok(mut w) = writer.lock() {
             let _ = w.write_all(&slip_encode(&[CTRL_MAGIC, CTRL_STOP]));
@@ -280,9 +280,27 @@ mod linux {
         mut tun: std::fs::File,
         writer: Arc<Mutex<Box<dyn SerialPort>>>,
     ) -> std::thread::JoinHandle<()> {
+        use std::os::fd::AsRawFd;
+        let fd = tun.as_raw_fd();
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             while RUNNING.load(Ordering::SeqCst) {
+                let rc = unsafe { libc::poll(&mut pfd, 1, 100) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if rc == 0 {
+                    continue;
+                }
                 match tun.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -293,6 +311,7 @@ mod linux {
                             }
                         }
                     }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
@@ -380,8 +399,7 @@ mod linux {
         }
     }
 
-    // Put stdin into cbreak mode (single keypresses, no echo) but keep ISIG so our
-    // Ctrl-C still works.
+    // One key at a time, no echo. Ctrl-C stays a signal.
     fn enable_raw_stdin() -> Option<libc::termios> {
         unsafe {
             let mut orig: libc::termios = std::mem::zeroed();
@@ -420,9 +438,7 @@ mod linux {
         )
     }
 
-    // Clamp advertised TCP MSS on SYNs leaving the tunnel; otherwise PMTUD
-    // blackholes silently drop oversized packets. Applied on the interface,
-    // independent of routes.
+    // Clamp TCP MSS so large packets are not dropped in the tunnel.
     fn mss_clamp_args<'a>(op: &'a str, ifname: &'a str, mss: &'a str) -> [&'a str; 15] {
         [
             "-t",

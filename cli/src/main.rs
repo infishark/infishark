@@ -19,6 +19,7 @@ mod signals;
 mod target;
 mod tx;
 mod ui;
+mod vendors;
 mod wifi_analysis;
 
 use std::io::Write;
@@ -328,8 +329,8 @@ enum WifiCmd {
         /// Scan table row #, SSID, or BSSID.
         target: String,
     },
-    /// Deep recon: lock an AP's channel and summarize clients / probes /
-    /// airtime.
+    /// Lock an AP's channel and watch clients, probes, and airtime. The tables
+    /// refresh while it listens.
     Recon {
         /// Scan table row #, SSID, or BSSID (omit to pick interactively).
         target: Option<String>,
@@ -339,8 +340,8 @@ enum WifiCmd {
         /// Target AP by BSSID.
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
-        /// Seconds to dwell (0 = until Ctrl-C). Default 15.
-        #[arg(long, short = 't', default_value_t = 15)]
+        /// Stop after this many seconds. Default is until Ctrl-C.
+        #[arg(long, short = 't', default_value_t = 0)]
         seconds: u64,
     },
     /// Manage the networks saved on the device (used by Connect, the adapter,
@@ -404,7 +405,8 @@ enum WifiCmd {
         #[arg(long, conflicts_with = "ssid")]
         index: Option<u8>,
         /// Named filter preset: all, eapol, deauth, probe-req, beacons,
-        /// no-beacons.
+        /// no-beacons. Combine with address, RSSI, PHY, length, byte-match,
+        /// or dedup refinements; frame types/subtypes and EtherType stay fixed.
         #[arg(long)]
         filter: Option<String>,
         /// Raw: frame types to forward (mgmt,data,ctrl).
@@ -426,6 +428,7 @@ enum WifiCmd {
         #[arg(long)]
         ethertype: Option<String>,
         /// Raw: only frames carrying this MAC in addr1/addr2/addr3.
+        /// A row # from the last `wifi scan` uses that AP's BSSID.
         #[arg(long, visible_alias = "addr")]
         bssid: Option<String>,
         /// Raw: drop frames weaker than this RSSI (dBm).
@@ -487,11 +490,13 @@ enum WifiCmd {
         /// Gap between on-device TX attempts in ms (not 802.11 Duration/ID).
         #[arg(long, default_value_t = 0)]
         interval_ms: u16,
-        /// AP MAC (alias of --bssid). If omitted for AP-required templates,
-        /// scan + pick. Beacon: omitted = local BSSID (no scan).
+        /// AP MAC (alias of --bssid), or a row # from the last `wifi scan`.
+        /// If omitted for AP-required templates, scan + pick. Beacon: omitted
+        /// = local BSSID (no scan).
         #[arg(long)]
         ap: Option<String>,
-        /// AP BSSID (needs --channel when set without a scan).
+        /// AP BSSID, a raw MAC needs --channel and a row # from the last
+        /// `wifi scan` uses that AP's channel.
         #[arg(long)]
         bssid: Option<String>,
         /// Scan filter for AP-required templates. Beacon/probe-req: the
@@ -531,10 +536,11 @@ enum WifiCmd {
         /// Target AP by name; hits every BSSID advertising it.
         #[arg(long)]
         ssid: Option<String>,
-        /// Target a single AP by BSSID (needs --channel).
+        /// Target a single AP by BSSID (needs --channel), or a row # from the
+        /// last `wifi scan`.
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
-        /// Channel of --bssid.
+        /// Channel of a raw --bssid. Omitted when --bssid is a scan row #.
         #[arg(long, requires = "bssid", value_parser = clap::value_parser!(u8).range(1..=14))]
         channel: Option<u8>,
         /// Deauth one station (default: broadcast to all clients).
@@ -552,10 +558,11 @@ enum WifiCmd {
         /// Target AP by name; strongest BSSID if several.
         #[arg(long)]
         ssid: Option<String>,
-        /// Target a single AP by BSSID (needs --channel).
+        /// Target a single AP by BSSID (needs --channel), or a row # from the
+        /// last `wifi scan`.
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
-        /// Channel of --bssid.
+        /// Channel of a raw --bssid. Omitted when --bssid is a scan row #.
         #[arg(long, requires = "bssid", value_parser = clap::value_parser!(u8).range(1..=14))]
         channel: Option<u8>,
         /// Deauth one station (default: broadcast until a client is seen).
@@ -1784,6 +1791,7 @@ fn cmd_ir_rx(
 }
 
 fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
+    vendors::set_oui(oui_db);
     if let WifiCmd::List { verbose } = action {
         let mut nets = LAST_WIFI.lock().unwrap().clone();
         if nets.is_empty() {
@@ -1795,7 +1803,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             enrich_wifi(oui_db, &mut nets);
             *LAST_WIFI.lock().unwrap() = nets.clone();
         }
-        return print_networks(&nets, cli.json, *verbose);
+        return print_networks(&mut nets, cli.json, *verbose);
     }
     if let WifiCmd::Show { target } = action {
         let mut nets = LAST_WIFI.lock().unwrap().clone();
@@ -1808,19 +1816,19 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             enrich_wifi(oui_db, &mut nets);
             *LAST_WIFI.lock().unwrap() = nets.clone();
         }
-        let n = recon::resolve_from_cache(&nets, Some(target), None, None)?;
+        let mut n = recon::resolve_from_cache(&nets, Some(target), None, None)?;
+        vendors::fill_wifi(std::slice::from_mut(&mut n));
         if cli.json {
             return print_value(&serde_json::to_value(&n)?, true);
         }
-        ui::network_detail(&n);
+        ui::network_detail(&mut n);
         return Ok(());
     }
     // TUN needs root; fail before opening the device or picking a network.
     if matches!(action, WifiCmd::Adapter { .. }) {
         privs::require_root("wifi adapter")?;
     }
-    // Monitor streams indefinitely; give the read loop a long ceiling so a quiet
-    // channel doesn't error between frames (Ctrl-C ends it).
+    // A quiet channel is not an error. These waits are long on purpose.
     let timeout = match action {
         WifiCmd::Monitor { .. } => cli.timeout_ms.max(3_600_000),
         // A full scan sweeps every channel; wait for the device's SCAN_DONE.
@@ -1884,7 +1892,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             let mut nets = nets?;
             enrich_wifi(oui_db, &mut nets);
             *LAST_WIFI.lock().unwrap() = nets.clone();
-            print_networks(&nets, cli.json, *verbose)
+            print_networks(&mut nets, cli.json, *verbose)
         }
         WifiCmd::List { .. } | WifiCmd::Show { .. } => {
             unreachable!("served from cache before the device opens")
@@ -1918,7 +1926,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 if cli.json {
                     bail!("pass a target, --ssid, or --bssid (no interactive picker under --json)");
                 }
-                ui::pick_network(&nets)?
+                ui::pick_network(&mut nets)?
             } else {
                 recon::resolve_from_cache(
                     &nets,
@@ -1927,8 +1935,8 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                     bssid.as_deref(),
                 )?
             };
-            let oui = load_oui(oui_db);
-            recon::run(&mut dev, &net, *seconds, oui.as_ref(), cli.json)
+            let oui = vendors::oui();
+            recon::run(&mut dev, &net, *seconds, oui.as_deref(), cli.json)
         }
         WifiCmd::Saved { action } => cmd_wifi_saved(&mut dev, cli, oui_db, action),
         WifiCmd::Adapter {
@@ -2006,6 +2014,11 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             dst,
             out,
         } => {
+            let bssid_from_row = match bssid.as_deref() {
+                Some(b) if ui::is_row_index(b) => Some(recon::wifi_scan_row(b)?.bssid),
+                _ => None,
+            };
+            let bssid_ref = bssid_from_row.as_deref().or(bssid.as_deref());
             let mf = monitor::build_monitor_filter(&monitor::MonitorArgs {
                 filter: filter.as_deref(),
                 types: r#type,
@@ -2014,7 +2027,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 data_subtype,
                 block: *block,
                 ethertype: ethertype.as_deref(),
-                bssid: bssid.as_deref(),
+                bssid: bssid_ref,
                 min_rssi: *min_rssi,
                 max_rssi: *max_rssi,
                 phy: phy.as_deref(),
@@ -2032,13 +2045,17 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             if ssid.is_some() || index.is_some() {
                 dev.set_read_timeout(std::time::Duration::from_millis(cli.timeout_ms.max(30_000)))?;
             }
-            if let Some(i) = index {
-                dev.wifi_monitor_start_saved(*channel, &mf, *i)?;
+            let started = if let Some(i) = index {
+                dev.wifi_monitor_start_saved(*channel, &mf, *i)
             } else if let Some(s) = ssid {
                 let p = pass.as_deref().unwrap_or("");
-                dev.wifi_monitor_start(*channel, &mf, Some((s.as_str(), p)))?;
+                dev.wifi_monitor_start(*channel, &mf, Some((s.as_str(), p)))
             } else {
-                dev.wifi_monitor_start(*channel, &mf, None)?;
+                dev.wifi_monitor_start(*channel, &mf, None)
+            };
+            if let Err(e) = started {
+                let _ = dev.stop_current_task();
+                return Err(e.into());
             }
             let mut w: Box<dyn Write> = match out {
                 Some(f) => Box::new(std::io::BufWriter::new(ui::create_secure(f)?)),
@@ -2225,11 +2242,9 @@ fn cmd_wifi_saved(
                 Ok(())
             }
         }
-        SavedCmd::Add {
-            ssid,
-            pass,
-            scan_ms,
-        } => cmd_wifi_add(dev, cli, oui_db, ssid.clone(), pass.clone(), *scan_ms),
+        SavedCmd::Add { ssid, pass, .. } => {
+            cmd_wifi_add(dev, cli, oui_db, ssid.clone(), pass.clone())
+        }
         SavedCmd::Rm { index } => {
             let count = dev.wifi_saved_delete(*index)?;
             print_action(
@@ -2247,14 +2262,13 @@ fn cmd_wifi_add(
     oui_db: Option<&str>,
     ssid: Option<String>,
     pass: Option<String>,
-    scan_ms: u32,
 ) -> Result<()> {
     if cli.json && (ssid.is_none() || pass.is_none()) {
         bail!("wifi saved add under --json needs --ssid and --pass");
     }
     let ssid = match ssid {
         Some(s) => s,
-        None => pick_ssid_interactively(dev, oui_db, scan_ms)?,
+        None => pick_ssid_interactively(dev, oui_db)?,
     };
     // Prompt is echoed (personal-machine tool); pass --pass to avoid it in scripts.
     let pass = match pass {
@@ -2270,14 +2284,13 @@ fn cmd_wifi_add(
 }
 
 /// Scan, then pick via the shared Wi-Fi table (`ui::pick_network`)
-fn pick_ssid_interactively(dev: &mut Device, oui_db: Option<&str>, scan_ms: u32) -> Result<String> {
+fn pick_ssid_interactively(dev: &mut Device, oui_db: Option<&str>) -> Result<String> {
     let opts = WifiScanOpts {
         active: true,
         hide_hidden: true,
         ..Default::default()
     };
-    let spin_msg = format!("scanning networks (~{}s)", (scan_ms / 1000).max(1));
-    let sp = ui::Spinner::start(&spin_msg);
+    let sp = ui::Spinner::start("scanning networks");
     let nets = dev.wifi_scan(&opts);
     sp.stop();
     let mut nets = nets?;
@@ -2286,7 +2299,7 @@ fn pick_ssid_interactively(dev: &mut Device, oui_db: Option<&str>, scan_ms: u32)
         anyhow::bail!("no networks found (use --ssid for a hidden network)");
     }
     enrich_wifi(oui_db, &mut nets);
-    Ok(ui::pick_network(&nets)?.ssid)
+    Ok(ui::pick_network(&mut nets)?.ssid)
 }
 
 fn pick_saved_index(dev: &mut Device) -> Result<u8> {
@@ -3569,10 +3582,8 @@ fn load_company(company_db: Option<&str>) -> Option<company::Db> {
 }
 
 pub(crate) fn enrich_wifi(oui_db: Option<&str>, nets: &mut [infishark::model::Network]) {
-    let oui = load_oui(oui_db);
-    for n in nets {
-        n.enrich(oui.as_ref());
-    }
+    vendors::set_oui(oui_db);
+    vendors::fill_wifi(nets);
 }
 
 fn enrich_ble(db: &DbOpts, devices: &mut [infishark::model::BleDevice]) {
@@ -3583,7 +3594,12 @@ fn enrich_ble(db: &DbOpts, devices: &mut [infishark::model::BleDevice]) {
     }
 }
 
-fn print_networks(nets: &[infishark::model::Network], as_json: bool, verbose: bool) -> Result<()> {
+fn print_networks(
+    nets: &mut [infishark::model::Network],
+    as_json: bool,
+    verbose: bool,
+) -> Result<()> {
+    vendors::fill_wifi(nets);
     if as_json {
         // Host-only enrichment (posture/flags/summary) stays off the device wire;
         // attach it here for machine consumers of `--json`.

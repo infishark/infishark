@@ -1,7 +1,8 @@
-//! Deep Wi-Fi recon: lock a channel, sniff frames for one AP, summarize
-//! stations, probes, and airtime mix.
+//! Deep Wi-Fi recon: lock a channel, sniff frames for one AP, and keep the
+//! station, probe, and airtime tables current as frames arrive.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +33,7 @@ struct Prober {
     /// Directed probe SSIDs seen (empty string = wildcard).
     ssids: Vec<String>,
     best_rssi: i8,
+    last_rssi: i8,
 }
 
 #[derive(Debug, Default)]
@@ -46,6 +48,9 @@ struct ReconStats {
     mgmt_other: u64,
     eapol: u64,
     protected_data: u64,
+    /// Latest RSSI from a frame the AP sent. The scan value stands in until
+    /// then.
+    ap_last_rssi: Option<i8>,
     stations: HashMap<[u8; 6], Station>,
     probers: HashMap<[u8; 6], Prober>,
 }
@@ -69,16 +74,12 @@ pub fn run(
         format!("{} ({})", net.ssid, net.bssid)
     };
     if !as_json {
-        eprintln!(
-            "recon {} ch{} for {} (Ctrl-C to stop)",
-            style(&label).bold(),
-            channel,
-            if secs == 0 {
-                "until interrupt".into()
-            } else {
-                format!("{secs}s")
-            }
-        );
+        let dwell = if secs == 0 {
+            "until Ctrl-C".to_string()
+        } else {
+            format!("for {secs}s (Ctrl-C to stop)")
+        };
+        eprintln!("recon {} ch{} {dwell}", style(&label).bold(), channel,);
     }
 
     dev.wifi_monitor_start(channel, &filter, None)?;
@@ -89,14 +90,23 @@ pub fn run(
     let mut stats = ReconStats::default();
     let start = Instant::now();
     let limit = (secs > 0).then(|| Duration::from_secs(secs));
+    // Per-frame repaint flickers. 200 ms matches the other live views.
+    const REDRAW: Duration = Duration::from_millis(200);
+    let live = !as_json && std::io::stdout().is_terminal();
+    let mut view = live.then(ui::StatusBlock::new);
+    let mut last_draw: Option<Instant> = None;
+    if let Some(v) = view.as_mut() {
+        v.draw(&human_lines(&stats, net, Duration::ZERO, oui_db));
+        last_draw = Some(Instant::now());
+    }
 
-    loop {
+    let result = loop {
         if !signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
+            break Ok(());
         }
         if let Some(lim) = limit {
             if start.elapsed() >= lim {
-                break;
+                break Ok(());
             }
         }
         match dev.next_wifi_frame_opt() {
@@ -107,9 +117,23 @@ pub fn run(
             }
             Ok(Some(_)) | Ok(None) => {}
             Err(infishark::Error::Timeout) => {}
-            Err(_) if !signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) => break,
-            Err(e) => return Err(e.into()),
+            Err(_) if !signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) => break Ok(()),
+            Err(e) => break Err(e.into()),
         }
+        let due = last_draw.is_none_or(|t| t.elapsed() >= REDRAW);
+        if view.is_some() && due {
+            let lines = human_lines(&stats, net, start.elapsed(), oui_db);
+            if let Some(v) = view.as_mut() {
+                v.draw(&lines);
+            }
+            last_draw = Some(Instant::now());
+        }
+    };
+    if let Err(e) = result {
+        if let Some(v) = view.as_mut() {
+            v.clear();
+        }
+        return Err(e);
     }
     let _ = dev.stop_current_task();
     let elapsed = start.elapsed();
@@ -119,6 +143,8 @@ pub fn run(
             "{}",
             serde_json::to_string_pretty(&stats_json(&stats, net, elapsed, oui_db))?
         );
+    } else if let Some(v) = view.as_mut() {
+        v.draw(&human_lines(&stats, net, elapsed, oui_db));
     } else {
         print_human(&stats, net, elapsed, oui_db);
     }
@@ -142,6 +168,9 @@ fn ingest(stats: &mut ReconStats, bssid: [u8; 6], ap_ssid: &str, rssi: i8, raw: 
         return;
     }
     stats.frames += 1;
+    if heard_from_ap(&fr, bssid) {
+        stats.ap_last_rssi = Some(rssi);
+    }
 
     match fr.ftype {
         FrameType::Mgmt => match fr.subtype {
@@ -192,6 +221,18 @@ fn ingest(stats: &mut ReconStats, bssid: [u8; 6], ap_ssid: &str, rssi: i8, raw: 
             }
         }
         FrameType::Ext => {}
+    }
+}
+
+/// Beacon, probe response, or FromDS data: the RSSI belongs to the AP.
+fn heard_from_ap(fr: &ieee80211::Frame<'_>, bssid: [u8; 6]) -> bool {
+    match fr.ftype {
+        FrameType::Mgmt => {
+            matches!(fr.subtype, mgmt_subtype::BEACON | mgmt_subtype::PROBE_RESP)
+                && fr.addr2 == bssid
+        }
+        FrameType::Data => fr.from_ds && !fr.to_ds && fr.addr2 == bssid,
+        _ => false,
     }
 }
 
@@ -255,8 +296,10 @@ fn touch_prober(stats: &mut ReconStats, mac: [u8; 6], rssi: i8, ssid: String) {
         count: 0,
         ssids: Vec::new(),
         best_rssi: rssi,
+        last_rssi: rssi,
     });
     e.count += 1;
+    e.last_rssi = rssi;
     if rssi > e.best_rssi {
         e.best_rssi = rssi;
     }
@@ -282,9 +325,21 @@ fn vendor_of(mac: &[u8; 6], db: Option<&oui::Db>) -> String {
 }
 
 fn print_human(stats: &ReconStats, net: &Network, elapsed: Duration, oui_db: Option<&oui::Db>) {
+    for line in human_lines(stats, net, elapsed, oui_db) {
+        println!("{line}");
+    }
+}
+
+fn human_lines(
+    stats: &ReconStats,
+    net: &Network,
+    elapsed: Duration,
+    oui_db: Option<&oui::Db>,
+) -> Vec<String> {
     let secs = elapsed.as_secs_f64().max(0.001);
-    println!();
-    println!("{}", style("AP").bold());
+    let mut lines = Vec::new();
+    lines.push(String::new());
+    lines.push(style("AP").bold().to_string());
     let mut rows: Vec<(String, String)> = vec![
         (
             "ssid".into(),
@@ -296,15 +351,18 @@ fn print_human(stats: &ReconStats, net: &Network, elapsed: Duration, oui_db: Opt
         ),
         ("bssid".into(), net.bssid.clone()),
         ("channel".into(), net.channel.to_string()),
-        ("rssi".into(), format!("{} dBm", net.rssi)),
+        (
+            "rssi".into(),
+            format!("{} dBm", stats.ap_last_rssi.unwrap_or(net.rssi)),
+        ),
         ("encryption".into(), net.encryption.clone()),
         (
             "posture".into(),
             wifi_analysis::posture(net).as_str().into(),
         ),
     ];
-    if let Some(v) = &net.vendor {
-        rows.push(("vendor".into(), v.clone()));
+    if let Some(v) = ap_vendor(net, oui_db) {
+        rows.push(("vendor".into(), v));
     }
     for key in [
         "phy",
@@ -330,71 +388,65 @@ fn print_human(stats: &ReconStats, net: &Network, elapsed: Duration, oui_db: Opt
             rows.push((key.into(), s));
         }
     }
-    ui::detail_table(&rows);
+    push_detail(&mut lines, &rows);
 
-    println!();
-    println!("{}", style("Airtime").bold());
-    ui::detail_table(&[
-        ("dwell".to_string(), ui::fmt_elapsed(elapsed)),
-        ("frames".into(), stats.frames.to_string()),
-        (
-            "rate".into(),
-            format!("{:.1} fps", stats.frames as f64 / secs),
-        ),
-        ("beacons".into(), stats.beacons.to_string()),
-        ("probe_req".into(), stats.probe_req.to_string()),
-        ("probe_resp".into(), stats.probe_resp.to_string()),
-        ("data".into(), stats.data.to_string()),
-        ("nulls".into(), stats.nulls.to_string()),
-        ("ctrl".into(), stats.ctrl.to_string()),
-        ("eapol".into(), stats.eapol.to_string()),
-        ("protected_data".into(), stats.protected_data.to_string()),
-    ]);
+    lines.push(String::new());
+    lines.push(style("Airtime").bold().to_string());
+    push_detail(
+        &mut lines,
+        &[
+            ("dwell".to_string(), ui::fmt_elapsed(elapsed)),
+            ("frames".into(), stats.frames.to_string()),
+            (
+                "rate".into(),
+                format!("{:.1} fps", stats.frames as f64 / secs),
+            ),
+            ("beacons".into(), stats.beacons.to_string()),
+            ("probe_req".into(), stats.probe_req.to_string()),
+            ("probe_resp".into(), stats.probe_resp.to_string()),
+            ("data".into(), stats.data.to_string()),
+            ("nulls".into(), stats.nulls.to_string()),
+            ("ctrl".into(), stats.ctrl.to_string()),
+            ("eapol".into(), stats.eapol.to_string()),
+            ("protected_data".into(), stats.protected_data.to_string()),
+        ],
+    );
 
-    let mut stas: Vec<&Station> = stats.stations.values().collect();
-    stas.sort_by(|a, b| b.frames.cmp(&a.frames));
-    println!();
-    println!(
+    let stas = sorted_stations(stats);
+    lines.push(String::new());
+    lines.push(format!(
         "{}  {}",
         style("Stations").bold(),
         style(format!("({})", stas.len())).dim()
-    );
+    ));
     if stas.is_empty() {
-        println!("  (none seen - quiet channel or no client traffic during dwell)");
+        lines.push("  (none seen - quiet channel or no client traffic during dwell)".into());
     } else {
         for (i, s) in stas.iter().enumerate() {
-            let vend = vendor_of(&s.mac, oui_db);
-            let vend = if vend.is_empty() {
-                String::new()
-            } else {
-                format!("  {vend}")
-            };
-            println!(
+            lines.push(format!(
                 "  {:>2}  {}  {:>4} dBm  {:>5} frames  data={} null={}{}",
                 i,
                 fmt_mac(&s.mac),
-                s.best_rssi,
+                s.last_rssi,
                 s.frames,
                 s.data,
                 s.nulls,
-                vend
-            );
+                vendor_suffix(&s.mac, oui_db)
+            ));
         }
     }
 
-    let mut probes: Vec<&Prober> = stats.probers.values().collect();
-    probes.sort_by(|a, b| b.count.cmp(&a.count));
-    println!();
-    println!(
+    let probes = sorted_probers(stats);
+    lines.push(String::new());
+    lines.push(format!(
         "{}  {}",
         style("Probe requests").bold(),
         style(format!("({})", probes.len())).dim()
-    );
+    ));
     if probes.is_empty() {
-        println!("  (none addressing this BSSID during dwell)");
+        lines.push("  (none addressing this BSSID during dwell)".into());
     } else {
         for (i, p) in probes.iter().enumerate() {
-            let vend = vendor_of(&p.mac, oui_db);
             let ssids = if p.ssids.is_empty() {
                 "*".into()
             } else {
@@ -404,22 +456,53 @@ fn print_human(stats: &ReconStats, net: &Network, elapsed: Duration, oui_db: Opt
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            let vend = if vend.is_empty() {
-                String::new()
-            } else {
-                format!("  {vend}")
-            };
-            println!(
+            lines.push(format!(
                 "  {:>2}  {}  {:>4} dBm  {:>4}x  ssid=[{}]{}",
                 i,
                 fmt_mac(&p.mac),
-                p.best_rssi,
+                p.last_rssi,
                 p.count,
                 ssids,
-                vend
-            );
+                vendor_suffix(&p.mac, oui_db)
+            ));
         }
     }
+    lines
+}
+
+fn ap_vendor(net: &Network, oui_db: Option<&oui::Db>) -> Option<String> {
+    net.vendor
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| oui_db.and_then(|db| db.lookup_ap(&net.bssid).map(str::to_string)))
+}
+
+fn push_detail(lines: &mut Vec<String>, rows: &[(String, String)]) {
+    let w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in rows {
+        lines.push(format!("  {}  {}", style(format!("{k:<w$}")).dim(), v));
+    }
+}
+
+fn vendor_suffix(mac: &[u8; 6], db: Option<&oui::Db>) -> String {
+    let vend = vendor_of(mac, db);
+    if vend.is_empty() {
+        String::new()
+    } else {
+        format!("  {vend}")
+    }
+}
+
+fn sorted_stations(stats: &ReconStats) -> Vec<&Station> {
+    let mut stas: Vec<&Station> = stats.stations.values().collect();
+    stas.sort_by(|a, b| b.frames.cmp(&a.frames).then_with(|| a.mac.cmp(&b.mac)));
+    stas
+}
+
+fn sorted_probers(stats: &ReconStats) -> Vec<&Prober> {
+    let mut probes: Vec<&Prober> = stats.probers.values().collect();
+    probes.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.mac.cmp(&b.mac)));
+    probes
 }
 
 fn stats_json(
@@ -428,19 +511,17 @@ fn stats_json(
     elapsed: Duration,
     oui_db: Option<&oui::Db>,
 ) -> serde_json::Value {
-    let mut stas: Vec<&Station> = stats.stations.values().collect();
-    stas.sort_by(|a, b| b.frames.cmp(&a.frames));
-    let mut probes: Vec<&Prober> = stats.probers.values().collect();
-    probes.sort_by(|a, b| b.count.cmp(&a.count));
+    let stas = sorted_stations(stats);
+    let probes = sorted_probers(stats);
     serde_json::json!({
         "ap": {
             "ssid": net.ssid,
             "bssid": net.bssid,
             "channel": net.channel,
-            "rssi": net.rssi,
+            "rssi": stats.ap_last_rssi.unwrap_or(net.rssi),
             "encryption": net.encryption,
             "posture": wifi_analysis::posture(net).as_str(),
-            "vendor": net.vendor,
+            "vendor": ap_vendor(net, oui_db),
         },
         "dwell_ms": elapsed.as_millis() as u64,
         "frames": stats.frames,
@@ -458,6 +539,7 @@ fn stats_json(
             "data": s.data,
             "nulls": s.nulls,
             "best_rssi": s.best_rssi,
+            "last_rssi": s.last_rssi,
             "vendor": vendor_of(&s.mac, oui_db),
         })).collect::<Vec<_>>(),
         "probers": probes.iter().map(|p| serde_json::json!({
@@ -465,9 +547,19 @@ fn stats_json(
             "count": p.count,
             "ssids": p.ssids,
             "best_rssi": p.best_rssi,
+            "last_rssi": p.last_rssi,
             "vendor": vendor_of(&p.mac, oui_db),
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Row number from the last `wifi scan` / `wifi list` table.
+pub fn wifi_scan_row(token: &str) -> Result<Network> {
+    let nets = crate::LAST_WIFI.lock().unwrap().clone();
+    if nets.is_empty() {
+        bail!("no wifi scan yet; run `wifi scan` first");
+    }
+    resolve_from_cache(&nets, Some(token.trim()), None, None)
 }
 
 /// Resolve a recon/show target from the last scan cache.
@@ -514,14 +606,16 @@ pub fn resolve_from_cache(
         }
         return resolve_from_cache(nets, None, Some(tok), None);
     }
-    // Caller should interactive-pick when nothing is specified; keep a clear error
-    // if someone hits this path without a selection.
     bail!("specify a scan #, --ssid, --bssid, or pick interactively");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BSSID: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const STA: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const SSID: &str = "lab";
 
     fn from_ds_data(bssid: [u8; 6], dest: [u8; 6], src: [u8; 6]) -> Vec<u8> {
         let mut f = vec![0x08, 0x02, 0, 0]; // data, FromDS
@@ -534,7 +628,7 @@ mod tests {
 
     #[test]
     fn multicast_dest_is_not_a_station() {
-        let bssid = [0xB0, 0xE4, 0xD5, 0x0A, 0xC7, 0xD2];
+        let bssid = BSSID;
         let mut stats = ReconStats::default();
         ingest(
             &mut stats,
@@ -559,8 +653,8 @@ mod tests {
 
     #[test]
     fn unicast_dest_is_a_station() {
-        let bssid = [0xB0, 0xE4, 0xD5, 0x0A, 0xC7, 0xD2];
-        let sta = [0x94, 0xB3, 0xF7, 0xDB, 0x82, 0xF2];
+        let bssid = BSSID;
+        let sta = STA;
         let mut stats = ReconStats::default();
         ingest(
             &mut stats,
@@ -570,5 +664,71 @@ mod tests {
             &from_ds_data(bssid, sta, [0x22; 6]),
         );
         assert!(stats.stations.contains_key(&sta));
+    }
+
+    fn beacon(bssid: [u8; 6]) -> Vec<u8> {
+        let mut f = vec![0x80, 0x00, 0, 0];
+        f.extend_from_slice(&[0xff; 6]);
+        f.extend_from_slice(&bssid);
+        f.extend_from_slice(&bssid);
+        f.extend_from_slice(&[0, 0]);
+        f
+    }
+
+    fn to_ds_data(bssid: [u8; 6], sta: [u8; 6]) -> Vec<u8> {
+        let mut f = vec![0x08, 0x01, 0, 0];
+        f.extend_from_slice(&bssid);
+        f.extend_from_slice(&sta);
+        f.extend_from_slice(&bssid);
+        f.extend_from_slice(&[0, 0]);
+        f
+    }
+
+    fn lab_net(rssi: i8) -> Network {
+        serde_json::from_value(serde_json::json!({
+            "bssid": "02:00:00:00:00:01",
+            "ssid": SSID,
+            "rssi": rssi,
+            "channel": 1,
+            "encryption": "WPA2_PSK"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ap_rssi_follows_frames_the_ap_sent() {
+        let bssid = BSSID;
+        let sta = STA;
+        let mut stats = ReconStats::default();
+        ingest(&mut stats, bssid, SSID, -20, &to_ds_data(bssid, sta));
+        assert_eq!(stats.ap_last_rssi, None);
+        ingest(&mut stats, bssid, SSID, -48, &beacon(bssid));
+        ingest(&mut stats, bssid, SSID, -63, &beacon(bssid));
+        assert_eq!(stats.ap_last_rssi, Some(-63));
+        let text = human_lines(&stats, &lab_net(-55), Duration::from_secs(1), None).join("\n");
+        assert!(text.contains("-63 dBm"), "{text}");
+        assert!(!text.contains("-55"), "{text}");
+        assert!(text.contains("-20 dBm"), "{text}");
+        ingest(
+            &mut stats,
+            bssid,
+            SSID,
+            -30,
+            &from_ds_data(bssid, sta, [0x22; 6]),
+        );
+        assert_eq!(stats.ap_last_rssi, Some(-30));
+    }
+
+    #[test]
+    fn station_row_shows_latest_rssi() {
+        let bssid = BSSID;
+        let sta = STA;
+        let mut stats = ReconStats::default();
+        ingest(&mut stats, bssid, SSID, -41, &to_ds_data(bssid, sta));
+        ingest(&mut stats, bssid, SSID, -77, &to_ds_data(bssid, sta));
+        let text = human_lines(&stats, &lab_net(-55), Duration::from_secs(2), None).join("\n");
+        assert!(text.contains("-77 dBm"), "{text}");
+        assert!(!text.contains("-41"), "{text}");
+        assert_eq!(stats.stations[&sta].best_rssi, -41);
     }
 }

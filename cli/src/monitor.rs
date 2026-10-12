@@ -27,37 +27,27 @@ pub struct MonitorArgs<'a> {
 }
 
 impl MonitorArgs<'_> {
-    fn any_raw(&self) -> bool {
+    fn overrides_preset(&self) -> bool {
         !self.types.is_empty()
             || !self.subtype.is_empty()
             || !self.ctrl_subtype.is_empty()
             || !self.data_subtype.is_empty()
             || self.block
             || self.ethertype.is_some()
-            || self.bssid.is_some()
-            || self.min_rssi.is_some()
-            || self.max_rssi.is_some()
-            || self.phy.is_some()
-            || self.min_len.is_some()
-            || self.max_len.is_some()
-            || self.dedup
-            || self.encrypted
-            || self.unencrypted
-            || !self.matches.is_empty()
-            || self.vendor.is_some()
-            || self.src.is_some()
-            || self.dst.is_some()
     }
 }
 
 pub fn build_monitor_filter(a: &MonitorArgs) -> Result<MonitorFilter> {
-    if let Some(p) = a.filter {
-        if a.any_raw() {
-            anyhow::bail!("--filter is a preset; drop it to use the raw filter flags");
+    let mut f = if let Some(p) = a.filter {
+        if a.overrides_preset() {
+            anyhow::bail!(
+                "--filter fixes frame types, subtypes, and EtherType; omit the preset to override them"
+            );
         }
-        return preset(p);
-    }
-    let mut f = MonitorFilter::all();
+        preset(p)?
+    } else {
+        MonitorFilter::all()
+    };
     if !a.types.is_empty() {
         f.types = types_mask(a.types)?;
     }
@@ -70,28 +60,33 @@ pub fn build_monitor_filter(a: &MonitorArgs) -> Result<MonitorFilter> {
     if !a.data_subtype.is_empty() {
         f.data_subtypes = subtype_mask(a.data_subtype, data_subtype_num)?;
     }
-    f.subtype_block = a.block;
+    if a.block {
+        f.subtype_block = true;
+    }
     if let Some(e) = a.ethertype {
         f.ethertype = Some(ethertype_num(e)?);
     }
     if let Some(b) = a.bssid {
         f.addr = Some(ieee80211::parse_mac(b)?);
     }
-    f.min_rssi = a.min_rssi;
-    f.max_rssi = a.max_rssi;
+    f.min_rssi = a.min_rssi.or(f.min_rssi);
+    f.max_rssi = a.max_rssi.or(f.max_rssi);
     if let Some(p) = a.phy {
         f.phy = Some(phy_num(p)?);
     }
-    f.min_len = a.min_len;
-    f.max_len = a.max_len;
-    f.dedup = a.dedup;
-    f.protected = if a.encrypted {
-        Some(true)
-    } else if a.unencrypted {
-        Some(false)
-    } else {
-        None
-    };
+    f.min_len = a.min_len.or(f.min_len);
+    f.max_len = a.max_len.or(f.max_len);
+    f.dedup |= a.dedup;
+    if a.encrypted && a.unencrypted {
+        anyhow::bail!("--encrypted conflicts with --unencrypted");
+    }
+    if a.encrypted || a.unencrypted {
+        let protected = a.encrypted;
+        if a.filter.is_some() && f.protected.is_some_and(|p| p != protected) {
+            anyhow::bail!("encryption selection conflicts with the --filter preset");
+        }
+        f.protected = Some(protected);
+    }
     for m in a.matches {
         f.matches.push(parse_match(m)?);
     }
@@ -316,6 +311,47 @@ mod tests {
         let mut a = args();
         a.filter = Some("all");
         a.block = true;
+        assert!(build_monitor_filter(&a).is_err());
+    }
+
+    #[test]
+    fn preset_accepts_refinements_without_losing_eapol_constraints() {
+        let mut a = args();
+        a.filter = Some("eapol");
+        a.bssid = Some("aa:bb:cc:dd:ee:ff");
+        a.min_rssi = Some(-70);
+        a.max_len = Some(1500);
+        a.phy = Some("ht");
+        a.dedup = true;
+        a.src = Some("11:22:33:44:55:66");
+        let f = build_monitor_filter(&a).unwrap();
+        assert_eq!(f.types, ieee80211::FrameType::Data.bit());
+        assert_eq!(f.ethertype, Some(0x888e));
+        assert_eq!(f.protected, Some(false));
+        assert_eq!(f.addr, Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(f.min_rssi, Some(-70));
+        assert_eq!(f.max_len, Some(1500));
+        assert_eq!(f.phy, Some(1));
+        assert!(f.dedup);
+        assert_eq!(f.matches[0].bytes, vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    }
+
+    #[test]
+    fn preset_refinements_preserve_excluded_subtypes() {
+        let mut a = args();
+        a.filter = Some("no-beacons");
+        a.min_len = Some(60);
+        let f = build_monitor_filter(&a).unwrap();
+        assert!(f.subtype_block);
+        assert_eq!(f.mgmt_subtypes, 1 << 8);
+        assert_eq!(f.min_len, Some(60));
+    }
+
+    #[test]
+    fn eapol_preset_rejects_encryption_that_would_exclude_eapol() {
+        let mut a = args();
+        a.filter = Some("eapol");
+        a.encrypted = true;
         assert!(build_monitor_filter(&a).is_err());
     }
 

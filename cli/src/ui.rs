@@ -32,6 +32,20 @@ fn ble_display_order(devs: &[BleDevice]) -> Vec<usize> {
     idx
 }
 
+pub(crate) fn is_mac_token(token: &str) -> bool {
+    let t = token.trim();
+    if t.contains(':') || t.contains('-') {
+        return true;
+    }
+    t.len() == 12 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Decimal row number, not a MAC.
+pub(crate) fn is_row_index(token: &str) -> bool {
+    let t = token.trim();
+    !t.is_empty() && !is_mac_token(t) && t.parse::<usize>().is_ok()
+}
+
 // Item indices ordered by strongest signal first.
 fn order_by_rssi<T, R: Ord + Copy>(items: &[T], rssi: impl Fn(&T) -> R) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..items.len()).collect();
@@ -255,7 +269,8 @@ fn wifi_rows(nets: &[Network], order: &[usize], verbose: bool) -> Vec<Row> {
 
 /// Borderless network table, strongest first. `verbose` adds
 /// ciphers/bandwidth/flags.
-pub fn network_table(nets: &[Network], verbose: bool) {
+pub fn network_table(nets: &mut [Network], verbose: bool) {
+    crate::vendors::fill_wifi(nets);
     if nets.is_empty() {
         println!("no networks found");
         return;
@@ -335,7 +350,8 @@ fn print_scan_summary(nets: &[Network]) {
 }
 
 /// Full detail for one AP from a scan (fixed fields + every extra key).
-pub fn network_detail(n: &Network) {
+pub fn network_detail(n: &mut Network) {
+    crate::vendors::fill_wifi(std::slice::from_mut(n));
     let mut rows: Vec<(String, String)> = vec![
         ("ssid".into(), ssid_label(n)),
         ("bssid".into(), n.bssid.clone()),
@@ -583,7 +599,7 @@ pub fn require_interactive(hint: &str) -> Result<()> {
 
 /// Show the shared Wi-Fi table (same columns as `wifi scan`) and return the
 /// operator's selection. Multi-select: `n | n,n | a`.
-pub fn pick_networks(nets: &[Network]) -> Result<Vec<Network>> {
+pub fn pick_networks(nets: &mut [Network]) -> Result<Vec<Network>> {
     require_interactive("pass --ssid or --bssid to choose a target")?;
     let order = wifi_picker_table(nets)?;
     let picks = parse_selection(
@@ -594,7 +610,7 @@ pub fn pick_networks(nets: &[Network]) -> Result<Vec<Network>> {
 }
 
 /// Same table as [`pick_networks`], single choice (for save / join flows).
-pub fn pick_network(nets: &[Network]) -> Result<Network> {
+pub fn pick_network(nets: &mut [Network]) -> Result<Network> {
     require_interactive("pass --ssid or --bssid to choose a network")?;
     let order = wifi_picker_table(nets)?;
     let picks = parse_selection(&prompt_line("select network [n]: ")?, order.len())?;
@@ -604,7 +620,8 @@ pub fn pick_network(nets: &[Network]) -> Result<Network> {
     Ok(nets[order[picks[0]]].clone())
 }
 
-fn wifi_picker_table(nets: &[Network]) -> Result<Vec<usize>> {
+fn wifi_picker_table(nets: &mut [Network]) -> Result<Vec<usize>> {
+    crate::vendors::fill_wifi(nets);
     if nets.is_empty() {
         bail!("scan found no networks");
     }

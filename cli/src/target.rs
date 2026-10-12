@@ -38,6 +38,21 @@ pub(crate) fn resolve_targets_ex(
         }
     }
     if let Some(bssid) = bssid {
+        if ui::is_row_index(bssid) {
+            let net = crate::recon::wifi_scan_row(bssid)?;
+            if let Some(ch) = channel {
+                if ch != net.channel {
+                    anyhow::bail!(
+                        "--channel {ch} is not the AP channel {} ({})",
+                        net.channel,
+                        net.bssid
+                    );
+                }
+            }
+            let target = net_to_target(&net)
+                .with_context(|| format!("{} has no usable channel", net.bssid))?;
+            return Ok(vec![target]);
+        }
         let channel = channel.context("--bssid needs --channel")?;
         return Ok(vec![Target {
             bssid: ieee80211::parse_mac(bssid)?,
@@ -71,7 +86,7 @@ pub(crate) fn resolve_targets_ex(
     }
     ui::require_interactive("pass --ssid or --bssid to choose a target")?;
     crate::enrich_wifi(oui_db, &mut nets); // vendor column in the picker
-    Ok(ui::pick_networks(&nets)?
+    Ok(ui::pick_networks(&mut nets)?
         .iter()
         .filter_map(net_to_target)
         .collect())
