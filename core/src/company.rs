@@ -72,7 +72,7 @@ impl Db {
 
     pub fn load(path: &std::path::Path) -> Result<Db> {
         let hint = format!(
-            "reading BLE company database {} (run infishark company update to install it)",
+            "reading BLE company database {} (run `infishark manage company update` to install it)",
             path.display()
         );
         Ok(Db(crate::registry::Db::load(path, &hint, |h| {
