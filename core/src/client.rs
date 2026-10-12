@@ -149,6 +149,120 @@ impl Device {
         Ok(v)
     }
 
+    /// Start a router session and wait for its terminal association event.
+    pub fn wifi_mitm_start(
+        &mut self,
+        opts: &crate::wifi_mitm::WifiMitmOpts,
+        mut on_event: impl FnMut(serde_json::Value),
+    ) -> Result<serde_json::Value> {
+        let start = opts.to_json()?;
+        let old_timeout = self.transport.stream_mut().timeout();
+        self.set_read_timeout(Duration::from_millis(300))?;
+        let result = (|| {
+            self.stop_current_task()?;
+            for mac in &opts.block {
+                self.wifi_mitm_control(&serde_json::json!({
+                    "op":"block", "mac":format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
+                }))?;
+            }
+            let mut terminal = None;
+            let resp = self.transport.transact_with_events(
+                protocol::CMD_WIFI_MITM,
+                &local_args(&start),
+                |id, payload| {
+                    if id == protocol::EVT_WIFI_MITM {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                            if v.get("type").and_then(|x| x.as_str()) == Some("phase")
+                                && matches!(
+                                    v.get("phase").and_then(|x| x.as_str()),
+                                    Some("active" | "failed")
+                                )
+                            {
+                                terminal = Some(v.clone());
+                            }
+                            on_event(v);
+                        }
+                    }
+                },
+            )?;
+            check_mitm(&resp)?;
+            let ack: serde_json::Value = serde_json::from_slice(&resp.body)?;
+            let phase = ack.get("phase").and_then(|x| x.as_str()).unwrap_or("");
+            if phase == "failed" {
+                return Err(Error::msg("Wi-Fi MITM AP failed to start"));
+            }
+            if phase == "active" {
+                return Ok(ack);
+            }
+            if phase != "connecting" {
+                return Err(Error::msg("Wi-Fi MITM start returned no phase"));
+            }
+            if let Some(v) = terminal {
+                if v["phase"] == "active" {
+                    return Ok(v);
+                }
+                return Err(Error::msg("Wi-Fi MITM association failed"));
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                match self.next_event() {
+                    Ok((protocol::EVT_WIFI_MITM, payload)) => {
+                        let v: serde_json::Value = serde_json::from_slice(&payload)?;
+                        let phase = v.get("phase").and_then(|x| x.as_str()).unwrap_or("");
+                        on_event(v.clone());
+                        if phase == "active" {
+                            return Ok(v);
+                        }
+                        if phase == "failed" {
+                            return Err(Error::msg("Wi-Fi MITM association failed"));
+                        }
+                    }
+                    Ok(_) | Err(Error::Timeout) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(Error::msg("Wi-Fi MITM association timed out"))
+        })();
+        if result.is_err() {
+            let _ = self.stop_current_task();
+            let _ = self.wifi_mitm_control(&serde_json::json!({"op":"status"}));
+        }
+        let _ = self.set_read_timeout(old_timeout);
+        result
+    }
+
+    /// Send a scoped router control verb.
+    pub fn wifi_mitm_control(&mut self, spec: &serde_json::Value) -> Result<serde_json::Value> {
+        let resp = self.transact(protocol::CMD_WIFI_MITM, &local_args(spec))?;
+        check_mitm(&resp)?;
+        if resp.body.is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        Ok(serde_json::from_slice(&resp.body)?)
+    }
+
+    pub fn wifi_mitm_action(
+        &mut self,
+        id: u16,
+        action: crate::wifi_mitm::WifiMitmAction,
+    ) -> Result<()> {
+        let spec = match action {
+            crate::wifi_mitm::WifiMitmAction::Allow => {
+                serde_json::json!({"id":id,"action":"allow"})
+            }
+            crate::wifi_mitm::WifiMitmAction::Drop => serde_json::json!({"id":id,"action":"drop"}),
+            crate::wifi_mitm::WifiMitmAction::ReplaceA(a) => {
+                serde_json::json!({"id":id,"action":"replace","a":a.to_string()})
+            }
+        };
+        self.command_ok(protocol::CMD_WIFI_MITM_ACTION, &spec)
+    }
+
+    pub fn wifi_mitm_stop(&mut self) -> Result<()> {
+        self.stop_current_task()
+    }
+
     /// Consume the device and return its raw serial port, for SLIP once the
     /// adapter tunnel is up (see [`Device::wifi_adapter_start`]).
     pub fn into_port(self) -> Box<dyn SerialPort> {
@@ -1117,6 +1231,20 @@ fn check(resp: &Response) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn check_mitm(resp: &Response) -> Result<()> {
+    if resp.error == protocol::ERR_UNKNOWN_COMMAND
+        || (resp.error == protocol::ERR_BAD_ARGS
+            && serde_json::from_slice::<serde_json::Value>(&resp.body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|x| x.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some("not in this firmware"))
+    {
+        return Err(Error::msg("wifi mitm is not in this firmware"));
+    }
+    check(resp)
 }
 
 /// Read the `count` field from a mutation reply, defaulting to 0.

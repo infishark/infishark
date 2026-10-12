@@ -47,6 +47,8 @@ pub const CMD_PORTAL_RESP: u16 = 0x0116;
 pub const CMD_WIFI_RAW_TX: u16 = 0x0120;
 pub const CMD_WIFI_RAW_MONITOR: u16 = 0x0121;
 pub const CMD_WIFI_ADAPTER: u16 = 0x0122;
+pub const CMD_WIFI_MITM: u16 = 0x0123;
+pub const CMD_WIFI_MITM_ACTION: u16 = 0x0124;
 // 0x02 BLE
 pub const CMD_BLE_SCAN: u16 = 0x0200;
 pub const CMD_BLE_LIST: u16 = 0x0201;
@@ -128,5 +130,6 @@ pub const EVT_IR: u16 = 0x000D;
 pub const EVT_PORTAL_REQUEST: u16 = 0x000E;
 pub const EVT_WIFI_TX: u16 = 0x000F;
 pub const EVT_BLE_MITM: u16 = 0x0010;
+pub const EVT_WIFI_MITM: u16 = 0x0011;
 /// GATT-central pairing progress: `{op,step,pin,compare}`.
 pub const EVT_BLE_PAIR: u16 = 0x0012;
