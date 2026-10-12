@@ -186,10 +186,23 @@ fn wifi_cols(verbose: bool) -> Vec<Col> {
     cols
 }
 
-fn tty_text(s: &str) -> String {
+pub(crate) fn tty_text(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// Shared table for textual records, with terminal control bytes removed.
+pub(crate) fn text_table(header: &[&str], rows: &[Vec<String>]) {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| tty_text(cell)).collect())
+        .collect();
+    let aligned = align_table(header, &rows);
+    println!("{}", style(aligned.header).dim());
+    for row in aligned.rows {
+        println!("{row}");
+    }
 }
 
 fn ssid_label(n: &Network) -> String {
@@ -523,6 +536,44 @@ pub fn gatt_services(services: &[GattService]) {
     }
 }
 
+struct Aligned {
+    header: String,
+    rows: Vec<String>,
+}
+
+fn align_table(header: &[&str], rows: &[Vec<String>]) -> Aligned {
+    let mut width: Vec<usize> = header.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if let Some(w) = width.get_mut(i) {
+                *w = (*w).max(cell.len());
+            }
+        }
+    }
+    let line = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let w = width.get(i).copied().unwrap_or(0);
+                if i + 1 == cells.len() {
+                    cell.clone()
+                } else if i == 0 {
+                    format!("{cell:>w$}")
+                } else {
+                    format!("{cell:<w$}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let head: Vec<String> = header.iter().map(|s| (*s).to_string()).collect();
+    Aligned {
+        header: line(&head),
+        rows: rows.iter().map(|row| line(row)).collect(),
+    }
+}
+
 pub fn require_interactive(hint: &str) -> Result<()> {
     if std::io::stdin().is_terminal() {
         return Ok(());
@@ -596,21 +647,119 @@ pub(crate) fn create_secure(path: &str) -> Result<std::fs::File> {
         .with_context(|| format!("creating {path} (refusing to follow a symlink)"))
 }
 
-/// Prompt on stderr and read one trimmed line from stdin.
+/// Prompt on stderr and read one line from the terminal; EOF is empty.
 pub fn prompt_line(prompt: &str) -> Result<String> {
+    Ok(prompt_line_eof(prompt)?.unwrap_or_default())
+}
+
+/// Prompt on stderr; distinguish EOF from an empty submitted line.
+pub fn prompt_line_eof(prompt: &str) -> Result<Option<String>> {
     eprint!("{prompt}");
     std::io::stderr().flush()?;
-    let mut s = String::new();
     #[cfg(unix)]
     {
         if let Ok(tty) = std::fs::File::open("/dev/tty") {
-            use std::io::BufRead;
-            std::io::BufReader::new(tty).read_line(&mut s)?;
-            return Ok(s.trim_end_matches(['\n', '\r']).to_string());
+            use std::os::unix::io::AsRawFd;
+            return read_fd_line(tty.as_raw_fd());
         }
     }
+    read_stdin_line()
+}
+
+/// One line from stdin. `Ok(None)` is end of input.
+pub fn read_stdin_line() -> Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        read_fd_line(libc::STDIN_FILENO)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut s = String::new();
+        let n = std::io::stdin().read_line(&mut s)?;
+        if n == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(s.trim_end_matches(['\n', '\r']).to_string()))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_stdin_blocking() -> Result<String> {
+    let mut s = String::new();
     std::io::stdin().read_line(&mut s)?;
     Ok(s.trim_end_matches(['\n', '\r']).to_string())
+}
+
+#[cfg(unix)]
+fn read_fd_line(fd: std::os::unix::io::RawFd) -> Result<Option<String>> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 256];
+    loop {
+        if !crate::signals::RUNNING.load(Ordering::SeqCst) {
+            return Err(crate::signals::cancelled());
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if rc == 0 {
+            continue;
+        }
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            && pfd.revents & libc::POLLIN == 0
+        {
+            return Ok(finished_line(&buf));
+        }
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr().cast::<libc::c_void>(), tmp.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if n == 0 {
+            return Ok(finished_line(&buf));
+        }
+        buf.extend_from_slice(&tmp[..n as usize]);
+        if buf.contains(&b'\n') {
+            return Ok(finished_line(&buf));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn finished_line(buf: &[u8]) -> Option<String> {
+    if buf.is_empty() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(buf)
+            .trim_end_matches(['\n', '\r'])
+            .to_string(),
+    )
+}
+
+/// Passwords must never be echoed or accepted as argv. Email codes use
+/// prompt_code.
+pub fn prompt_secret(prompt: &str) -> Result<String> {
+    require_interactive("account secrets require an interactive terminal")?;
+    let term = Term::stderr();
+    if !term.is_term() {
+        bail!("account secrets require an interactive terminal on stderr");
+    }
+    term.write_str(prompt)?;
+    term.read_secure_line().context("read account secret")
 }
 
 /// Prompt for a Wi-Fi password (blank = open network).
@@ -981,5 +1130,69 @@ impl Spinner {
         if let Some(h) = self.handle.take() {
             h.join().ok();
         }
+    }
+}
+#[cfg(all(test, unix))]
+mod prompt_tests {
+    use super::read_fd_line;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn pty_pair() -> (i32, std::fs::File) {
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(
+                master >= 0,
+                "posix_openpt: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let mut name = [0u8; 64];
+            let rc = libc::ptsname_r(master, name.as_mut_ptr().cast::<libc::c_char>(), name.len());
+            assert_eq!(rc, 0, "ptsname_r");
+            let slave = libc::open(
+                name.as_ptr().cast::<libc::c_char>(),
+                libc::O_RDWR | libc::O_NOCTTY,
+            );
+            assert!(
+                slave >= 0,
+                "open slave: {}",
+                std::io::Error::last_os_error()
+            );
+            (master, std::fs::File::from_raw_fd(slave))
+        }
+    }
+
+    #[test]
+    fn line_comes_back_without_waiting_out_a_timeout() {
+        let _guard = LOCK.lock().unwrap();
+        let (master, slave) = pty_pair();
+        let fd = slave.as_raw_fd();
+        let msg = b"7\n";
+        let n = unsafe { libc::write(master, msg.as_ptr().cast(), msg.len()) };
+        assert_eq!(n, msg.len() as isize);
+        crate::signals::RUNNING.store(true, Ordering::SeqCst);
+        let line = read_fd_line(fd).unwrap();
+        unsafe { libc::close(master) };
+        assert_eq!(line.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn ctrl_c_flag_returns_before_enter() {
+        let _guard = LOCK.lock().unwrap();
+        let (master, slave) = pty_pair();
+        let fd = slave.as_raw_fd();
+        crate::signals::RUNNING.store(true, Ordering::SeqCst);
+        let worker = std::thread::spawn(move || read_fd_line(fd));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::signals::RUNNING.store(false, Ordering::SeqCst);
+        let err = worker.join().unwrap().unwrap_err();
+        crate::signals::RUNNING.store(true, Ordering::SeqCst);
+        unsafe { libc::close(master) };
+        assert!(crate::signals::is_cancel(&err), "{err:#}");
     }
 }

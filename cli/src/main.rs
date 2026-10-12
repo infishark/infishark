@@ -1132,6 +1132,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if signals::is_cancel(&e) => {
+            let _ = writeln!(std::io::stderr());
+            ExitCode::from(130)
+        }
         Err(e) => {
             // Keep the failure path machine-parseable under --json; anyhow's
             // default would print plain text even there.
@@ -1236,8 +1240,7 @@ fn cmd_device(cli: &Cli, action: &DeviceCmd) -> Result<()> {
     }
 }
 
-/// Stream the Wi-Fi monitor to `w`, sending the device a stop on exit (Ctrl-C
-/// or a closed sink) so it doesn't keep pushing frames and appear frozen.
+/// Stream monitor frames. Stop the device when the stream ends.
 fn stream_wifi_monitor<W: Write>(dev: &mut Device, w: &mut W) -> Result<()> {
     signals::install_sigint();
     loop {
