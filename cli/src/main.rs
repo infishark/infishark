@@ -6,6 +6,7 @@ mod flash;
 mod fwota;
 mod gatt_assigned;
 mod gatt_names;
+mod gatt_recon;
 mod handshake;
 mod hid;
 mod hidraw;
@@ -1119,6 +1120,13 @@ enum GattCmd {
     },
     /// Discover characteristics and print them as a numbered table.
     Enum,
+    /// Profile the open connection: link, identity, and live notifications.
+    /// Refreshes until Ctrl-C.
+    Recon {
+        /// Stop after this many seconds. Default is until Ctrl-C.
+        #[arg(long, short = 't', default_value_t = 0)]
+        seconds: u64,
+    },
     /// Read one characteristic, or every readable row with `all`.
     Read {
         /// UUID, a row # from the last `ble gatt enum`, or `all`.
@@ -3673,6 +3681,9 @@ fn gatt_timeout(cli: &Cli, action: &GattCmd) -> u64 {
         }
         GattCmd::Read { .. } | GattCmd::Write { .. } => base.max(110_000),
         GattCmd::Enum => base.max(30_000),
+        // A pairing read during the profile can still take the PIN window.
+        // The dwell itself polls at 200 ms.
+        GattCmd::Recon { .. } => base.max(110_000),
         // A subscription streams indefinitely; wait a long time between values
         // (Ctrl-C ends it). The shell does not use this path.
         GattCmd::Subscribe { .. } => 3_600_000,
@@ -3852,6 +3863,7 @@ fn gatt_on(cli: &Cli, db: &DbOpts, action: &GattCmd, mut dev: &mut Device) -> Re
                 Ok(())
             }
         }
+        GattCmd::Recon { seconds } => gatt_recon::run(cli, dev, *seconds),
         GattCmd::Read { uuid } => {
             let sel = gatt_select(std::slice::from_ref(uuid), ui::GattOp::Read)?;
             apply_gatt_read(cli, dev, &sel)
