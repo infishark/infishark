@@ -4,6 +4,8 @@ mod crack;
 mod deauth;
 mod flash;
 mod fwota;
+mod gatt_assigned;
+mod gatt_names;
 mod handshake;
 mod hid;
 mod hidraw;
@@ -48,6 +50,8 @@ static LAST_IR: std::sync::Mutex<Vec<infishark::ir::IrCapture>> = std::sync::Mut
 // Files from the last `files ls`, largest first - lets `files pull 1` etc.
 // resolve a row #.
 static LAST_FILES: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+// Characteristic rows from the last `ble gatt enum`, in table order.
+static LAST_GATT: std::sync::Mutex<Vec<ui::GattRow>> = std::sync::Mutex::new(Vec::new());
 
 #[derive(Debug, Parser)]
 #[command(

@@ -524,31 +524,378 @@ pub fn saved_networks(nets: &[SavedNetwork]) {
     }
 }
 
-/// List GATT services and their characteristics.
+/// One characteristic row from `ble gatt enum`, in table order.
+#[derive(Clone)]
+pub(crate) struct GattRow {
+    pub uuid: String,
+    pub handle: u16,
+    pub name: String,
+    pub service: String,
+    pub props: String,
+}
+
+/// What `read` / `write` / `subscribe` / `unsubscribe` is about to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GattOp {
+    Read,
+    Write,
+    Subscribe { indicate: bool },
+    Unsubscribe,
+}
+
+/// One characteristic a GATT command should touch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GattTarget {
+    pub uuid: String,
+    /// Set when the row came from the last enum. Absent for a UUID that is
+    /// not in the table. Zero is never sent.
+    pub handle: Option<u16>,
+    pub name: String,
+    pub row: Option<usize>,
+    /// Subscribe only: notifications when false, indications when true.
+    pub indicate: bool,
+}
+
+/// An explicit row this operation cannot use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GattRejection {
+    pub row: Option<usize>,
+    pub name: String,
+    pub reason: &'static str,
+}
+
+/// Resolved arguments for one GATT command.
+#[derive(Clone, Debug)]
+pub(crate) struct GattSelection {
+    pub targets: Vec<GattTarget>,
+    pub rejected: Vec<GattRejection>,
+    /// `all`, or more than one characteristic. Results are labeled.
+    pub bulk: bool,
+}
+
+pub(crate) fn gatt_target_label(t: &GattTarget) -> String {
+    match t.row {
+        Some(n) => format!("{n}  {}", t.name),
+        None => t.name.clone(),
+    }
+}
+
+pub(crate) fn gatt_rejection_line(r: &GattRejection) -> String {
+    match r.row {
+        Some(n) => format!("{n}  {} is {}", r.name, r.reason),
+        None => format!("{} is {}", r.name, r.reason),
+    }
+}
+
+/// Characteristics in the order `gatt_services` numbers them.
+pub(crate) fn gatt_rows(services: &[GattService]) -> Vec<GattRow> {
+    let mut out = Vec::new();
+    for s in services {
+        let service = crate::gatt_names::service(&s.uuid)
+            .map(str::to_string)
+            .unwrap_or_else(|| compact_uuid(&s.uuid));
+        for c in &s.characteristics {
+            out.push(GattRow {
+                uuid: c.uuid.clone(),
+                handle: c.handle,
+                name: crate::gatt_names::characteristic(&c.uuid)
+                    .unwrap_or("<unknown>")
+                    .to_string(),
+                service: service.clone(),
+                props: c.properties.join(","),
+            });
+        }
+    }
+    out
+}
+
+fn prop_has(props: &str, name: &str) -> bool {
+    props.split(',').any(|p| p == name)
+}
+
+fn same_char(row_uuid: &str, token: &str) -> bool {
+    match (
+        infishark::hex::bluetooth_uuid(row_uuid),
+        infishark::hex::bluetooth_uuid(token),
+    ) {
+        (Ok(a), Ok(b)) => a.eq_ignore_ascii_case(&b),
+        _ => row_uuid.eq_ignore_ascii_case(token),
+    }
+}
+
+fn char_name(uuid: &str) -> String {
+    let name = crate::gatt_names::characteristic(uuid).unwrap_or("<unknown>");
+    if name == "<unknown>" {
+        uuid.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn from_row(index: usize, row: &GattRow, indicate: bool) -> GattTarget {
+    GattTarget {
+        uuid: row.uuid.clone(),
+        handle: (row.handle != 0).then_some(row.handle),
+        name: row.name.clone(),
+        row: Some(index),
+        indicate,
+    }
+}
+
+/// `Ok(indicate)` when this row can do `op`. The error is the reason it cannot.
+fn fit(row: &GattRow, op: GattOp) -> std::result::Result<bool, &'static str> {
+    let notify = prop_has(&row.props, "notify");
+    let indicate = prop_has(&row.props, "indicate");
+    match op {
+        GattOp::Read => {
+            if prop_has(&row.props, "read") {
+                Ok(false)
+            } else {
+                Err("not readable")
+            }
+        }
+        GattOp::Write => {
+            if prop_has(&row.props, "write") || prop_has(&row.props, "write_no_resp") {
+                Ok(false)
+            } else {
+                Err("not writable")
+            }
+        }
+        GattOp::Unsubscribe => Ok(false),
+        GattOp::Subscribe { indicate: true } => {
+            if indicate {
+                Ok(true)
+            } else {
+                Err("not indicatable")
+            }
+        }
+        GattOp::Subscribe { indicate: false } => {
+            if notify {
+                Ok(false)
+            } else if indicate {
+                Ok(true)
+            } else {
+                Err("not notifiable")
+            }
+        }
+    }
+}
+
+fn loose_uuid(token: &str, op: GattOp) -> GattTarget {
+    GattTarget {
+        uuid: token.to_string(),
+        handle: None,
+        name: char_name(token),
+        row: None,
+        indicate: matches!(op, GattOp::Subscribe { indicate: true }),
+    }
+}
+
+enum One {
+    Use(GattTarget),
+    Skip(GattRejection),
+}
+
+fn resolve_one(rows: &[GattRow], token: &str, op: GattOp) -> Result<One> {
+    if let Ok(n) = token.parse::<usize>() {
+        if let Some(row) = rows.get(n) {
+            return Ok(match fit(row, op) {
+                Ok(indicate) => One::Use(from_row(n, row, indicate)),
+                Err(reason) => One::Skip(GattRejection {
+                    row: Some(n),
+                    name: row.name.clone(),
+                    reason,
+                }),
+            });
+        }
+        if infishark::hex::bluetooth_uuid(token).is_ok() {
+            return Ok(One::Use(loose_uuid(token, op)));
+        }
+        if rows.is_empty() {
+            bail!("no gatt table yet; run `ble gatt enum` first (or pass a UUID)");
+        }
+        bail!(
+            "index {n} out of range (0..{}); numbers match the last `ble gatt enum`",
+            rows.len() - 1
+        );
+    }
+    let hits: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| same_char(&row.uuid, token))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [] => Ok(One::Use(loose_uuid(token, op))),
+        [i] => {
+            let row = &rows[*i];
+            Ok(match fit(row, op) {
+                Ok(indicate) => One::Use(from_row(*i, row, indicate)),
+                Err(reason) => One::Skip(GattRejection {
+                    row: Some(*i),
+                    name: row.name.clone(),
+                    reason,
+                }),
+            })
+        }
+        many => {
+            let mut msg = format!("{token} matches more than one row; pass a row number");
+            for i in many {
+                let row = &rows[*i];
+                msg.push_str(&format!(
+                    "\n{i}  {}  {:#06x}  {}",
+                    row.name, row.handle, row.props
+                ));
+            }
+            bail!(msg)
+        }
+    }
+}
+
+fn select_all(rows: &[GattRow], op: GattOp) -> Result<GattSelection> {
+    if rows.is_empty() {
+        bail!("no gatt table yet; run `ble gatt enum` first");
+    }
+    match op {
+        GattOp::Write => bail!("`write all` is not supported"),
+        GattOp::Unsubscribe => bail!("`unsubscribe all` is not supported"),
+        GattOp::Read | GattOp::Subscribe { .. } => {}
+    }
+    let mut targets = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if let Ok(indicate) = fit(row, op) {
+            targets.push(from_row(i, row, indicate));
+        }
+    }
+    if targets.is_empty() {
+        bail!(match op {
+            GattOp::Read => "no readable characteristics",
+            GattOp::Subscribe { indicate: true } => "no indicatable characteristics",
+            _ => "no notifiable characteristics",
+        });
+    }
+    Ok(GattSelection {
+        targets,
+        rejected: Vec::new(),
+        bulk: true,
+    })
+}
+
+/// `all` is every row this operation can use. A row number or a unique UUID
+/// carries that row's handle. An ambiguous UUID asks for the row number.
+pub(crate) fn select_gatt(
+    rows: &[GattRow],
+    tokens: &[String],
+    op: GattOp,
+) -> Result<GattSelection> {
+    let tokens: Vec<&str> = tokens
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        bail!("pass a row number or a characteristic UUID");
+    }
+    if tokens.iter().any(|t| *t == "*") {
+        bail!("`*` is not a selector; use `all`");
+    }
+    if tokens.iter().any(|t| t.eq_ignore_ascii_case("all")) {
+        if tokens.len() != 1 {
+            bail!("`all` stands alone");
+        }
+        return select_all(rows, op);
+    }
+    let mut targets = Vec::new();
+    let mut rejected = Vec::new();
+    for token in &tokens {
+        match resolve_one(rows, token, op)? {
+            One::Use(t) => targets.push(t),
+            One::Skip(r) => rejected.push(r),
+        }
+    }
+    if targets.is_empty() && rejected.len() == 1 {
+        bail!("{}", gatt_rejection_line(&rejected[0]));
+    }
+    Ok(GattSelection {
+        targets,
+        rejected,
+        bulk: tokens.len() > 1,
+    })
+}
+
+/// SIG UUIDs as `2a19`. Other 128-bit values stay in canonical form.
+fn compact_uuid(uuid: &str) -> String {
+    let Ok(full) = infishark::hex::bluetooth_uuid(uuid) else {
+        return uuid.to_string();
+    };
+    let hex: String = full.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let Some(assigned) = hex.strip_suffix("00001000800000805f9b34fb") else {
+        return full;
+    };
+    let short = assigned.trim_start_matches('0');
+    if short.is_empty() {
+        "0".to_string()
+    } else if short.len() <= 4 {
+        short.to_string()
+    } else {
+        assigned.to_string()
+    }
+}
+
+fn service_heading(s: &GattService) -> String {
+    let name = crate::gatt_names::service(&s.uuid)
+        .map(|n| format!("  {n}"))
+        .unwrap_or_default();
+    format!(
+        "svc {}  [{:#06x}-{:#06x}]{name}",
+        compact_uuid(&s.uuid),
+        s.handle,
+        s.end_handle
+    )
+}
+
+/// Numbered characteristic table. Each service is a section header.
+/// `#` matches `ble gatt read N` and stays continuous across services.
 pub fn gatt_services(services: &[GattService]) {
     if services.is_empty() {
         println!("no services");
         return;
     }
+    let mut n = 0usize;
+    let mut sections: Vec<(String, Vec<Vec<String>>)> = Vec::new();
     for s in services {
-        println!(
-            "{}  {}",
-            style(format!("svc {}", s.uuid)).bold(),
-            style(format!("[{:#06x}-{:#06x}]", s.handle, s.end_handle)).dim()
-        );
+        let mut rows = Vec::new();
         for c in &s.characteristics {
-            let props = if c.properties.is_empty() {
-                String::new()
-            } else {
-                format!("  ({})", c.properties.join(","))
-            };
-            println!(
-                "  {}  {}{}",
-                c.uuid,
-                style(format!("{:#06x}", c.handle)).dim(),
-                props
-            );
+            rows.push(vec![
+                n.to_string(),
+                format!("{:#06x}", c.handle),
+                compact_uuid(&c.uuid),
+                c.properties.join(","),
+                crate::gatt_names::characteristic(&c.uuid)
+                    .unwrap_or("<unknown>")
+                    .to_string(),
+            ]);
+            n += 1;
         }
+        sections.push((service_heading(s), rows));
+    }
+    if n == 0 {
+        for (heading, _) in &sections {
+            println!("{}", style(heading).dim());
+        }
+        return;
+    }
+    let header = ["#", "handle", "uuid", "props", "characteristic"];
+    let body: Vec<Vec<String>> = sections.iter().flat_map(|(_, rows)| rows.clone()).collect();
+    let lines = align_table(&header, &body);
+    println!("{}", style(&lines.header).dim());
+    let mut offset = 0;
+    for (heading, rows) in &sections {
+        println!("{}", style(heading).dim());
+        for line in &lines.rows[offset..offset + rows.len()] {
+            println!("{line}");
+        }
+        offset += rows.len();
     }
 }
 
@@ -1211,5 +1558,229 @@ mod prompt_tests {
         crate::signals::RUNNING.store(true, Ordering::SeqCst);
         unsafe { libc::close(master) };
         assert!(crate::signals::is_cancel(&err), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod gatt_row_tests {
+    use super::{GattOp, gatt_rows, select_gatt, service_heading};
+    use infishark::{GattChar, GattService};
+
+    fn ch(uuid: &str, handle: u16, props: &[&str]) -> GattChar {
+        GattChar {
+            uuid: uuid.into(),
+            handle,
+            properties: props.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    fn sample() -> Vec<GattService> {
+        vec![
+            GattService {
+                uuid: "180f".into(),
+                handle: 12,
+                end_handle: 16,
+                characteristics: vec![
+                    ch("2a19", 14, &["read", "notify"]),
+                    ch("f00d", 16, &["write"]),
+                ],
+            },
+            GattService {
+                uuid: "0000180a-0000-1000-8000-00805f9b34fb".into(),
+                handle: 20,
+                end_handle: 24,
+                characteristics: vec![ch("2a29", 22, &["read"])],
+            },
+        ]
+    }
+
+    #[test]
+    fn rows_follow_service_order_and_keep_names() {
+        let rows = gatt_rows(&sample());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].uuid, "2a19");
+        assert_eq!(rows[0].name, "Battery Level");
+        assert_eq!(rows[0].service, "Battery");
+        assert_eq!(rows[0].props, "read,notify");
+        assert_eq!(rows[0].handle, 14);
+        assert_eq!(rows[1].uuid, "f00d");
+        assert_eq!(rows[1].name, "<unknown>");
+        assert_eq!(rows[1].service, "Battery");
+        assert_eq!(rows[2].name, "Manufacturer Name String");
+        assert_eq!(rows[2].service, "Device Information");
+    }
+
+    #[test]
+    fn service_heading_names_the_section_and_rows_stay_continuous() {
+        let services = vec![
+            GattService {
+                uuid: "1800".into(),
+                handle: 1,
+                end_handle: 6,
+                characteristics: vec![ch("2a00", 3, &["read"]), ch("2a01", 5, &["read"])],
+            },
+            GattService {
+                uuid: "180f".into(),
+                handle: 15,
+                end_handle: 18,
+                characteristics: vec![ch("2a19", 17, &["read"])],
+            },
+        ];
+        assert_eq!(
+            service_heading(&services[0]),
+            "svc 1800  [0x0001-0x0006]  GAP"
+        );
+        assert_eq!(
+            service_heading(&services[1]),
+            "svc 180f  [0x000f-0x0012]  Battery"
+        );
+        let rows = gatt_rows(&services);
+        assert_eq!(rows[0].service, "GAP");
+        assert_eq!(rows[2].uuid, "2a19");
+        assert_eq!(rows[2].service, "Battery");
+    }
+
+    fn tok(s: &str) -> Vec<String> {
+        vec![s.into()]
+    }
+
+    #[test]
+    fn row_number_resolves_and_a_uuid_passes_through() {
+        let rows = gatt_rows(&sample());
+        let hit = select_gatt(&rows, &tok("0"), GattOp::Read).unwrap();
+        assert_eq!(hit.targets[0].uuid, "2a19");
+        assert_eq!(hit.targets[0].handle, Some(14));
+        assert_eq!(hit.targets[0].row, Some(0));
+        let hit = select_gatt(&rows, &tok("2"), GattOp::Read).unwrap();
+        assert_eq!(hit.targets[0].uuid, "2a29");
+        assert_eq!(hit.targets[0].handle, Some(22));
+        let hit = select_gatt(&rows, &tok("2a19"), GattOp::Read).unwrap();
+        assert_eq!(hit.targets[0].handle, Some(14));
+        let full = "00002a19-0000-1000-8000-00805f9b34fb";
+        let hit = select_gatt(&rows, &tok(full), GattOp::Read).unwrap();
+        assert_eq!(hit.targets[0].row, Some(0));
+        assert_eq!(hit.targets[0].handle, Some(14));
+        let other = "00002a37-0000-1000-8000-00805f9b34fb";
+        let hit = select_gatt(&rows, &tok(other), GattOp::Read).unwrap();
+        assert_eq!(hit.targets[0].uuid, other);
+        assert_eq!(hit.targets[0].handle, None);
+        // 2902 is the CCCD UUID and also a decimal. It is not a row here.
+        let hit = select_gatt(&rows, &tok("2902"), GattOp::Read).unwrap();
+        assert_eq!(hit.targets[0].uuid, "2902");
+        assert_eq!(hit.targets[0].handle, None);
+        let err = select_gatt(&rows, &tok("9"), GattOp::Read).unwrap_err();
+        assert!(err.to_string().contains("ble gatt enum"), "{err}");
+        let err = select_gatt(&[], &tok("0"), GattOp::Read).unwrap_err();
+        assert!(err.to_string().contains("ble gatt enum"), "{err}");
+    }
+
+    fn hid() -> Vec<super::GattRow> {
+        gatt_rows(&[
+            GattService {
+                uuid: "1812".into(),
+                handle: 16,
+                end_handle: 40,
+                characteristics: vec![
+                    ch("2a4d", 20, &["read", "write"]),
+                    ch("2a4d", 24, &["read", "notify"]),
+                ],
+            },
+            GattService {
+                uuid: "180f".into(),
+                handle: 48,
+                end_handle: 52,
+                characteristics: vec![ch("2a19", 50, &["read", "notify"])],
+            },
+            GattService {
+                uuid: "1801".into(),
+                handle: 1,
+                end_handle: 5,
+                characteristics: vec![ch("2a05", 3, &["indicate"])],
+            },
+        ])
+    }
+
+    #[test]
+    fn read_all_skips_rows_without_read_and_keeps_handles() {
+        let rows = gatt_rows(&sample());
+        let sel = select_gatt(&rows, &tok("all"), GattOp::Read).unwrap();
+        assert!(sel.bulk);
+        let got: Vec<_> = sel
+            .targets
+            .iter()
+            .map(|t| (t.row, t.handle, t.uuid.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(Some(0), Some(14), "2a19"), (Some(2), Some(22), "2a29")]
+        );
+        let err = select_gatt(&rows, &tok("1"), GattOp::Read).unwrap_err();
+        assert!(err.to_string().contains("not readable"), "{err}");
+    }
+
+    #[test]
+    fn subscribe_all_picks_notify_and_indicate_only_rows() {
+        let rows = hid();
+        let sel = select_gatt(&rows, &tok("all"), GattOp::Subscribe { indicate: false }).unwrap();
+        let got: Vec<_> = sel
+            .targets
+            .iter()
+            .map(|t| (t.row, t.handle, t.indicate, t.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(1), Some(24), false, "Report"),
+                (Some(2), Some(50), false, "Battery Level"),
+                (Some(3), Some(3), true, "Service Changed"),
+            ]
+        );
+        let only = select_gatt(&rows, &tok("all"), GattOp::Subscribe { indicate: true }).unwrap();
+        assert_eq!(only.targets.len(), 1);
+        assert_eq!(only.targets[0].name, "Service Changed");
+        assert!(only.targets[0].indicate);
+        let one = select_gatt(&rows, &tok("3"), GattOp::Subscribe { indicate: false }).unwrap();
+        assert!(one.targets[0].indicate);
+        assert!(!one.bulk);
+        let err = select_gatt(&rows, &tok("0"), GattOp::Subscribe { indicate: false }).unwrap_err();
+        assert!(err.to_string().contains("not notifiable"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_uuid_asks_for_the_row() {
+        let rows = hid();
+        let err = select_gatt(&rows, &tok("2a4d"), GattOp::Read).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pass a row number"), "{msg}");
+        assert!(msg.contains("0x0014"), "{msg}");
+        assert!(msg.contains("0x0018"), "{msg}");
+        let second = select_gatt(&rows, &tok("1"), GattOp::Subscribe { indicate: false }).unwrap();
+        assert_eq!(second.targets[0].handle, Some(24));
+        assert!(!second.targets[0].indicate);
+        let both = vec!["0".into(), "1".into()];
+        let sel = select_gatt(&rows, &both, GattOp::Subscribe { indicate: false }).unwrap();
+        assert!(sel.bulk);
+        assert_eq!(sel.targets.len(), 1);
+        assert_eq!(sel.targets[0].row, Some(1));
+        assert_eq!(sel.rejected.len(), 1);
+        assert_eq!(sel.rejected[0].reason, "not notifiable");
+    }
+
+    #[test]
+    fn star_and_combined_all_are_rejected() {
+        let rows = gatt_rows(&sample());
+        let err = select_gatt(&rows, &tok("*"), GattOp::Read).unwrap_err();
+        assert!(err.to_string().contains("use `all`"), "{err}");
+        let err = select_gatt(
+            &rows,
+            &["all".into(), "0".into()],
+            GattOp::Subscribe { indicate: false },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stands alone"), "{err}");
+        let err = select_gatt(&rows, &tok("all"), GattOp::Write).unwrap_err();
+        assert!(err.to_string().contains("write all"), "{err}");
+        let err = select_gatt(&[], &tok("all"), GattOp::Read).unwrap_err();
+        assert!(err.to_string().contains("ble gatt enum"), "{err}");
     }
 }
