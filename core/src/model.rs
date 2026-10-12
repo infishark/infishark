@@ -411,11 +411,17 @@ pub struct GattConnectOpts {
     pub latency: Option<u16>,
     pub supervision_timeout: Option<u16>,
     pub secure: bool,
+    /// Pair with a deadline and surface the PIN. The device does not block
+    /// inside `secureConnection()` for this flag.
+    pub pair: bool,
     pub bond: bool,
     pub mitm: bool,
     pub sc: bool,
     pub io_cap: Option<u8>,
     pub passkey: Option<u32>,
+    /// "off", "auto", "passkey", or "justworks". Omitted lets the device
+    /// decide.
+    pub pair_mode: Option<String>,
 }
 
 impl GattConnectOpts {
@@ -435,11 +441,13 @@ impl GattConnectOpts {
         insert_opt(&mut m, "latency", self.latency);
         insert_opt(&mut m, "supervision_timeout", self.supervision_timeout);
         insert_flag(&mut m, "secure", self.secure, true.into());
+        insert_flag(&mut m, "pair", self.pair, true.into());
         insert_flag(&mut m, "bond", self.bond, true.into());
         insert_flag(&mut m, "mitm", self.mitm, true.into());
         insert_flag(&mut m, "sc", self.sc, true.into());
         insert_opt(&mut m, "io_cap", self.io_cap);
         insert_opt(&mut m, "passkey", self.passkey);
+        insert_opt(&mut m, "pair_mode", self.pair_mode.as_deref());
         serde_json::Value::Object(m)
     }
 }

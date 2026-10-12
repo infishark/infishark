@@ -3443,6 +3443,8 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
                 latency: *latency,
                 supervision_timeout: *supervision_timeout,
                 secure: *secure,
+                pair: false,
+                pair_mode: None,
                 bond: *bond,
                 mitm: *mitm,
                 sc: *sc,
