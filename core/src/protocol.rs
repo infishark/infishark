@@ -83,6 +83,7 @@ pub const CMD_FILES_LIST: u16 = 0x0500;
 pub const CMD_FILES_READ_CHUNK: u16 = 0x0501;
 pub const CMD_FILES_WRITE: u16 = 0x0502;
 pub const CMD_FILES_DELETE: u16 = 0x0503;
+
 // 0x7F CONTROL
 pub const CMD_STOP: u16 = 0x7F00;
 

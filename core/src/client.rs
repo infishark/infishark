@@ -72,7 +72,10 @@ impl Device {
         }
         let _ = self.stop_current_task();
         let _ = self.transport.drain_events();
-        self.command_ok_local(protocol::CMD_WIFI_SCAN, &opts.to_json())?;
+        if let Err(e) = self.command_ok_local(protocol::CMD_WIFI_SCAN, &opts.to_json()) {
+            let _ = self.stop_current_task();
+            return Err(e);
+        }
         let _ = self.transport.drain_events();
         let mut nets: std::collections::BTreeMap<String, Network> =
             std::collections::BTreeMap::new();
@@ -90,7 +93,10 @@ impl Device {
                 Ok((protocol::EVT_SCAN_DONE, _)) => break,
                 Ok(_) => {}
                 Err(Error::Timeout) => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let _ = self.stop_current_task();
+                    return Err(e);
+                }
             }
         }
         let _ = self.stop_current_task();
@@ -976,4 +982,23 @@ fn parse_array<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str)
         out.push(serde_json::from_value(item.clone())?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod connect_retry_tests {
+    use super::*;
+
+    #[test]
+    fn pairing_failure_is_not_retried() {
+        let paired = Error::Device {
+            code: protocol::ERR_INTERNAL,
+            message: "{\"error\":\"disconnected during pairing (520)\"}".into(),
+        };
+        assert!(!gatt_connect_retryable(&paired));
+        let missed = Error::Device {
+            code: protocol::ERR_INTERNAL,
+            message: "{\"error\":\"connect failed\"}".into(),
+        };
+        assert!(gatt_connect_retryable(&missed));
+    }
 }

@@ -54,8 +54,7 @@ impl Demuxer {
                 push_log(&mut events, drained);
             }
 
-            // buf now starts with MAGIC. Peek the version to reject a false
-            // magic cheaply, before waiting on a (possibly bogus) length.
+            // Reject a false magic before trusting the length.
             if self.buf.len() < MAGIC.len() + 1 {
                 return events;
             }
@@ -193,8 +192,7 @@ mod tests {
     #[test]
     fn resyncs_past_false_magic_with_bad_version() {
         let (bytes, want) = sample_frame();
-        // B5 5A C1 followed by a, for example, non-0x01 version byte is not in fact a
-        // real frame
+        // Magic plus a bad version byte is not a frame.
         let mut input = vec![0xB5, 0x5A, 0xC1, 0x99];
         input.extend_from_slice(&bytes);
         let mut d = Demuxer::new();

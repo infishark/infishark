@@ -34,8 +34,7 @@ impl Response {
     }
 }
 
-// Ceilings that bound host memory if a hostile or malfunctioning device never
-// ends a multi-frame stream.
+// A stuck stream must not grow without bound.
 const MAX_REASSEMBLY: usize = 4 * 1024 * 1024;
 const MAX_BUFFERED_EVENTS: usize = 1024;
 
@@ -45,6 +44,8 @@ pub struct Transport<S> {
     seq: u16,
     events: Vec<Frame>,
     inbox: VecDeque<Frame>,
+    ev_acc: Vec<u8>,
+    ev_id: Option<u16>,
 }
 
 impl<S: Read + Write> Transport<S> {
@@ -55,6 +56,8 @@ impl<S: Read + Write> Transport<S> {
             seq: 0,
             events: Vec::new(),
             inbox: VecDeque::new(),
+            ev_acc: Vec::new(),
+            ev_id: None,
         }
     }
 
@@ -79,28 +82,68 @@ impl<S: Read + Write> Transport<S> {
     /// Block for the next complete event, reassembling multi-frame chunks.
     /// returns (event_id, json_bytes)
     pub fn next_event(&mut self) -> Result<(u16, Vec<u8>)> {
-        let mut acc: Vec<u8> = Vec::new();
-        let mut id: Option<u16> = None;
+        let mut parked = Vec::new();
         loop {
             let f = if self.events.is_empty() {
-                self.next_inbound()?
+                match self.next_inbound() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.restore_events(parked);
+                        return Err(e);
+                    }
+                }
             } else {
                 self.events.remove(0)
             };
             if f.typ != PKT_EVENT || f.payload.len() < 3 {
                 continue;
             }
-            if id.is_none() {
-                id = Some(u16::from_le_bytes([f.payload[0], f.payload[1]]));
+            let fid = u16::from_le_bytes([f.payload[0], f.payload[1]]);
+            if let Some(want) = self.ev_id {
+                if fid != want {
+                    if parked.len() + self.events.len() >= MAX_BUFFERED_EVENTS {
+                        self.ev_acc.clear();
+                        self.ev_id = None;
+                        self.inbox.push_front(f);
+                        self.restore_events(parked);
+                        return Err(Error::msg("too many buffered events"));
+                    }
+                    parked.push(f);
+                    continue;
+                }
+            } else {
+                self.ev_id = Some(fid);
             }
-            acc.extend_from_slice(&f.payload[3..]);
-            if acc.len() > MAX_REASSEMBLY {
-                bail!("event reassembly exceeded {MAX_REASSEMBLY} bytes");
+            self.ev_acc.extend_from_slice(&f.payload[3..]);
+            if self.ev_acc.len() > MAX_REASSEMBLY {
+                self.ev_acc.clear();
+                self.ev_id = None;
+                self.restore_events(parked);
+                return Err(Error::msg(format!(
+                    "event reassembly exceeded {MAX_REASSEMBLY} bytes"
+                )));
             }
             if f.payload[2] & RESP_MORE == 0 {
-                return Ok((id.unwrap(), acc));
+                let id = self.ev_id.take().unwrap();
+                let body = std::mem::take(&mut self.ev_acc);
+                self.restore_events(parked);
+                return Ok((id, body));
             }
         }
+    }
+
+    fn restore_events(&mut self, mut parked: Vec<Frame>) {
+        parked.append(&mut self.events);
+        self.events = parked;
+    }
+
+    fn buffer_event(&mut self, frame: Frame) -> Result<()> {
+        if self.events.len() >= MAX_BUFFERED_EVENTS {
+            self.inbox.push_front(frame);
+            bail!("too many buffered events");
+        }
+        self.events.push(frame);
+        Ok(())
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -124,7 +167,9 @@ impl<S: Read + Write> Transport<S> {
                 Err(e) if e.kind() == ErrorKind::TimedOut => {
                     return Err(Error::Timeout);
                 }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue, // EINTR (e.g. Ctrl-C)
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    return Err(Error::Interrupted);
+                }
                 Err(e) => return Err(e.into()),
             };
             for ev in self.demux.feed(&buf[..n]) {
@@ -177,10 +222,7 @@ impl<S: Read + Write> Transport<S> {
                 }
             } else {
                 // Unsolicited event or out-of-band frame: keep it, keep waiting.
-                self.events.push(f);
-                if self.events.len() > MAX_BUFFERED_EVENTS {
-                    bail!("too many buffered events ({})", self.events.len());
-                }
+                self.buffer_event(f)?;
             }
         }
     }
@@ -229,10 +271,7 @@ impl<S: Read + Write> Transport<S> {
                 let id = u16::from_le_bytes([f.payload[0], f.payload[1]]);
                 on_event(id, &f.payload[3..]);
             } else {
-                self.events.push(f);
-                if self.events.len() > MAX_BUFFERED_EVENTS {
-                    bail!("too many buffered events ({})", self.events.len());
-                }
+                self.buffer_event(f)?;
             }
         }
     }
@@ -255,10 +294,7 @@ impl<S: Read + Write> Transport<S> {
                 };
                 return Ok((h, data.to_vec()));
             }
-            self.events.push(f);
-            if self.events.len() > MAX_BUFFERED_EVENTS {
-                bail!("too many buffered events ({})", self.events.len());
-            }
+            self.buffer_event(f)?;
         }
     }
 }
@@ -411,5 +447,103 @@ mod tests {
     fn transact_errors_when_stream_closes_before_response() {
         let mut t = Transport::new(MockStream::new(Vec::new()));
         assert!(t.transact(CMD_DEVICE_INFO, b"").is_err());
+    }
+
+    fn event(id: u16, flags: u8, body: &[u8]) -> Vec<u8> {
+        let mut payload = id.to_le_bytes().to_vec();
+        payload.push(flags);
+        payload.extend_from_slice(body);
+        frame::encode(PKT_EVENT, 0, &payload)
+    }
+
+    #[test]
+    fn event_reassembly_bounds_parked_frames() {
+        let mut wire = event(1, RESP_MORE, b"{");
+        for _ in 0..MAX_BUFFERED_EVENTS + 1 {
+            wire.extend(event(2, RESP_JSON, b"{}"));
+        }
+        let mut t = Transport::new(MockStream::new(wire));
+        let err = t.next_event().unwrap_err().to_string();
+        assert!(err.contains("too many buffered events"), "{err}");
+        assert_eq!(t.events.len(), MAX_BUFFERED_EVENTS);
+        assert!(t.ev_acc.is_empty());
+        assert!(t.ev_id.is_none());
+        for _ in 0..MAX_BUFFERED_EVENTS + 1 {
+            assert_eq!(t.next_event().unwrap(), (2, b"{}".to_vec()));
+        }
+    }
+
+    #[test]
+    fn command_retries_cannot_grow_a_full_event_queue() {
+        let mut wire = Vec::new();
+        for _ in 0..MAX_BUFFERED_EVENTS + 1 {
+            wire.extend(event(2, RESP_JSON, b"{}"));
+        }
+        let mut t = Transport::new(MockStream::new(wire));
+        for _ in 0..3 {
+            let err = t.transact(CMD_DEVICE_INFO, b"").unwrap_err();
+            assert!(err.to_string().contains("too many buffered events"));
+            assert_eq!(t.events.len(), MAX_BUFFERED_EVENTS);
+        }
+        t.drain_events();
+        assert_eq!(t.next_event().unwrap(), (2, b"{}".to_vec()));
+    }
+
+    #[test]
+    fn oversized_event_preserves_parked_frames() {
+        let mut wire = event(1, RESP_MORE, b"{");
+        wire.extend(event(2, RESP_JSON, b"{}"));
+        let chunk = vec![b'x'; crate::protocol::MAX_PAYLOAD - 3];
+        for _ in 0..MAX_REASSEMBLY / chunk.len() + 1 {
+            wire.extend(event(1, RESP_MORE, &chunk));
+        }
+        let mut t = Transport::new(MockStream::new(wire));
+        let err = t.next_event().unwrap_err().to_string();
+        assert!(err.contains("event reassembly exceeded"), "{err}");
+        assert_eq!(t.next_event().unwrap(), (2, b"{}".to_vec()));
+    }
+
+    #[test]
+    fn fragmented_event_keeps_other_events_in_order() {
+        let mut wire = event(1, RESP_MORE, b"{");
+        wire.extend(event(2, RESP_JSON, b"2"));
+        wire.extend(event(3, RESP_JSON, b"3"));
+        wire.extend(event(1, RESP_JSON, b"}"));
+        let mut t = Transport::new(MockStream::new(wire));
+        assert_eq!(t.next_event().unwrap(), (1, b"{}".to_vec()));
+        assert_eq!(t.next_event().unwrap(), (2, b"2".to_vec()));
+        assert_eq!(t.next_event().unwrap(), (3, b"3".to_vec()));
+    }
+
+    #[test]
+    fn interrupted_read_is_not_retried() {
+        struct OnceThenTimeout {
+            hit: bool,
+        }
+        impl Read for OnceThenTimeout {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.hit {
+                    self.hit = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "interrupted",
+                    ));
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out",
+                ))
+            }
+        }
+        impl Write for OnceThenTimeout {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut t = Transport::new(OnceThenTimeout { hit: false });
+        assert!(matches!(t.next_inbound(), Err(Error::Interrupted)));
     }
 }

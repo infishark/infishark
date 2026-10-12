@@ -39,12 +39,8 @@ pub fn probe_device_info(path: &str, timeout_ms: u64) -> Option<serde_json::Valu
     serde_json::from_slice(&resp.body).ok()
 }
 
-// BLEShark Nano is not registered under the espressif/usb-pids GitHub repo
-// because it is based on an ESP32-C3 which does not have OTG. This means it
-// cannot use a custom PID, so we must use the Espressif VID to shortlist
-// candidates and then confirm each is a Nano by probing its identity. A bare
-// JTAG/serial debug unit or ESP shares the VID but never answers the
-// device-info probe.
+// No custom USB id on this chip. Espressif's vendor id is shared, so confirm
+// with device-info.
 pub fn auto_port() -> Result<String> {
     auto_select()
 }
