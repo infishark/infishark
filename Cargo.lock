@@ -952,6 +952,7 @@ dependencies = [
  "anyhow",
  "clap",
  "console",
+ "crossterm",
  "hmac",
  "infishark",
  "libc",
