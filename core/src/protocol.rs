@@ -23,6 +23,7 @@ pub const GRP_BLE: u8 = 0x02;
 pub const GRP_IR: u8 = 0x03;
 pub const GRP_MESH: u8 = 0x04;
 pub const GRP_FILES: u8 = 0x05;
+pub const GRP_CTF: u8 = 0x06;
 pub const GRP_CONTROL: u8 = 0x7F;
 
 // Command opcodes
@@ -88,6 +89,10 @@ pub const CMD_FILES_LIST: u16 = 0x0500;
 pub const CMD_FILES_READ_CHUNK: u16 = 0x0501;
 pub const CMD_FILES_WRITE: u16 = 0x0502;
 pub const CMD_FILES_DELETE: u16 = 0x0503;
+// 0x06 CTF (challenge-box firmware; not stock)
+pub const CMD_CTF_HELLO: u16 = 0x0600;
+pub const CMD_CTF_LOAD: u16 = 0x0601;
+pub const CMD_CTF_RESET: u16 = 0x0602;
 
 // 0x7F CONTROL
 pub const CMD_STOP: u16 = 0x7F00;

@@ -64,6 +64,22 @@ impl Device {
         crate::fw::DeviceFw::from_info(&self.device_info()?)
     }
 
+    pub fn ctf_hello(&mut self) -> Result<serde_json::Value> {
+        self.json_command(protocol::CMD_CTF_HELLO, b"")
+    }
+
+    pub fn ctf_load(&mut self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.json_command(protocol::CMD_CTF_LOAD, body.to_string().as_bytes())
+    }
+
+    /// Restart a challenge box while retaining its loaded RAM flag.
+    pub fn ctf_reset(&mut self) -> Result<serde_json::Value> {
+        // A reset must not be retried if its acknowledgement is lost.
+        let resp = self.transport.transact(protocol::CMD_CTF_RESET, b"")?;
+        check(&resp)?;
+        Ok(serde_json::from_slice(&resp.body)?)
+    }
+
     /// Live status (uptime, heap, battery, mesh).
     pub fn system_status(&mut self) -> Result<serde_json::Value> {
         self.json_command(protocol::CMD_SYSTEM_STATUS, b"")
