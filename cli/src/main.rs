@@ -39,10 +39,12 @@ use infishark::json::insert_opt;
 use infishark::model::{
     AdapterConfig, AdapterTarget, BleScanOpts, GattConnectOpts, PortalOpts, WifiScanOpts,
 };
-use infishark::{company, hex, oui, pcap};
+use infishark::{hex, pcap};
 
 // Host-held last scans (the device streams results; it doesn't retain them).
 static LAST_BLE: std::sync::Mutex<Vec<infishark::model::BleDevice>> =
+    std::sync::Mutex::new(Vec::new());
+static LAST_BLE_ROWS: std::sync::Mutex<Vec<infishark::model::BleDevice>> =
     std::sync::Mutex::new(Vec::new());
 static LAST_WIFI: std::sync::Mutex<Vec<infishark::model::Network>> =
     std::sync::Mutex::new(Vec::new());
@@ -740,7 +742,7 @@ enum BleCmd {
     },
     /// Show full detail for one device from the last scan (by list number).
     Show {
-        /// Device number from `ble scan`/`ble list` (omit to re-list).
+        /// Device number from `ble scan` / `ble list` (omit to re-list).
         index: Option<usize>,
     },
     /// GATT central: connect out to a peripheral and act on its attributes.
@@ -847,11 +849,13 @@ enum BleCmd {
     },
     /// Dual-link GATT proxy: clone a peripheral, wait for a central, relay ATT.
     Mitm {
-        /// Target address, e.g. AA:BB:CC:DD:EE:FF (omit to scan and pick).
+        /// Target address, or a row # from the last ble table (omit to scan
+        /// and pick).
         address: Option<String>,
-        /// Address type: 0=public, 1=random.
-        #[arg(long, default_value_t = 0)]
-        addr_type: u8,
+        /// Address type: 0=public, 1=random. Omit to use the type
+        /// from that row (0 if the row has none).
+        #[arg(long)]
+        addr_type: Option<u8>,
         /// Advertised name (default: the target's GAP name).
         #[arg(long)]
         name: Option<String>,
@@ -929,8 +933,9 @@ impl HidPreset {
 enum BondsCmd {
     /// List saved peers (default).
     List,
-    /// Remove one address, or --all.
+    /// Remove one peer, or --all.
     Forget {
+        /// Address, or a row # from the last `ble bonds` / `ble scan` table.
         address: Option<String>,
         #[arg(long)]
         all: bool,
@@ -2317,8 +2322,52 @@ fn pick_saved_index(dev: &mut Device) -> Result<u8> {
     Ok(pick.index)
 }
 
-/// Scan briefly, then pick a BLE peer by number. Returns its address and the
-/// address type to connect with (so a random-address peer resolves correctly).
+fn publish_ble_rows(devs: &[infishark::model::BleDevice]) {
+    *LAST_BLE_ROWS.lock().unwrap() = ui::ble_in_display_order(devs);
+}
+
+/// Scan cache and the active row table, both in the order `ble scan` prints.
+fn publish_ble_scan(devs: &[infishark::model::BleDevice]) {
+    let ordered = ui::ble_in_display_order(devs);
+    *LAST_BLE.lock().unwrap() = ordered.clone();
+    *LAST_BLE_ROWS.lock().unwrap() = ordered;
+}
+
+/// Row number or MAC. `type_known` is set when the type came from the table
+/// or from `--addr-type`. An address we have not seen defaults to public.
+fn resolve_ble_arg(token: &str, explicit_type: Option<u8>) -> Result<ui::ResolvedBle> {
+    let rows = LAST_BLE_ROWS.lock().unwrap().clone();
+    ui::resolve_ble_target(&rows, token, explicit_type)
+}
+
+fn log_ble_connecting(address: &str, addr_type: u8) {
+    match ble_cached_name(address) {
+        Some(n) => log::info(format!(
+            "connecting to {n} ({address}, addr-type {addr_type})"
+        )),
+        None => log::info(format!("connecting to {address} (addr-type {addr_type})")),
+    }
+}
+
+fn ble_cached(address: &str) -> Option<infishark::model::BleDevice> {
+    let hit = |devs: &[infishark::model::BleDevice]| {
+        devs.iter()
+            .find(|d| d.address.eq_ignore_ascii_case(address))
+            .cloned()
+    };
+    hit(&LAST_BLE_ROWS.lock().unwrap()).or_else(|| hit(&LAST_BLE.lock().unwrap()))
+}
+
+fn ble_cached_name(address: &str) -> Option<String> {
+    let hit = |devs: &[infishark::model::BleDevice]| {
+        devs.iter()
+            .find(|d| d.address.eq_ignore_ascii_case(address))
+            .and_then(|d| d.name.clone())
+            .filter(|s| !s.is_empty())
+    };
+    hit(&LAST_BLE_ROWS.lock().unwrap()).or_else(|| hit(&LAST_BLE.lock().unwrap()))
+}
+
 fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
     let mut dev = cli.open(cli.timeout_ms.max(8_000))?;
     match action {
@@ -2327,12 +2376,14 @@ fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
             for d in &mut devices {
                 d.paired = true;
             }
+            publish_ble_rows(&devices);
+            let mut devices = LAST_BLE_ROWS.lock().unwrap().clone();
             if cli.json {
                 println!("{}", serde_json::to_string(&devices)?);
             } else if devices.is_empty() {
                 log::info("no saved BLE devices");
             } else {
-                ui::ble_table(&devices);
+                ui::ble_table(&mut devices);
             }
             Ok(())
         }
@@ -2342,15 +2393,16 @@ fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
             } else {
                 let addr = address
                     .clone()
-                    .ok_or_else(|| anyhow::anyhow!("pass an address or --all"))?;
-                dev.ble_bond_forget(Some(&addr))?;
+                    .ok_or_else(|| anyhow::anyhow!("pass an address, a row number, or --all"))?;
+                let resolved = resolve_ble_arg(&addr, None)?;
+                dev.ble_bond_forget(Some(&resolved.address))?;
             }
             print_ok(cli.json)
         }
     }
 }
 
-fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
+fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8, bool)> {
     let mut devices = match dev.ble_bonds() {
         Ok(v) => v,
         Err(e) => {
@@ -2361,12 +2413,13 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
     for d in &mut devices {
         d.paired = true;
     }
-    log::info("scanning for BLE devices (~5s)");
     let opts = BleScanOpts {
         duration_ms: Some(5000),
         ..Default::default()
     };
+    let sp = ui::Spinner::start("scanning BLE");
     let nearby = dev.ble_scan(&opts);
+    sp.stop();
     match nearby {
         Ok(mut scan) => {
             enrich_ble(db, &mut scan);
@@ -2383,6 +2436,7 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
                 }
             }
         }
+        Err(e @ infishark::Error::Interrupted) => return Err(e.into()),
         Err(e) => {
             if devices.is_empty() {
                 return Err(e.into());
@@ -2390,11 +2444,15 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
             log::warn(format!("scan failed ({e}); showing saved devices only"));
         }
     }
-    let pick = ui::pick_ble_device(&devices)?;
-    Ok((pick.address.clone(), pick.addr_type.unwrap_or(0)))
+    publish_ble_rows(&devices);
+    let pick = ui::pick_ble_device(&mut devices)?;
+    let known = pick.addr_type.is_some();
+    Ok((pick.address.clone(), pick.addr_type.unwrap_or(0), known))
 }
 
 fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
+    vendors::set_oui(db.oui_db.as_deref());
+    vendors::set_company(db.company_db.as_deref());
     match action {
         BleCmd::Scan {
             duration,
@@ -2412,8 +2470,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
                 dedup: *dedup,
                 scan_phy: phy.map(|p| p.mask()),
             };
-            // A sighting streams per advert; size the read timeout to the scan duration
-            // plus headroom (0 = run until stopped, so fall back to a long idle ceiling).
+            // duration 0 scans until stopped, so the read wait stays long.
             let dur = duration.unwrap_or(10_000);
             let timeout = if dur == 0 {
                 cli.timeout_ms.max(30_000)
@@ -2426,8 +2483,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             sp.stop();
             let mut devices = devices?;
             enrich_ble(db, &mut devices);
-            *LAST_BLE.lock().unwrap() = devices.clone();
-            print_devices(&devices, cli.json)
+            print_devices(&mut devices, cli.json)
         }
         BleCmd::Bonds { action } => cmd_bonds(cli, action.as_ref()),
         BleCmd::List => {
@@ -2443,9 +2499,8 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
                 sp.stop();
                 devices = scanned?;
                 enrich_ble(db, &mut devices);
-                *LAST_BLE.lock().unwrap() = devices.clone();
             }
-            print_devices(&devices, cli.json)
+            print_devices(&mut devices, cli.json)
         }
         BleCmd::Show { index } => {
             let mut devices = LAST_BLE.lock().unwrap().clone();
@@ -2460,22 +2515,26 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
                 sp.stop();
                 devices = scanned?;
                 enrich_ble(db, &mut devices);
-                *LAST_BLE.lock().unwrap() = devices.clone();
+                publish_ble_scan(&devices);
+                devices = LAST_BLE.lock().unwrap().clone();
             }
-            devices.sort_by_key(|d| std::cmp::Reverse(d.rssi));
             match index {
                 Some(i) => {
-                    let d = devices
-                        .get(*i)
-                        .ok_or_else(|| anyhow::anyhow!("no device #{i}; run 'ble scan' first"))?;
+                    let mut d = match ui::resolve_ble_token(&devices, &i.to_string())? {
+                        ui::BleToken::Row(d) => d,
+                        ui::BleToken::Address(_) => {
+                            bail!("no device #{i}; run 'ble scan' or 'ble bonds' first")
+                        }
+                    };
+                    vendors::fill_ble(std::slice::from_mut(&mut d));
                     if cli.json {
-                        print_value(&serde_json::to_value(d)?, true)
+                        print_value(&serde_json::to_value(&d)?, true)
                     } else {
-                        ui::ble_detail(d);
+                        ui::ble_detail(&mut d);
                         Ok(())
                     }
                 }
-                None => print_devices(&devices, cli.json),
+                None => print_devices(&mut devices, cli.json),
             }
         }
         BleCmd::Gatt { action } => cmd_gatt(cli, db, action),
@@ -2555,20 +2614,19 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             log::info(format!(
                 "streaming stdin to notify {char} (one hex value per line, ctrl-d to end)"
             ));
-            let stdin = std::io::stdin();
-            let mut line = String::new();
             loop {
-                line.clear();
-                if stdin.read_line(&mut line)? == 0 {
+                let Some(line) = ui::read_stdin_line()? else {
                     break;
-                }
+                };
                 let hex = line.trim();
                 if hex.is_empty() {
                     continue;
                 }
                 dev.ble_char_set(&char_set_spec(char, hex, true))?;
-                if *interval_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(*interval_ms));
+                if *interval_ms > 0
+                    && !signals::sleep_while_running(std::time::Duration::from_millis(*interval_ms))
+                {
+                    return Err(signals::cancelled());
                 }
             }
             print_ok(cli.json)
@@ -3213,7 +3271,7 @@ fn cmd_mitm(
     cli: &Cli,
     db: &DbOpts,
     address: &Option<String>,
-    addr_type: u8,
+    addr_type: Option<u8>,
     name: &Option<String>,
     mac: &Option<String>,
     no_spoof: bool,
@@ -3230,8 +3288,14 @@ fn cmd_mitm(
         .max(connect_timeout_ms.unwrap_or(0) as u64 + 120_000);
     let mut dev = cli.open(timeout)?;
     let (address, addr_type) = match address {
-        Some(a) => (a.clone(), addr_type),
-        None => pick_ble_target(&mut dev, db)?,
+        Some(a) => {
+            let r = resolve_ble_arg(a, addr_type)?;
+            (r.address, r.addr_type)
+        }
+        None => {
+            let (a, t, _) = pick_ble_target(&mut dev, db)?;
+            (a, t)
+        }
     };
     let mut spec = serde_json::Map::new();
     spec.insert("address".into(), address.clone().into());
@@ -3257,30 +3321,22 @@ fn cmd_mitm(
         insert_opt(&mut spec, "intercept_timeout_ms", intercept_timeout_ms);
     }
     warn_if_mesh_active(&mut dev);
-    let label = LAST_BLE
-        .lock()
-        .ok()
-        .and_then(|devs| {
-            devs.iter()
-                .find(|d| d.address.eq_ignore_ascii_case(&address))
-                .and_then(|d| d.name.clone())
-        })
-        .filter(|s| !s.is_empty());
     if !cli.json {
-        match &label {
-            Some(n) => log::info(format!(
-                "connecting to {n} ({address}, addr-type {addr_type})"
-            )),
-            None => log::info(format!("connecting to {address} (addr-type {addr_type})")),
-        }
+        log_ble_connecting(&address, addr_type);
     }
-    let ident = dev.ble_mitm_start(&serde_json::Value::Object(spec), |v| {
+    let ident = match dev.ble_mitm_start(&serde_json::Value::Object(spec), |v| {
         if cli.json {
             let _ = writeln!(std::io::stdout(), "{}", v);
         } else {
             print_mitm_event(&v);
         }
-    })?;
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = dev.stop_current_task();
+            return Err(e.into());
+        }
+    };
     if cli.json {
         println!("{}", serde_json::to_string(&ident)?);
     } else {
@@ -3349,6 +3405,7 @@ fn cmd_mitm(
             }
             Ok(_) => {}
             Err(infishark::Error::Timeout) => continue,
+            Err(infishark::Error::Interrupted) => break,
             Err(e) => {
                 let _ = dev.stop_current_task();
                 return Err(e.into());
@@ -3395,7 +3452,7 @@ fn print_mitm_event(v: &serde_json::Value) {
             "bonded" => "using stored bond (no PIN)",
             "pair" => "waiting for pairing (type the PIN on the keyboard)...",
             "advertise" => "advertising as the clone...",
-            "ready" => "ready — waiting for a central",
+            "ready" => "ready; waiting for a central",
             other => other,
         };
         log::info(format!("{msg}{heap_s}"));
@@ -3451,8 +3508,8 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
             io_cap,
             passkey,
         } => {
-            let (address, addr_type) = match address {
-                Some(a) => (a.clone(), *addr_type),
+            let (address, addr_type, _) = match address {
+                Some(a) => (a.clone(), *addr_type, true),
                 None => pick_ble_target(&mut dev, db)?,
             };
             let opts = GattConnectOpts {
@@ -3551,51 +3608,15 @@ retry {address} with --addr-type {alt}"
     }
 }
 
-/// Load a reference database, emitting `note` (not an error) if absent so recon
-/// still works without it.
-fn load_db<T>(open: impl FnOnce() -> Result<T>, note: &str) -> Option<T> {
-    match open() {
-        Ok(db) => Some(db),
-        Err(_) => {
-            eprintln!("{note}");
-            None
-        }
-    }
-}
-
-fn load_oui(oui_db: Option<&str>) -> Option<oui::Db> {
-    load_db(
-        || {
-            oui::db_path(oui_db)
-                .and_then(|p| oui::Db::load(&p))
-                .map_err(Into::into)
-        },
-        "note: OUI database not installed; run `infishark manage oui update` for vendor names",
-    )
-}
-
-fn load_company(company_db: Option<&str>) -> Option<company::Db> {
-    load_db(
-        || {
-            company::db_path(company_db)
-                .and_then(|p| company::Db::load(&p))
-                .map_err(Into::into)
-        },
-        "note: BLE company database not installed; run `infishark manage company update` for manufacturer names",
-    )
-}
-
 pub(crate) fn enrich_wifi(oui_db: Option<&str>, nets: &mut [infishark::model::Network]) {
     vendors::set_oui(oui_db);
     vendors::fill_wifi(nets);
 }
 
 fn enrich_ble(db: &DbOpts, devices: &mut [infishark::model::BleDevice]) {
-    let oui = load_oui(db.oui_db.as_deref());
-    let company = load_company(db.company_db.as_deref());
-    for d in devices {
-        d.enrich(oui.as_ref(), company.as_ref());
-    }
+    vendors::set_oui(db.oui_db.as_deref());
+    vendors::set_company(db.company_db.as_deref());
+    vendors::fill_ble(devices);
 }
 
 fn print_networks(
@@ -3666,11 +3687,23 @@ fn print_networks(
     }
 }
 
-fn print_devices(devs: &[infishark::model::BleDevice], as_json: bool) -> Result<()> {
+fn is_pairing_failure(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("pairing") || msg.contains("pair ")
+}
+
+fn bad_ble_address(e: &infishark::Error) -> bool {
+    matches!(e, infishark::Error::Device { message, .. } if message.contains("bad address"))
+}
+
+fn print_devices(devs: &mut [infishark::model::BleDevice], as_json: bool) -> Result<()> {
+    vendors::fill_ble(devs);
+    publish_ble_scan(devs);
+    let mut devs = LAST_BLE.lock().unwrap().clone();
     if as_json {
-        print_items("devices", devs, true)
+        print_items("devices", &devs, true)
     } else {
-        ui::ble_table(devs);
+        ui::ble_table(&mut devs);
         Ok(())
     }
 }

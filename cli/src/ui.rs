@@ -32,6 +32,14 @@ fn ble_display_order(devs: &[BleDevice]) -> Vec<usize> {
     idx
 }
 
+/// Same order as the `#` column of [`ble_table`].
+pub(crate) fn ble_in_display_order(devs: &[BleDevice]) -> Vec<BleDevice> {
+    ble_display_order(devs)
+        .into_iter()
+        .map(|i| devs[i].clone())
+        .collect()
+}
+
 pub(crate) fn is_mac_token(token: &str) -> bool {
     let t = token.trim();
     if t.contains(':') || t.contains('-') {
@@ -377,7 +385,8 @@ pub fn network_detail(n: &mut Network) {
 }
 
 /// Borderless BLE device table, strongest first, name shaded by signal.
-pub fn ble_table(devs: &[BleDevice]) {
+pub fn ble_table(devs: &mut [BleDevice]) {
+    crate::vendors::fill_ble(devs);
     if devs.is_empty() {
         println!("no devices found");
         return;
@@ -435,7 +444,8 @@ pub fn ble_table(devs: &[BleDevice]) {
 }
 
 /// Full detail for one BLE device: fixed fields then every extra scan field.
-pub fn ble_detail(d: &BleDevice) {
+pub fn ble_detail(d: &mut BleDevice) {
+    crate::vendors::fill_ble(std::slice::from_mut(d));
     let mut rows: Vec<(String, String)> = vec![
         (
             "name".into(),
@@ -1142,6 +1152,156 @@ pub fn parse_index<'a, T>(items: &'a [T], tok: &str) -> Result<&'a T> {
         .ok_or_else(|| anyhow::anyhow!("index {idx} out of range"))
 }
 
+#[derive(Debug)]
+pub(crate) enum BleToken {
+    Row(BleDevice),
+    Address(String),
+}
+
+impl BleToken {
+    pub(crate) fn address(&self) -> &str {
+        match self {
+            BleToken::Row(d) => &d.address,
+            BleToken::Address(a) => a,
+        }
+    }
+
+    pub(crate) fn addr_type(&self) -> Option<u8> {
+        match self {
+            BleToken::Row(d) => d.addr_type,
+            BleToken::Address(_) => None,
+        }
+    }
+}
+
+fn same_mac(a: &str, b: &str) -> bool {
+    match (
+        infishark::ieee80211::parse_mac(a),
+        infishark::ieee80211::parse_mac(b),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
+pub(crate) struct ResolvedBle {
+    pub address: String,
+    pub addr_type: u8,
+    /// Set when the type came from `--addr-type` or from a table row.
+    pub type_known: bool,
+}
+
+fn hid_uuid(s: &str) -> bool {
+    let hex: String = s
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    let trimmed = hex.trim_start_matches('0');
+    trimmed == "1812" || (hex.starts_with("00001812") && hex.len() == 32)
+}
+
+/// Keyboard, mouse, and other HID advertisements. Those peers can type a PIN.
+pub(crate) fn ble_prefers_passkey(d: &BleDevice) -> bool {
+    if let Some(app) = d.extra.get("appearance").and_then(|v| v.as_u64()) {
+        if (0x03C0..=0x03FF).contains(&app) {
+            return true;
+        }
+    }
+    d.extra
+        .get("services")
+        .and_then(|v| v.as_array())
+        .is_some_and(|svcs| svcs.iter().any(|v| v.as_str().is_some_and(hid_uuid)))
+}
+
+/// Scan flag. `None` when this record never reported it (a saved bond, or a
+/// typed address we have not scanned).
+pub(crate) fn ble_connectable(d: &BleDevice) -> Option<bool> {
+    d.extra.get("connectable").and_then(|v| v.as_bool())
+}
+
+/// Error when every sighting of `address` said it is not connectable. One
+/// `true` allows the attempt, same as the sticky scan merge. No flag at all
+/// means try: a saved peer may not be advertising yet.
+pub(crate) fn refuse_unconnectable(
+    rows: &[BleDevice],
+    scan: &[BleDevice],
+    address: &str,
+) -> Result<()> {
+    let mut saw_false = false;
+    let mut name = None;
+    for d in rows
+        .iter()
+        .chain(scan.iter())
+        .filter(|d| same_mac(&d.address, address))
+    {
+        if name.is_none() {
+            name = d.name.clone().filter(|s| !s.is_empty());
+        }
+        match ble_connectable(d) {
+            Some(true) => return Ok(()),
+            Some(false) => saw_false = true,
+            None => {}
+        }
+    }
+    if !saw_false {
+        return Ok(());
+    }
+    let label = match name {
+        Some(n) => format!("{n} ({address})"),
+        None => address.to_string(),
+    };
+    bail!("{label} is not connectable")
+}
+
+pub(crate) fn resolve_ble_target(
+    rows: &[BleDevice],
+    token: &str,
+    explicit_type: Option<u8>,
+) -> Result<ResolvedBle> {
+    let tok = resolve_ble_token(rows, token)?;
+    let (addr_type, type_known) = match explicit_type {
+        Some(t) => (t, true),
+        None => match tok.addr_type() {
+            Some(t) => (t, true),
+            None => (0, false),
+        },
+    };
+    Ok(ResolvedBle {
+        address: tok.address().to_string(),
+        addr_type,
+        type_known,
+    })
+}
+
+pub(crate) fn resolve_ble_token(rows: &[BleDevice], token: &str) -> Result<BleToken> {
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("pass a row number or a BLE address");
+    }
+    if !is_mac_token(token) {
+        let Ok(idx) = token.parse::<usize>() else {
+            bail!("'{token}' is not a row number or a BLE address");
+        };
+        if rows.is_empty() {
+            bail!("no ble table yet; run `ble scan` or `ble bonds` first");
+        }
+        let d = rows.get(idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "index {idx} out of range (0..{}); numbers match the last ble table",
+                rows.len() - 1
+            )
+        })?;
+        return Ok(BleToken::Row(d.clone()));
+    }
+    infishark::ieee80211::parse_mac(token)
+        .map_err(|_| anyhow::anyhow!("bad BLE address '{token}'"))?;
+    if let Some(d) = rows.iter().find(|d| same_mac(&d.address, token)) {
+        return Ok(BleToken::Row(d.clone()));
+    }
+    Ok(BleToken::Address(token.to_string()))
+}
+
 /// Print a numbered list and return the item the operator picks by index.
 pub fn pick_from_list<'a, T>(
     items: &'a [T],
@@ -1160,7 +1320,7 @@ pub fn pick_from_list<'a, T>(
 }
 
 /// Show the BLE device table and return the operator's single selection.
-pub fn pick_ble_device(devs: &[BleDevice]) -> Result<BleDevice> {
+pub fn pick_ble_device(devs: &mut [BleDevice]) -> Result<BleDevice> {
     require_interactive("pass a BLE address; need a terminal to pick")?;
     if devs.is_empty() {
         bail!("scan found no devices; pass an address");
@@ -1558,6 +1718,166 @@ mod prompt_tests {
         crate::signals::RUNNING.store(true, Ordering::SeqCst);
         unsafe { libc::close(master) };
         assert!(crate::signals::is_cancel(&err), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod ble_token_tests {
+    use super::{BleToken, ble_in_display_order, resolve_ble_token};
+    use infishark::BleDevice;
+
+    fn dev(addr: &str, rssi: i64, paired: bool, addr_type: Option<u8>) -> BleDevice {
+        BleDevice {
+            address: addr.into(),
+            name: None,
+            rssi,
+            addr_type,
+            company_id: None,
+            vendor: None,
+            company: None,
+            paired,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn paired_rows_sort_ahead_of_stronger_adverts() {
+        let rows = ble_in_display_order(&[
+            dev("aa:aa:aa:aa:aa:01", -40, false, Some(0)),
+            dev("bb:bb:bb:bb:bb:02", 0, true, Some(1)),
+        ]);
+        assert_eq!(rows[0].address, "bb:bb:bb:bb:bb:02");
+        assert_eq!(rows[1].address, "aa:aa:aa:aa:aa:01");
+    }
+
+    #[test]
+    fn row_number_uses_table_order_and_keeps_addr_type() {
+        let rows = ble_in_display_order(&[
+            dev("aa:aa:aa:aa:aa:01", -40, false, Some(0)),
+            dev("bb:bb:bb:bb:bb:02", 0, true, Some(1)),
+        ]);
+        match resolve_ble_token(&rows, "0").unwrap() {
+            BleToken::Row(d) => {
+                assert_eq!(d.address, "bb:bb:bb:bb:bb:02");
+                assert_eq!(d.addr_type, Some(1));
+            }
+            BleToken::Address(a) => panic!("{a}"),
+        }
+        match resolve_ble_token(&rows, "1").unwrap() {
+            BleToken::Row(d) => assert_eq!(d.address, "aa:aa:aa:aa:aa:01"),
+            BleToken::Address(a) => panic!("{a}"),
+        }
+    }
+
+    #[test]
+    fn mac_hits_the_row_ignoring_case_and_separators() {
+        let rows = [dev("DD:CC:BB:AA:EE:FF", -50, false, Some(1))];
+        match resolve_ble_token(&rows, "ddccbbaaeeff").unwrap() {
+            BleToken::Row(d) => {
+                assert_eq!(d.address, "DD:CC:BB:AA:EE:FF");
+                assert_eq!(d.addr_type, Some(1));
+            }
+            BleToken::Address(a) => panic!("{a}"),
+        }
+    }
+
+    #[test]
+    fn unknown_mac_is_passed_through() {
+        match resolve_ble_token(&[], "aa:bb:cc:dd:ee:ff").unwrap() {
+            BleToken::Address(a) => assert_eq!(a, "aa:bb:cc:dd:ee:ff"),
+            BleToken::Row(_) => panic!("row"),
+        }
+    }
+
+    #[test]
+    fn known_row_keeps_its_type_and_an_unknown_mac_does_not() {
+        let rows = [dev("aa:bb:cc:00:00:01", -52, false, Some(1))];
+        let row = super::resolve_ble_target(&rows, "0", None).unwrap();
+        assert_eq!(row.address, "aa:bb:cc:00:00:01");
+        assert_eq!(row.addr_type, 1);
+        assert!(row.type_known);
+        let mac = super::resolve_ble_target(&rows, "aa:bb:cc:00:00:01", None).unwrap();
+        assert!(mac.type_known);
+        assert_eq!(mac.addr_type, 1);
+        let fresh = super::resolve_ble_target(&[], "aa:bb:cc:dd:ee:ff", None).unwrap();
+        assert!(!fresh.type_known);
+        assert_eq!(fresh.addr_type, 0);
+        let forced = super::resolve_ble_target(&rows, "0", Some(0)).unwrap();
+        assert!(forced.type_known);
+        assert_eq!(forced.addr_type, 0);
+    }
+
+    #[test]
+    fn unconnectable_scan_refuses_and_a_later_true_allows() {
+        let mut beacon = dev("aa:bb:cc:dd:ee:ff", -60, false, Some(1));
+        beacon
+            .extra
+            .insert("connectable".into(), serde_json::json!(false));
+        let err =
+            super::refuse_unconnectable(&[], &[beacon.clone()], "AA-BB-CC-DD-EE-FF").unwrap_err();
+        assert!(err.to_string().contains("is not connectable"), "{err}");
+
+        let mut named = beacon.clone();
+        named.name = Some("Tile".into());
+        let err = super::refuse_unconnectable(&[named], &[], "aa:bb:cc:dd:ee:ff").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Tile (aa:bb:cc:dd:ee:ff) is not connectable"),
+            "{err}"
+        );
+
+        let mut later = dev("aa:bb:cc:dd:ee:ff", -40, false, Some(1));
+        later
+            .extra
+            .insert("connectable".into(), serde_json::json!(true));
+        super::refuse_unconnectable(&[beacon], &[later], "aa:bb:cc:dd:ee:ff").unwrap();
+    }
+
+    #[test]
+    fn missing_connectable_flag_still_tries() {
+        let saved = dev("aa:bb:cc:dd:ee:01", 0, true, Some(0));
+        super::refuse_unconnectable(&[saved], &[], "aa:bb:cc:dd:ee:01").unwrap();
+        super::refuse_unconnectable(&[], &[], "aa:bb:cc:dd:ee:02").unwrap();
+    }
+
+    #[test]
+    fn hid_appearance_or_service_wants_a_passkey() {
+        let mut keyboard = dev("aa:aa:aa:aa:aa:01", -40, false, Some(1));
+        keyboard
+            .extra
+            .insert("appearance".into(), serde_json::json!(0x03C1));
+        assert!(super::ble_prefers_passkey(&keyboard));
+        let mut band = dev("aa:aa:aa:aa:aa:02", -40, false, Some(1));
+        band.extra
+            .insert("services".into(), serde_json::json!(["180d"]));
+        assert!(!super::ble_prefers_passkey(&band));
+        let mut hogp = dev("aa:aa:aa:aa:aa:03", -40, false, Some(1));
+        hogp.extra.insert(
+            "services".into(),
+            serde_json::json!(["00001812-0000-1000-8000-00805f9b34fb"]),
+        );
+        assert!(super::ble_prefers_passkey(&hogp));
+    }
+
+    #[test]
+    fn index_without_a_table_names_the_commands() {
+        let msg = format!("{}", resolve_ble_token(&[], "4").unwrap_err());
+        assert!(msg.contains("ble scan"), "{msg}");
+    }
+
+    #[test]
+    fn index_past_the_table_says_the_range() {
+        let rows = [dev("aa:aa:aa:aa:aa:01", -40, false, Some(0))];
+        let msg = format!("{}", resolve_ble_token(&rows, "4").unwrap_err());
+        assert!(msg.contains("out of range"), "{msg}");
+    }
+
+    #[test]
+    fn garbage_is_rejected() {
+        let msg = format!("{}", resolve_ble_token(&[], "keyboard").unwrap_err());
+        assert!(msg.contains("not a row number"), "{msg}");
+        let msg = format!("{}", resolve_ble_token(&[], "not-a-device").unwrap_err());
+        assert!(msg.contains("bad BLE address"), "{msg}");
     }
 }
 
