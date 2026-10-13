@@ -222,17 +222,20 @@ enum FlashCmd {
 enum IrCmd {
     /// Blast the TV-B-Gone power-off sweep.
     Tvbgone,
-    /// Transmit a code (`ir tx nec 20DF10EF`) or a `.ir` button (`ir tx
-    /// remote.ir` / `ir tx remote.ir Power`).
+    /// Transmit a code, a `.ir` button, or a cached capture with --capture.
     Tx {
         /// Protocol name, or path to a `.ir` file.
-        target: String,
+        #[arg(required_unless_present = "capture", conflicts_with = "capture")]
+        target: Option<String>,
         /// Hex data (protocol mode), or button name/# (file mode).
         arg: Option<String>,
+        /// Capture index from the last `ir rx` session (1-based #).
+        #[arg(long, conflicts_with_all = ["target", "arg", "bits"])]
+        capture: Option<usize>,
         /// Bit count (protocol mode; 0 = the protocol's default).
         #[arg(long, default_value_t = 0)]
         bits: u16,
-        /// Repeat count (0 = the protocol's minimum).
+        /// Repeat count for decoded codes (0 = the protocol's minimum).
         #[arg(long, default_value_t = 0)]
         repeats: u16,
     },
@@ -269,6 +272,14 @@ enum IrCmd {
     Show {
         /// Capture index from the last session table; omit to re-list.
         index: Option<usize>,
+    },
+    /// Save captures from the last `ir rx` session to a local `.ir` file.
+    Save {
+        /// Destination file.
+        file: PathBuf,
+        /// Capture indexes (1-based, comma/space-separated); omit to save all.
+        #[arg(value_delimiter = ',')]
+        captures: Vec<usize>,
     },
 }
 
@@ -1559,6 +1570,15 @@ fn cmd_ir(cli: &Cli, action: &IrCmd) -> Result<()> {
     if let IrCmd::Show { index } = action {
         return cmd_ir_show(cli, *index);
     }
+    if let IrCmd::Save { file, captures } = action {
+        return cmd_ir_save(cli, file, captures);
+    }
+    let cached = match action {
+        IrCmd::Tx {
+            capture: Some(n), ..
+        } => Some((*n, cached_ir_capture(*n)?)),
+        _ => None,
+    };
 
     let mut dev = cli.open(cli.timeout_ms)?;
     match action {
@@ -1576,7 +1596,27 @@ fn cmd_ir(cli: &Cli, action: &IrCmd) -> Result<()> {
             arg,
             bits,
             repeats,
-        } => cmd_ir_tx(cli, &mut dev, target, arg.as_deref(), *bits, *repeats),
+            ..
+        } => {
+            if let Some((n, cap)) = cached {
+                let note = dev.ir_tx_capture(&cap, *repeats)?;
+                print_ir_note(note, cli.json);
+                print_action(
+                    ir_capture_json(n, &cap, false),
+                    format!("Sent capture #{n}."),
+                    cli.json,
+                )
+            } else {
+                cmd_ir_tx(
+                    cli,
+                    &mut dev,
+                    target.as_deref().context("IR protocol or file required")?,
+                    arg.as_deref(),
+                    *bits,
+                    *repeats,
+                )
+            }
+        }
         IrCmd::Raw { khz, timings } => {
             if timings.is_empty() {
                 bail!("--timings is required");
@@ -1597,7 +1637,7 @@ fn cmd_ir(cli: &Cli, action: &IrCmd) -> Result<()> {
             cmd_ir_rx(cli, &mut dev, *once, *verbose, out.as_deref())
         }
         IrCmd::Push { file, slot } => cmd_ir_push(cli, &mut dev, file, *slot),
-        IrCmd::Show { .. } => unreachable!("handled above"),
+        IrCmd::Show { .. } | IrCmd::Save { .. } => unreachable!("handled above"),
     }
 }
 
@@ -1797,6 +1837,51 @@ fn cmd_ir_show(cli: &Cli, index: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+fn cached_ir_capture(n: usize) -> Result<IrCapture> {
+    let caps = LAST_IR.lock().unwrap();
+    if caps.is_empty() {
+        bail!("no cached captures; run `ir rx` first");
+    }
+    n.checked_sub(1)
+        .and_then(|i| caps.get(i))
+        .cloned()
+        .with_context(|| format!("capture #{n} out of range (1..{})", caps.len()))
+}
+
+fn cmd_ir_save(cli: &Cli, path: &Path, indexes: &[usize]) -> Result<()> {
+    let caps = LAST_IR.lock().unwrap().clone();
+    if caps.is_empty() {
+        bail!("no cached captures; run `ir rx` first");
+    }
+    let mut remote = IrRemote::from_captures(&caps);
+    if !indexes.is_empty() {
+        let mut selected = Vec::new();
+        let mut seen = Vec::new();
+        for &n in indexes {
+            let button = n
+                .checked_sub(1)
+                .and_then(|i| remote.buttons.get(i))
+                .with_context(|| format!("capture #{n} out of range (1..{})", caps.len()))?;
+            if !seen.contains(&n) {
+                seen.push(n);
+                selected.push(button.clone());
+            }
+        }
+        remote.buttons = selected;
+    }
+    std::fs::write(path, remote.to_ir_string())
+        .with_context(|| format!("write {}", path.display()))?;
+    print_action(
+        serde_json::json!({ "file": path.display().to_string(), "count": remote.buttons.len() }),
+        format!(
+            "Saved {} capture(s) to {}.",
+            remote.buttons.len(),
+            path.display()
+        ),
+        cli.json,
+    )
+}
+
 fn ir_capture_json(n: usize, cap: &IrCapture, with_timings: bool) -> serde_json::Value {
     match cap {
         IrCapture::Code(c) => serde_json::json!({
@@ -1839,7 +1924,6 @@ fn cmd_ir_rx(
     signals::RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
     let note = dev.ir_rx_start()?;
     print_ir_note(note, cli.json);
-    // Short reads so Ctrl-C is noticed between captures.
     dev.set_read_timeout(Duration::from_millis(300))?;
     if !cli.json {
         log::info("listening for IR (ctrl-c to stop)");
@@ -1867,6 +1951,7 @@ fn cmd_ir_rx(
                     break;
                 }
             }
+            Err(infishark::Error::Interrupted) => break,
             // Transport/serial failure: stop listening, keep what we have.
             Err(e) => {
                 if !cli.json {
@@ -4262,6 +4347,7 @@ fn print_ok(as_json: bool) -> Result<()> {
 #[cfg(test)]
 mod qol_tests {
     use super::*;
+    use infishark::ir::{IrCode, Protocol, RawIr};
 
     #[test]
     fn interrupted_typing_attempts_key_release_before_returning() {
@@ -4303,5 +4389,124 @@ mod qol_tests {
             reports,
             [hid::hid_key_report(1, 0, 4), hid::hid_key_report(1, 0, 0)]
         );
+    }
+
+    #[test]
+    fn ir_capture_tx_keeps_legacy_forms_and_rejects_conflicting_sources() {
+        let cli =
+            Cli::try_parse_from(["infishark", "ir", "tx", "--capture", "3", "--repeats", "2"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ir {
+                action: IrCmd::Tx {
+                    target: None,
+                    arg: None,
+                    capture: Some(3),
+                    repeats: 2,
+                    ..
+                }
+            })
+        ));
+        for args in [
+            vec!["infishark", "ir", "tx", "nec", "20DF10EF"],
+            vec!["infishark", "ir", "tx", "remote.ir", "Power"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["infishark", "ir", "tx"],
+            vec!["infishark", "ir", "tx", "nec", "--capture", "3"],
+            vec!["infishark", "ir", "tx", "--capture", "3", "--bits", "32"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn cached_ir_save_and_capture_validation_work_without_a_device() {
+        let captures = vec![
+            IrCapture::Code(IrCode {
+                protocol: Protocol::Nec,
+                data: 0x20DF10EF,
+                bits: 32,
+            }),
+            IrCapture::Raw(RawIr {
+                khz: 38,
+                timings: vec![9000, 4500, 560, 1690],
+            }),
+        ];
+        *LAST_IR.lock().unwrap() = captures.clone();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("infishark-ir-save-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("selected.ir");
+        let cli = Cli::try_parse_from([
+            "infishark",
+            "--port",
+            "/no-nano-for-cached-ir-test",
+            "--json",
+            "ir",
+            "save",
+            path.to_str().unwrap(),
+            "2,1",
+            "2",
+        ])
+        .unwrap();
+        let Some(Command::Ir { action }) = &cli.command else {
+            panic!("expected IR command");
+        };
+        cmd_ir(&cli, action).unwrap();
+        let saved = IrRemote::load_strict(&path).unwrap();
+        assert_eq!(saved.buttons.len(), 2);
+        assert_eq!(saved.buttons[0].name, "Capture_2");
+        assert_eq!(saved.buttons[0].capture, captures[1]);
+        assert_eq!(saved.buttons[1].name, "Capture_1");
+        assert_eq!(saved.buttons[1].capture, captures[0]);
+        assert_eq!(cached_ir_capture(2).unwrap(), captures[1]);
+
+        let original = std::fs::read(&path).unwrap();
+        assert!(cmd_ir_save(&cli, &path, &[1, 3]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let invalid_tx = Cli::try_parse_from([
+            "infishark",
+            "--port",
+            "/no-nano-for-cached-ir-test",
+            "ir",
+            "tx",
+            "--capture",
+            "0",
+        ])
+        .unwrap();
+        let Some(Command::Ir { action }) = &invalid_tx.command else {
+            panic!("expected IR command");
+        };
+        assert!(
+            cmd_ir(&invalid_tx, action)
+                .unwrap_err()
+                .to_string()
+                .contains("capture #0 out of range")
+        );
+
+        let all = dir.join("all.ir");
+        cmd_ir_save(&cli, &all, &[]).unwrap();
+        let saved = IrRemote::load_strict(&all).unwrap();
+        assert_eq!(saved.buttons[0].capture, captures[0]);
+        assert_eq!(saved.buttons[1].capture, captures[1]);
+        LAST_IR.lock().unwrap().clear();
+        assert!(
+            cached_ir_capture(1)
+                .unwrap_err()
+                .to_string()
+                .contains("run `ir rx` first")
+        );
+        assert!(cmd_ir_save(&cli, &all, &[]).is_err());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(all).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 }

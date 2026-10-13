@@ -345,6 +345,9 @@ impl Shell {
                             db,
                             action: BleCmd::Gatt { action },
                         } => self.gatt_cmd(&cli, db, action),
+                        CliCommand::Ir {
+                            action: crate::IrCmd::Save { .. },
+                        } => dispatch(&cli, command),
                         _ => {
                             self.stop_listen();
                             dispatch(&cli, command)
