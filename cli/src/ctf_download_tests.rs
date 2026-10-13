@@ -1162,6 +1162,31 @@ fn hints_are_public_selected_and_validate_response() {
 }
 
 #[test]
+fn cli_parses_download_and_hint_commands() {
+    use crate::{Cli, Command, CtfCmd};
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["infishark", "ctf", "start", "gate"]).unwrap();
+    assert!(
+        matches!(cli.command, Some(Command::Ctf { action: CtfCmd::Start { target, bin: None, .. } }) if target == "gate")
+    );
+    let cli = Cli::try_parse_from(["infishark", "ctf", "hint", "gate"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Ctf {
+            action: CtfCmd::Hint { level: 1, .. }
+        })
+    ));
+    let cli = Cli::try_parse_from(["infishark", "ctf", "hint", "gate", "3"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Ctf {
+            action: CtfCmd::Hint { level: 3, .. }
+        })
+    ));
+    assert!(Cli::try_parse_from(["infishark", "ctf", "hint", "gate", "0"]).is_err());
+}
+
+#[test]
 fn failed_verification_removes_partial_files() {
     for body in [
         vec![0; IMAGE.len()],

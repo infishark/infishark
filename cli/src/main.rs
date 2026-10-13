@@ -272,6 +272,54 @@ enum CtfCmd {
         #[command(flatten)]
         api: CtfApiOpts,
     },
+    /// List challenges from the CTF server.
+    Challenges {
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Download and verify a box, flash it, and load a RAM flag.
+    Start {
+        /// Challenge slug, or a .bin path with --local.
+        target: String,
+        /// Optional local .bin override; required with --local.
+        bin: Option<PathBuf>,
+        /// Skip the CTF server; generate a local flag and wait at flag>.
+        #[arg(long)]
+        local: bool,
+        /// Skip the confirm prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Request one staged hint; later levels reveal more detail.
+    Hint {
+        /// Challenge slug.
+        slug: String,
+        /// Hint level (starts at 1).
+        #[arg(default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        level: u32,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Restart the box like the left+right button chord; keep its loaded flag.
+    Reset,
+    /// Reload the connected CTF challenge (auto-detected from firmware).
+    Load {
+        /// Optional assertion: must match the connected firmware's challenge.
+        slug: Option<String>,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Submit a flag{...} string.
+    Submit {
+        /// Challenge slug.
+        challenge: String,
+        /// The flag string (flag{...}, not a hex dump).
+        flag: String,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1389,6 +1437,44 @@ fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
                 crate::ctf_account::run(action, url.as_deref(), cli.json)
             }
             CtfCmd::Stats { api } => crate::ctf_account::stats(cli.json, api_opts(api)),
+            CtfCmd::Challenges { api } => crate::ctf::challenges(cli.json, api_opts(api)),
+            CtfCmd::Reset => crate::ctf::reset(cli.json, cli.port.as_deref(), cli.timeout_ms),
+            CtfCmd::Hint { slug, level, api } => {
+                crate::ctf::hint(slug, *level, cli.json, api_opts(api))
+            }
+            CtfCmd::Start {
+                target,
+                bin,
+                local,
+                yes,
+                api,
+            } => crate::ctf::start(crate::ctf::Start {
+                target: target.clone(),
+                bin: bin.clone(),
+                local: *local,
+                yes: *yes,
+                json: cli.json,
+                port: cli.port.clone(),
+                timeout_ms: cli.timeout_ms,
+                api: api_opts(api),
+            }),
+            CtfCmd::Load { slug, api } => crate::ctf::load(crate::ctf::LoadOpts {
+                slug: slug.clone(),
+                json: cli.json,
+                port: cli.port.clone(),
+                timeout_ms: cli.timeout_ms,
+                api: api_opts(api),
+            }),
+            CtfCmd::Submit {
+                challenge,
+                flag,
+                api,
+            } => crate::ctf::submit(crate::ctf::Submit {
+                challenge: challenge.clone(),
+                flag: flag.clone(),
+                json: cli.json,
+                api: api_opts(api),
+            }),
         },
     }
 }

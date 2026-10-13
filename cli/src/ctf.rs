@@ -8,6 +8,7 @@ use std::time::Duration;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, bail};
+use infishark::Device;
 use infishark::hex;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -18,6 +19,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::ctf_http::{USER_AGENT as UA, send, send_json};
 use crate::flash;
+use crate::signals::ensure_running;
+use crate::ui;
 use crate::{log, signals};
 
 pub const DEFAULT_URL: &str = "https://ctf.infishark.com";
@@ -1108,6 +1111,38 @@ fn load_json(load: &Load) -> serde_json::Value {
     })
 }
 
+fn wait_box(port: Option<&str>, timeout_ms: u64) -> Result<Device> {
+    let timeout = timeout_ms.max(8_000);
+    let mut last = String::new();
+    for i in 0..16 {
+        ensure_running()?;
+        match Device::open(port, timeout) {
+            Ok(mut d) => match d.firmware_identity() {
+                Ok(id) if id.mode == "ctf" => return Ok(d),
+                Ok(_) => {
+                    last = "firmware mode is not ctf".into();
+                }
+                Err(infishark::Error::Interrupted) => return Err(signals::cancelled()),
+                Err(_) => last = "could not read box identity".into(),
+            },
+            Err(infishark::Error::Interrupted) => return Err(signals::cancelled()),
+            Err(e) => last = e.to_string(),
+        }
+        if i + 1 < 16 && !signals::sleep_while_running(Duration::from_millis(750)) {
+            return Err(signals::cancelled());
+        }
+    }
+    bail!("CTF box did not come up ({last})");
+}
+
+fn device_error(error: infishark::Error, message: &str) -> anyhow::Error {
+    if matches!(error, infishark::Error::Interrupted) {
+        signals::cancelled()
+    } else {
+        anyhow::anyhow!("{message}")
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct BoxHello {
     key: [u8; 32],
@@ -1154,6 +1189,25 @@ fn box_hello(hello: &serde_json::Value, requested: Option<&str>) -> Result<BoxHe
     })
 }
 
+fn read_box_hello(dev: &mut Device, requested: Option<&str>) -> Result<BoxHello> {
+    // Suppress untrusted firmware error bodies; old images must never trigger
+    // fallback.
+    let hello = dev
+        .ctf_hello()
+        .map_err(|e| device_error(e, REFLASH_REQUIRED))?;
+    box_hello(&hello, requested)
+}
+
+fn send_load(dev: &mut Device, load: &serde_json::Value) -> Result<()> {
+    let resp = dev
+        .ctf_load(load)
+        .map_err(|e| device_error(e, "CTF LOAD failed; not retried"))?;
+    if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        bail!("device rejected CTF load");
+    }
+    Ok(())
+}
+
 fn check_load_identity(before: &BoxHello, after: &BoxHello) -> Result<()> {
     if after.key != before.key {
         bail!("CTF boot key changed before LOAD");
@@ -1164,9 +1218,344 @@ fn check_load_identity(before: &BoxHello, after: &BoxHello) -> Result<()> {
     Ok(())
 }
 
+fn recheck_load_identity(dev: &mut Device, before: &BoxHello) -> Result<()> {
+    // No requested assertion here: its pre-issue error claims no issuance.
+    let after = read_box_hello(dev, None)?;
+    check_load_identity(before, &after)
+}
+
+fn provision_local(dev: &mut Device, hello: &BoxHello, flag: &str) -> Result<()> {
+    let load = seal(&hello.key, &hello.slug, flag.as_bytes())?;
+    recheck_load_identity(dev, hello).context(
+        "CTF identity recheck after local sealing failed; no LOAD sent; restart local provisioning",
+    )?;
+    send_load(dev, &load_json(&load))
+}
+
+fn provision_issued(dev: &mut Device, api: &Api, hello: &BoxHello) -> Result<bool> {
+    let slug = &hello.slug;
+    log::info(format!("issuing {slug}"));
+    let body = api.issue(slug, &hello.key)?;
+    ensure_running()?;
+    // The API round trip may span a reboot or an image/identity change.
+    // Check both bindings again before relaying, without retry or re-encryption.
+    recheck_load_identity(dev, hello)
+        .context("CTF identity recheck after API response failed; no LOAD sent; API may already have issued a flag; reconnect and run infishark ctf load")?;
+    // Do not decrypt, re-encrypt or retry: only the active box has the boot secret.
+    send_load(dev, &serde_json::to_value(&body.load)?)?;
+    log::ok(format!(
+        "loaded {slug}{}",
+        if body.reused { " (reused)" } else { "" }
+    ));
+    Ok(body.reused)
+}
+
+const SWITCH_ON: &str = "leave the switch on if you unplug the box. it keeps running on battery.";
+
+fn server_next(slug: &str) -> String {
+    format!(
+        "\
+box is up. attack it, then:
+  infishark ctf submit {slug} flag{{...}}
+stuck? infishark ctf hint {slug}
+{SWITCH_ON}
+if it powers off, plug it back in and:
+  infishark ctf load"
+    )
+}
+
+fn local_ready() -> String {
+    format!(
+        "\
+box is up. paste flag{{...}} when you have it.
+{SWITCH_ON}
+exit or :q leaves."
+    )
+}
+
+fn local_left() -> &'static str {
+    "left. this local flag is forgotten."
+}
+
+fn is_leave(line: &str) -> bool {
+    matches!(line, "exit" | "quit" | ":q" | ":q!")
+}
+
+fn load_report(slug: &str, reused: bool) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "loaded": true,
+        "challenge": slug,
+        "reused": reused,
+    })
+}
+
+fn wait_submit(flag: &str) -> Result<()> {
+    eprintln!("{}", local_ready());
+    loop {
+        let Some(line) = ui::prompt_line_eof("flag> ")? else {
+            eprintln!();
+            eprintln!("{}", local_left());
+            return Ok(());
+        };
+        let got = line.trim();
+        if got.is_empty() {
+            continue;
+        }
+        if is_leave(got) {
+            eprintln!("{}", local_left());
+            return Ok(());
+        }
+        if let Err(e) = check_flag_shape(got) {
+            log::warn(e);
+            continue;
+        }
+        if flags_eq(got, flag) {
+            log::ok("correct");
+            return Ok(());
+        }
+        log::warn("incorrect");
+    }
+}
+
+pub fn challenges(json: bool, api: ApiOpts) -> Result<()> {
+    let list = Api::resolve(&api)?.challenges()?;
+    if json {
+        println!("{}", serde_json::to_string(&list)?);
+        return Ok(());
+    }
+    let rows = list
+        .into_iter()
+        .map(|c| vec![c.slug, c.difficulty, c.title])
+        .collect::<Vec<_>>();
+    ui::text_table(&["CHALLENGE", "DIFFICULTY", "TITLE"], &rows);
+    Ok(())
+}
+
+pub fn hint(slug: &str, level: u32, json: bool, api: ApiOpts) -> Result<()> {
+    let body = Api::resolve(&api)?.hint(slug, level)?;
+    if json {
+        println!("{}", serde_json::to_string(&body)?);
+    } else {
+        println!(
+            "hint {}/{} for {}: {}",
+            body.level,
+            body.total,
+            body.challenge,
+            body.text
+                .lines()
+                .map(ui::tty_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        if body.level < body.total {
+            println!("more detail: infishark ctf hint {slug} {}", body.level + 1);
+        }
+    }
+    Ok(())
+}
+
+pub fn submit(opts: Submit) -> Result<()> {
+    if opts.challenge.starts_with("flag{") {
+        bail!("pass the slug first: infishark ctf submit <slug> flag{{...}}");
+    }
+    check_flag_shape(&opts.flag)?;
+    let body = Api::authorized(&opts.api)?.submit(&opts.challenge, opts.flag.trim())?;
+    if opts.json {
+        if !body.ok {
+            bail!("incorrect");
+        }
+        return crate::print_value(&serde_json::to_value(&body)?, true);
+    }
+    if !body.ok {
+        bail!("incorrect");
+    }
+    if body.already {
+        log::ok("already solved");
+    } else {
+        log::ok("correct");
+    }
+    Ok(())
+}
+
+pub fn start(opts: Start) -> Result<()> {
+    signals::install_sigint();
+    ensure_running()?;
+    let spec = resolve_start(&opts.target, opts.bin.as_deref(), opts.local)?;
+    let local = opts.local || spec.slug.is_none();
+    let prepared = prepare_start(&spec, local, &opts.api);
+    ensure_running()?;
+    let prepared = prepared?;
+    if !opts.yes && !opts.json && std::io::stdin().is_terminal() {
+        let line = ui::prompt_line(&format!(
+            "flash {} and start CTF? [y/N] ",
+            prepared.bin.display()
+        ))?;
+        match line.trim() {
+            "y" | "Y" | "yes" => {}
+            _ => bail!("aborted"),
+        }
+    }
+    ensure_running()?;
+    let written = flash::write_local_image(&flash::Write {
+        bin: prepared.bin.clone(),
+        offset: None,
+        yes: true,
+        json: opts.json,
+        port: opts.port.clone(),
+    })?;
+    log::info("waiting for the box");
+    if !signals::sleep_while_running(Duration::from_secs(3)) {
+        return Err(signals::cancelled());
+    }
+    let mut dev = wait_box(Some(&written.port), opts.timeout_ms)?;
+    // This must be post-flash, including explicit .bin and --local starts.
+    let hello = read_box_hello(&mut dev, spec.slug.as_deref())?;
+    let (local_flag, reused) = if let Some(api) = &prepared.api {
+        (None, Some(provision_issued(&mut dev, api, &hello)?))
+    } else {
+        let flag = gen_flag();
+        provision_local(&mut dev, &hello, &flag)?;
+        (Some(flag), None)
+    };
+    drop(dev);
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "loaded": true,
+                "challenge": hello.slug,
+                "reused": reused,
+                "local": local,
+                "firmware": prepared.firmware,
+            })
+        );
+        return Ok(());
+    }
+    if let Some(flag) = local_flag {
+        wait_submit(&flag)
+    } else {
+        let slug = spec.slug.as_deref().context("missing challenge slug")?;
+        eprintln!("{}", server_next(slug));
+        Ok(())
+    }
+}
+
+fn reset_hello(hello: &serde_json::Value) -> Result<(BoxHello, bool)> {
+    let identity = box_hello(hello, None)?;
+    if hello.get("reset") != Some(&serde_json::Value::Bool(true)) {
+        bail!(
+            "box firmware does not support flag-preserving reset; hold left+right and release, or install a reset-capable image"
+        );
+    }
+    let ready = hello
+        .get("ready")
+        .and_then(|v| v.as_bool())
+        .context("reset hello missing flag state")?;
+    Ok((identity, ready))
+}
+
+fn reset_ack(body: &serde_json::Value, ready: bool) -> Result<bool> {
+    if body.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        bail!("device rejected CTF reset");
+    }
+    let kept = body
+        .get("kept")
+        .and_then(|v| v.as_bool())
+        .context("reset acknowledgement missing flag state")?;
+    if kept != ready {
+        bail!("reset acknowledgement disagrees with the loaded flag state");
+    }
+    Ok(kept)
+}
+
+fn check_reset_return(before: &BoxHello, kept: bool, hello: &serde_json::Value) -> Result<()> {
+    let (after, ready) = reset_hello(hello)?;
+    if after.slug != before.slug {
+        bail!("box returned after reset with a different challenge identity");
+    }
+    if after.key == before.key {
+        bail!("box acknowledged reset but did not restart");
+    }
+    if ready != kept {
+        bail!("box returned after reset with an unexpected flag state");
+    }
+    Ok(())
+}
+
+pub fn reset(json: bool, port: Option<&str>, timeout_ms: u64) -> Result<()> {
+    signals::install_sigint();
+    ensure_running()?;
+    let mut dev = Device::open(port, timeout_ms.max(8_000))?;
+    let identity = dev
+        .firmware_identity()
+        .map_err(|e| device_error(e, "could not read box identity"))?;
+    if identity.mode != "ctf" {
+        bail!("ctf reset requires challenge firmware");
+    }
+    let hello = dev
+        .ctf_hello()
+        .map_err(|e| device_error(e, REFLASH_REQUIRED))?;
+    let (before, ready) = reset_hello(&hello)?;
+    let body = dev
+        .ctf_reset()
+        .map_err(|e| device_error(e, "ctf reset acknowledgement failed; reset was not retried (malformed response header/JSON or lost acknowledgement)"))?;
+    let kept = reset_ack(&body, ready)?;
+    let path = dev.port().to_string();
+    drop(dev);
+    log::info("waiting for the reset box");
+    if !signals::sleep_while_running(Duration::from_millis(500)) {
+        return Err(signals::cancelled());
+    }
+    let mut dev = wait_box(Some(&path), timeout_ms)?;
+    if dev.firmware_identity()?.serial != identity.serial {
+        bail!("a different Nano returned after reset");
+    }
+    let hello = dev
+        .ctf_hello()
+        .map_err(|e| device_error(e, REFLASH_REQUIRED))?;
+    check_reset_return(&before, kept, &hello)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"ok": true, "reset": true, "flag_preserved": kept})
+        );
+    } else if kept {
+        log::ok("box reset; loaded flag preserved");
+    } else {
+        log::ok("box reset; no flag was loaded");
+    }
+    Ok(())
+}
+
+pub fn load(opts: LoadOpts) -> Result<()> {
+    signals::install_sigint();
+    ensure_running()?;
+    if let Some(slug) = &opts.slug {
+        check_slug(slug)?;
+    }
+    log::info("waiting for the box");
+    let mut dev = wait_box(opts.port.as_deref(), opts.timeout_ms)?;
+    let hello = read_box_hello(&mut dev, opts.slug.as_deref())?;
+    let api = Api::authorized(&opts.api)?;
+    let reused = provision_issued(&mut dev, &api, &hello)?;
+    drop(dev);
+    if opts.json {
+        println!("{}", load_report(&hello.slug, reused));
+        return Ok(());
+    }
+    log::ok("box is up");
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "ctf_download_tests.rs"]
 mod download_tests;
+
+#[cfg(test)]
+#[path = "ctf_identity_tests.rs"]
+mod identity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1317,6 +1706,134 @@ mod tests {
         assert_eq!(infishark::protocol::CMD_CTF_RESET, 0x0602);
     }
 
+    fn reset_hello_body(key: u8, ready: bool) -> serde_json::Value {
+        serde_json::json!({
+            "proto": 2,
+            "pub": hex::encode_lower(&[key; 32]),
+            "challenge": "gate",
+            "reset": true,
+            "ready": ready,
+        })
+    }
+
+    #[test]
+    fn reset_cli_parses_without_api_or_slug() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "infishark",
+            "--port",
+            "/dev/qa-nano",
+            "--json",
+            "ctf",
+            "reset",
+        ])
+        .unwrap();
+        assert_eq!(cli.port.as_deref(), Some("/dev/qa-nano"));
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(crate::Command::Ctf {
+                action: crate::CtfCmd::Reset
+            })
+        ));
+        assert!(crate::Cli::try_parse_from(["infishark", "ctf", "reset", "gate"]).is_err());
+    }
+
+    #[test]
+    fn reset_hello_rejects_old_firmware_before_command() {
+        let old = serde_json::json!({"proto": 2, "pub": hex::encode_lower(&[1; 32]), "challenge": "gate"});
+        let err = reset_hello(&old).unwrap_err().to_string();
+        assert!(
+            err.contains("does not support flag-preserving reset"),
+            "{err}"
+        );
+        assert!(err.contains("hold left+right"), "{err}");
+    }
+
+    #[test]
+    fn reset_hello_requires_exact_protocol_capability_key_and_state() {
+        for ready in [false, true] {
+            assert_eq!(
+                reset_hello(&reset_hello_body(1, ready)).unwrap(),
+                (
+                    BoxHello {
+                        key: [1; 32],
+                        slug: "gate".into()
+                    },
+                    ready
+                )
+            );
+        }
+        for (field, value) in [
+            ("proto", serde_json::json!(1)),
+            ("proto", serde_json::json!("2")),
+            ("reset", serde_json::json!(false)),
+            ("reset", serde_json::json!("true")),
+            ("pub", serde_json::json!("not hex")),
+            ("pub", serde_json::json!("ab")),
+            ("ready", serde_json::json!(null)),
+            ("ready", serde_json::json!(1)),
+        ] {
+            let mut hello = reset_hello_body(1, true);
+            hello[field] = value;
+            assert!(reset_hello(&hello).is_err(), "accepted {hello}");
+        }
+    }
+
+    #[test]
+    fn reset_ack_requires_success_and_consistent_flag_state() {
+        for ready in [false, true] {
+            assert_eq!(
+                reset_ack(&serde_json::json!({"ok": true, "kept": ready}), ready).unwrap(),
+                ready
+            );
+            assert!(reset_ack(&serde_json::json!({"ok": true, "kept": !ready}), ready).is_err());
+        }
+        for body in [
+            serde_json::json!({"ok": false, "kept": true}),
+            serde_json::json!({"ok": "true", "kept": true}),
+            serde_json::json!({"ok": true}),
+            serde_json::json!({"ok": true, "kept": "true"}),
+        ] {
+            assert!(reset_ack(&body, true).is_err(), "accepted {body}");
+        }
+    }
+
+    #[test]
+    fn reset_return_requires_reboot_and_preserved_flag_state() {
+        for kept in [false, true] {
+            check_reset_return(
+                &BoxHello {
+                    key: [1; 32],
+                    slug: "gate".into(),
+                },
+                kept,
+                &reset_hello_body(2, kept),
+            )
+            .unwrap();
+            let err = check_reset_return(
+                &BoxHello {
+                    key: [1; 32],
+                    slug: "gate".into(),
+                },
+                kept,
+                &reset_hello_body(1, kept),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("did not restart"));
+            let err = check_reset_return(
+                &BoxHello {
+                    key: [1; 32],
+                    slug: "gate".into(),
+                },
+                kept,
+                &reset_hello_body(2, !kept),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("unexpected flag state"));
+        }
+    }
+
     #[test]
     fn flag_shape_accepts_flag_rejects_hex() {
         check_flag_shape("flag{ish-deadbeefcafebabe}").unwrap();
@@ -1357,6 +1874,41 @@ mod tests {
         assert!(resolve_start("flag_gatt", None, true).is_err());
         assert!(resolve_start("firmware.bin", Some(Path::new("a.bin")), true).is_err());
         assert!(resolve_start("nope!", Some(Path::new("a.bin")), false).is_err());
+    }
+
+    #[test]
+    fn server_next_tells_you_to_load_again() {
+        let msg = server_next("gate");
+        assert!(msg.contains("infishark ctf submit gate flag{...}"), "{msg}");
+        assert!(msg.contains("infishark ctf load"), "{msg}");
+        assert!(msg.contains(SWITCH_ON), "{msg}");
+        assert!(!msg.contains("empty line"), "{msg}");
+        assert!(!msg.contains("box is back"), "{msg}");
+    }
+
+    #[test]
+    fn local_prompt_ignores_blank_and_names_quit() {
+        let msg = local_ready();
+        assert!(msg.contains(SWITCH_ON), "{msg}");
+        assert!(!msg.contains("blank line"), "{msg}");
+        assert!(msg.contains(":q"), "{msg}");
+        assert_eq!(local_left(), "left. this local flag is forgotten.");
+        assert!(is_leave("exit"));
+        assert!(is_leave(":q"));
+        assert!(is_leave(":q!"));
+        assert!(!is_leave(""));
+        assert!(!is_leave("flag{x}"));
+    }
+
+    #[test]
+    fn load_report_omits_the_flag() {
+        let v = load_report("gate", true);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["loaded"], true);
+        assert_eq!(v["challenge"], "gate");
+        assert_eq!(v["reused"], true);
+        let s = v.to_string();
+        assert!(!s.contains("flag{"), "{s}");
     }
 
     #[test]
