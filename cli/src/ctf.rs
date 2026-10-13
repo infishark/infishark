@@ -1,6 +1,10 @@
 //! Flash a CTF box, provision a RAM-only flag, reload it after a power-cycle,
 //! submit.
 
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, bail};
@@ -12,12 +16,42 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::ctf_http::{USER_AGENT as UA, send, send_json};
+use crate::flash;
+use crate::{log, signals};
+
 pub const DEFAULT_URL: &str = "https://ctf.infishark.com";
 
 pub struct ApiOpts {
     pub url: Option<String>,
     pub token: Option<String>,
     pub user: Option<String>,
+}
+
+pub struct Start {
+    pub target: String,
+    pub bin: Option<PathBuf>,
+    pub local: bool,
+    pub yes: bool,
+    pub json: bool,
+    pub port: Option<String>,
+    pub timeout_ms: u64,
+    pub api: ApiOpts,
+}
+
+pub struct Submit {
+    pub challenge: String,
+    pub flag: String,
+    pub json: bool,
+    pub api: ApiOpts,
+}
+
+pub struct LoadOpts {
+    pub slug: Option<String>,
+    pub json: bool,
+    pub port: Option<String>,
+    pub timeout_ms: u64,
+    pub api: ApiOpts,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -136,9 +170,45 @@ impl FirmwareGrant {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct Challenge {
+    pub slug: String,
+    pub title: String,
+    pub difficulty: String,
+    #[serde(default)]
+    pub firmware: Option<Firmware>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct HintBody {
+    pub challenge: String,
+    pub level: u32,
+    pub total: u32,
+    pub text: String,
+}
+
 const CTF_PROTO: u32 = 2;
 const REFLASH_REQUIRED: &str = "CTF firmware identity missing, unknown, or invalid; reflash required with a protocol-2 challenge image";
 const MAX_FLAG_BYTES: usize = 95;
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct IssueLoad {
+    #[serde(rename = "pub")]
+    sender_pub: String,
+    n: String,
+    ct: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct IssueBody {
+    proto: u32,
+    challenge: String,
+    device_pub: String,
+    reused: bool,
+    #[serde(deserialize_with = "deserialize_object")]
+    load: IssueLoad,
+}
 
 // Derived Serde structs also accept positional arrays; this wire format does
 // not.
@@ -178,6 +248,27 @@ where
     deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
 }
 
+impl IssueBody {
+    fn validate(&self, slug: &str, device_pub: &[u8; 32]) -> Result<()> {
+        if self.proto != CTF_PROTO
+            || self.challenge != slug
+            || self.device_pub != hex::encode_lower(device_pub)
+        {
+            bail!("CTF issue response protocol, challenge or recipient mismatch");
+        }
+        let load = &self.load;
+        if !lower_hex(&load.sender_pub, 32, 32)
+            || !lower_hex(&load.n, 12, 12)
+            || !lower_hex(&load.ct, 17, MAX_FLAG_BYTES + 16)
+        {
+            bail!("invalid CTF issue envelope");
+        }
+        let sender: [u8; 32] = hex::decode_n(&load.sender_pub)?;
+        check_public_key(&sender)?;
+        Ok(())
+    }
+}
+
 fn lower_hex(s: &str, min_bytes: usize, max_bytes: usize) -> bool {
     s.len() >= min_bytes * 2
         && s.len() <= max_bytes * 2
@@ -198,6 +289,209 @@ fn check_public_key(key: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct SubmitBody {
+    pub ok: bool,
+    pub already: bool,
+}
+
+struct Api {
+    url: String,
+    token: Option<String>,
+    user: String,
+}
+
+impl std::fmt::Debug for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Api")
+            .field("url", &self.url)
+            .field("user", &self.user)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Api {
+    fn resolve(opts: &ApiOpts) -> Result<Self> {
+        let url = pick(opts.url.clone(), &["INFISHARK_CTF_URL", "CTF_URL"])
+            .unwrap_or_else(|| DEFAULT_URL.to_string());
+        let url = crate::ctf_account::normalize_endpoint(&url)?;
+        let token = pick(opts.token.clone(), &["INFISHARK_CTF_TOKEN", "CTF_TOKEN"]);
+        let user = pick(
+            opts.user.clone(),
+            &["INFISHARK_CTF_USER", "CTF_USER", "USER", "USERNAME"],
+        )
+        .unwrap_or_else(|| "player".into());
+        if user.is_empty() {
+            bail!("missing player id (--user or INFISHARK_CTF_USER)");
+        }
+        Ok(Self { url, token, user })
+    }
+
+    fn authorized(opts: &ApiOpts) -> Result<Self> {
+        let mut api = Self::resolve(opts)?;
+        api.token = Some(crate::ctf_account::credential(&api.url, api.token)?);
+        api.require_token()?;
+        Ok(api)
+    }
+
+    #[cfg(test)]
+    fn at(url: &str, token: &str, user: &str) -> Self {
+        Self {
+            url: url.trim_end_matches('/').to_string(),
+            token: Some(token.into()),
+            user: user.into(),
+        }
+    }
+
+    fn agent() -> ureq::Agent {
+        crate::ctf_http::agent()
+    }
+
+    fn authed(&self, req: ureq::Request) -> ureq::Request {
+        let req = req.set("User-Agent", UA);
+        // Account bearer tokens are the identity; only explicit legacy tokens use
+        // x-user.
+        let req = if self.token.as_deref().is_some_and(|t| t.starts_with("ctf_")) {
+            req
+        } else {
+            req.set("x-user", &self.user)
+        };
+        match &self.token {
+            Some(t) if !t.is_empty() => req.set("Authorization", &format!("Bearer {t}")),
+            _ => req,
+        }
+    }
+
+    fn require_token(&self) -> Result<()> {
+        match &self.token {
+            Some(t) if !t.is_empty() => Ok(()),
+            _ => bail!("set INFISHARK_CTF_TOKEN (or --token)"),
+        }
+    }
+
+    fn challenges(&self) -> Result<Vec<Challenge>> {
+        let url = format!("{}/v1/challenges", self.url);
+        let (st, body) = send(Self::agent().get(&url).set("User-Agent", UA))?;
+        if st != 200 {
+            bail!("{}", api_error(st, &body));
+        }
+        serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("invalid CTF catalog response"))
+    }
+
+    fn firmware_grant(&self, slug: &str) -> Result<FirmwareGrant> {
+        self.require_token()?;
+        check_slug(slug)?;
+        let url = format!("{}/v1/challenges/{slug}/firmware", self.url);
+        // Bound grant responses and discard provider bodies and URL-bearing transport
+        // errors.
+        let response = match self
+            .authed(Self::agent().post(&url))
+            .set("Content-Type", "application/json")
+            .send_string("{}")
+        {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(_) => {
+                bail!("CTF firmware grant request failed; check your connection and try again")
+            }
+        };
+        match response.status() {
+            200 => {}
+            401 => bail!(
+                "CTF firmware grant requires valid credentials; log in again or check --token"
+            ),
+            403 => bail!("CTF firmware grant requires an active membership"),
+            404 => bail!("CTF firmware grant not found; check the challenge or pass a local .bin"),
+            503 => bail!("CTF billing or firmware artifact unavailable; try again later"),
+            status => bail!("CTF firmware grant HTTP {status}; try again later"),
+        }
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_FIRMWARE_GRANT_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| anyhow::anyhow!("could not read CTF firmware grant"))?;
+        if body.len() as u64 > MAX_FIRMWARE_GRANT_BYTES {
+            bail!("CTF firmware grant response is too large");
+        }
+        let JsonObject(grant) = serde_json::from_slice::<JsonObject<FirmwareGrant>>(&body)
+            .map_err(|_| anyhow::anyhow!("invalid CTF firmware grant response"))?;
+        grant.validate(slug)?;
+        Ok(grant)
+    }
+
+    fn hint(&self, slug: &str, level: u32) -> Result<HintBody> {
+        check_slug(slug)?;
+        if level == 0 {
+            bail!("hint levels start at 1");
+        }
+        let url = format!("{}/v1/challenges/{slug}/hints/{level}", self.url);
+        let (st, body) = send(Self::agent().get(&url).set("User-Agent", UA))?;
+        if st == 404 {
+            bail!("CTF server HTTP 404: hint unavailable; try an earlier level");
+        }
+        if st != 200 {
+            bail!("{}", api_error(st, &body));
+        }
+        let hint: HintBody = serde_json::from_str(&body)
+            .map_err(|_| anyhow::anyhow!("invalid CTF hint response"))?;
+        if hint.challenge != slug
+            || hint.level != level
+            || hint.total < level
+            || hint.text.is_empty()
+        {
+            bail!("invalid hint response for {slug} level {level}");
+        }
+        Ok(hint)
+    }
+
+    fn issue(&self, slug: &str, device_pub: &[u8; 32]) -> Result<IssueBody> {
+        self.require_token()?;
+        check_slug(slug)?;
+        check_public_key(device_pub)?;
+        let url = format!("{}/v1/challenges/{slug}/issue", self.url);
+        let (st, body) = send_json(
+            self.authed(Self::agent().post(&url)),
+            serde_json::json!({
+                "proto": CTF_PROTO,
+                "device_pub": hex::encode_lower(device_pub),
+            }),
+        )?;
+        if st != 200 {
+            // Enforce entitlement for local images without echoing untrusted issue bodies.
+            match st {
+                401 => bail!("CTF issue requires valid credentials; log in again or check --token"),
+                403 => bail!("CTF issue requires an active membership"),
+                409 => bail!("CTF issue HTTP 409: already solved; not re-issuing"),
+                503 => bail!("CTF billing or firmware artifact unavailable; try again later"),
+                _ => bail!("CTF issue HTTP {st}"),
+            }
+        }
+        let JsonObject(issued) =
+            serde_json::from_str::<JsonObject<IssueBody>>(&body).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid ciphertext-only CTF issue response; update the API and CLI together"
+                )
+            })?;
+        issued.validate(slug, device_pub)?;
+        Ok(issued)
+    }
+
+    fn submit(&self, challenge: &str, flag: &str) -> Result<SubmitBody> {
+        self.require_token()?;
+        check_slug(challenge)?;
+        let url = format!("{}/v1/submit", self.url);
+        let (st, body) = send_json(
+            self.authed(Self::agent().post(&url)),
+            serde_json::json!({ "challenge": challenge, "flag": flag }),
+        )?;
+        if st == 200 {
+            return serde_json::from_str(&body)
+                .map_err(|_| anyhow::anyhow!("invalid CTF submit response"));
+        }
+        bail!("{}", api_error(st, &body));
+    }
+}
+
 pub(crate) fn pick(flag: Option<String>, keys: &[&str]) -> Option<String> {
     if let Some(s) = flag {
         let s = s.trim().to_string();
@@ -214,6 +508,16 @@ pub(crate) fn pick(flag: Option<String>, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn api_error(status: u16, _body: &str) -> String {
+    match status {
+        401 => "CTF server HTTP 401: invalid credentials; log in again or check --token".into(),
+        403 => "CTF server HTTP 403: access denied; check your membership".into(),
+        429 => "CTF server HTTP 429: rate limited; try again later".into(),
+        503 => "CTF server HTTP 503: service unavailable; try again later".into(),
+        _ => format!("CTF server HTTP {status}"),
+    }
 }
 
 fn check_slug(s: &str) -> Result<()> {
@@ -480,6 +784,247 @@ fn validate_firmware(firmware: &Firmware) -> Result<Url> {
     firmware_url(&firmware.url)
 }
 
+#[derive(Debug)]
+struct DownloadedFirmware {
+    dir: PathBuf,
+    bin: PathBuf,
+}
+
+impl Drop for DownloadedFirmware {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl DownloadedFirmware {
+    fn new() -> Result<Self> {
+        let mut random = [0u8; 16];
+        OsRng.fill_bytes(&mut random);
+        let dir =
+            std::env::temp_dir().join(format!("infishark-ctf-{}", hex::encode_lower(&random)));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .context("create private firmware download directory")?;
+        Ok(Self {
+            bin: dir.join("firmware.bin"),
+            dir,
+        })
+    }
+}
+
+fn firmware_redirect(url: &Url, location: &str) -> Result<Url> {
+    if signed_firmware_url(url) {
+        bail!("signed firmware redirects are not allowed");
+    }
+    let next = url
+        .join(location)
+        .map_err(|_| anyhow::anyhow!("invalid firmware redirect"))?;
+    let next = firmware_url(next.as_str())?;
+    if url.scheme() == "https" && next.scheme() != "https" {
+        bail!("firmware redirect cannot downgrade HTTPS");
+    }
+    if signed_firmware_url(&next) {
+        bail!("public firmware cannot redirect to signed firmware; request a grant");
+    }
+    Ok(next)
+}
+
+fn download_firmware(firmware: &Firmware) -> Result<DownloadedFirmware> {
+    let url = validate_firmware(firmware)?;
+    let signed = signed_firmware_url(&url);
+    if signed {
+        bail!("signed firmware download requires a validated CTF firmware grant");
+    }
+    download_firmware_from(firmware, url, true)
+}
+
+fn download_firmware_from(
+    firmware: &Firmware,
+    mut url: Url,
+    allow_redirects: bool,
+) -> Result<DownloadedFirmware> {
+    // This separate, unauthenticated agent must never inherit API credentials.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout(Duration::from_secs(90))
+        .build();
+    let mut redirects = 0;
+    let response = loop {
+        let response = match agent.get(url.as_str()).set("User-Agent", UA).call() {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            // ureq's transport errors embed the full URL, including its signature.
+            Err(_) => {
+                bail!("CTF firmware download failed; check your connection or request a new grant")
+            }
+        };
+        match response.status() {
+            200 => break response,
+            301 | 302 | 303 | 307 | 308 => {
+                if !allow_redirects {
+                    bail!("signed firmware redirects are not allowed");
+                }
+                if redirects == 5 {
+                    bail!("too many firmware redirects");
+                }
+                let location = response
+                    .header("Location")
+                    .context("firmware redirect missing Location")?;
+                url = firmware_redirect(&url, location)?;
+                redirects += 1;
+            }
+            status => bail!("firmware download HTTP {status}; expected 200"),
+        }
+    };
+    store_firmware(firmware, response.into_reader(), DownloadedFirmware::new()?)
+}
+
+fn store_firmware(
+    firmware: &Firmware,
+    reader: impl Read,
+    download: DownloadedFirmware,
+) -> Result<DownloadedFirmware> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&download.bin)
+        .context("create firmware download file")?;
+    let mut reader = reader.take(firmware.size_bytes + 1);
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        // Stream errors can also carry transport details; discard their sources.
+        let n = reader
+            .read(&mut buf)
+            .map_err(|_| anyhow::anyhow!("could not read CTF firmware"))?;
+        if n == 0 {
+            break;
+        }
+        count += n as u64;
+        if count > firmware.size_bytes {
+            bail!(
+                "firmware size mismatch: expected {} bytes, received more",
+                firmware.size_bytes
+            );
+        }
+        hash.update(&buf[..n]);
+        file.write_all(&buf[..n]).context("write CTF firmware")?;
+    }
+    if count != firmware.size_bytes {
+        bail!(
+            "firmware size mismatch: expected {} bytes, got {count}",
+            firmware.size_bytes
+        );
+    }
+    let actual = hex::encode_lower(&hash.finalize());
+    if actual != firmware.sha256 {
+        bail!(
+            "firmware SHA-256 mismatch: expected {}, got {actual}",
+            firmware.sha256
+        );
+    }
+    file.flush().context("flush CTF firmware")?;
+    drop(file);
+    Ok(download)
+}
+
+#[derive(Debug, PartialEq)]
+struct StartSpec {
+    slug: Option<String>,
+    bin: Option<PathBuf>,
+}
+
+fn looks_like_bin(s: &str) -> bool {
+    Path::new(s).is_file() || s.ends_with(".bin") || s.ends_with(".BIN")
+}
+
+fn resolve_start(target: &str, bin: Option<&Path>, local: bool) -> Result<StartSpec> {
+    if looks_like_bin(target) {
+        if let Some(extra) = bin {
+            bail!("unexpected extra path {}", extra.display());
+        }
+        if local {
+            return Ok(StartSpec {
+                slug: None,
+                bin: Some(PathBuf::from(target)),
+            });
+        }
+        bail!(
+            "pass a challenge slug: infishark ctf start <slug> [bin]\n       or --local to skip the server"
+        );
+    }
+    check_slug(target)?;
+    if local && bin.is_none() {
+        bail!("--local requires a .bin: infishark ctf start {target} <bin> --local");
+    }
+    Ok(StartSpec {
+        slug: Some(target.to_string()),
+        bin: bin.map(Path::to_path_buf),
+    })
+}
+
+#[derive(Debug)]
+struct PreparedStart {
+    bin: PathBuf,
+    _download: Option<DownloadedFirmware>,
+    firmware: Option<Firmware>,
+    api: Option<Api>,
+}
+
+fn prepare_start(spec: &StartSpec, local: bool, opts: &ApiOpts) -> Result<PreparedStart> {
+    let api = if local {
+        None
+    } else {
+        Some(Api::authorized(opts)?)
+    };
+    if let Some(api) = &api {
+        api.require_token()?;
+    }
+    let mut firmware = None;
+    let mut download = None;
+    let bin = match &spec.bin {
+        Some(path) => path.clone(),
+        None => {
+            let api = api
+                .as_ref()
+                .context("firmware grant requires the CTF server")?;
+            let slug = spec.slug.as_deref().context("missing challenge slug")?;
+            let grant = api.firmware_grant(slug)?;
+            // Recheck expiry immediately before the artifact request.
+            let url = grant.validate(slug)?;
+            log::info(format!(
+                "downloading {slug} v{} ({} bytes)...",
+                grant.firmware.version, grant.firmware.size_bytes
+            ));
+            let image = if grant.expires_at.is_some() {
+                download_firmware_from(&grant.firmware, url, false)?
+            } else {
+                download_firmware(&grant.firmware)?
+            };
+            let path = image.bin.clone();
+            download = Some(image);
+            firmware = Some(grant.into_report());
+            log::ok("firmware size and SHA-256 verified");
+            path
+        }
+    };
+    flash::require_bin(&bin)?;
+    // Issuance must wait for the active post-flash boot key, not the old image.
+    Ok(PreparedStart {
+        bin,
+        _download: download,
+        firmware,
+        api,
+    })
+}
+
 pub fn gen_flag() -> String {
     let mut b = [0u8; 8];
     OsRng.fill_bytes(&mut b);
@@ -626,6 +1171,91 @@ mod download_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn serve_once(status: u16, body: &str) -> String {
+        serve_response(status, body).0
+    }
+
+    fn serve_response(status: u16, body: &str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let worker = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 8192];
+            let header_end = loop {
+                let n = s.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let n = s.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                404 => "Not Found",
+                409 => "Conflict",
+                _ => "X",
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(resp.as_bytes());
+            let _ = s.flush();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{addr}"), worker)
+    }
+
+    #[test]
+    fn malformed_success_responses_do_not_echo_provider_values() {
+        let secret = "flag{private-provider-value}";
+        for (kind, body) in [
+            (
+                "catalog",
+                format!(
+                    r#"[{{"slug":"gate","title":"Gate","difficulty":"easy","firmware":{{"version":"{secret}","url":"https://example.com/image","sha256":"","size_bytes":1}}}}]"#
+                ),
+            ),
+            (
+                "hint",
+                format!(r#"{{"challenge":"gate","level":"{secret}","total":1,"text":"hint"}}"#),
+            ),
+            ("submit", format!(r#"{{"ok":"{secret}","already":false}}"#)),
+        ] {
+            let (url, worker) = serve_response(200, &body);
+            let api = Api::at(&url, "synthetic-token", "player");
+            let error = match kind {
+                "catalog" => api.challenges().unwrap_err(),
+                "hint" => api.hint("gate", 1).unwrap_err(),
+                "submit" => api.submit("gate", "flag{synthetic}").unwrap_err(),
+                _ => unreachable!(),
+            };
+            worker.join().unwrap();
+            assert_eq!(format!("{error:#}"), format!("invalid CTF {kind} response"));
+            assert!(!format!("{error:#}").contains(secret));
+        }
+    }
 
     #[test]
     fn gen_flag_shape() {
@@ -699,6 +1329,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_start_slug_and_local_bin() {
+        let spec = resolve_start("flag_gatt", Some(Path::new("firmware.bin")), false).unwrap();
+        assert_eq!(
+            spec,
+            StartSpec {
+                slug: Some("flag_gatt".into()),
+                bin: Some(PathBuf::from("firmware.bin")),
+            }
+        );
+        let spec = resolve_start("firmware.bin", None, true).unwrap();
+        assert_eq!(
+            spec,
+            StartSpec {
+                slug: None,
+                bin: Some(PathBuf::from("firmware.bin")),
+            }
+        );
+        assert_eq!(
+            resolve_start("gate", None, false).unwrap(),
+            StartSpec {
+                slug: Some("gate".into()),
+                bin: None,
+            }
+        );
+        assert!(resolve_start("firmware.bin", None, false).is_err());
+        assert!(resolve_start("flag_gatt", None, true).is_err());
+        assert!(resolve_start("firmware.bin", Some(Path::new("a.bin")), true).is_err());
+        assert!(resolve_start("nope!", Some(Path::new("a.bin")), false).is_err());
+    }
+
+    #[test]
     fn check_slug_rejects_junk() {
         check_slug("flag_gatt").unwrap();
         check_slug("gate").unwrap();
@@ -742,5 +1403,218 @@ mod tests {
             invalid[field] = value;
             assert!(box_hello(&invalid, None).is_err());
         }
+    }
+
+    #[test]
+    fn issue_response_rejects_legacy_extras_mismatches_and_malformed_envelopes() {
+        let key = [9; 32];
+        let load = seal(&key, "gate", b"flag{test}").unwrap();
+        let valid = issue_fixture(&key, &load);
+        let decode = |value: &serde_json::Value| -> Result<IssueBody> {
+            let JsonObject(body) = serde_json::from_value::<JsonObject<IssueBody>>(value.clone())?;
+            body.validate("gate", &key)?;
+            Ok(body)
+        };
+        decode(&valid).unwrap();
+        assert!(
+            decode(&serde_json::json!([
+                1,
+                "gate",
+                hex::encode_lower(&key),
+                false,
+                valid["load"]
+            ]))
+            .is_err()
+        );
+        assert!(decode(&serde_json::json!({"flag": "flag{legacy}", "reused": false})).is_err());
+        for (field, value) in [
+            ("proto", serde_json::json!(1)),
+            ("proto", serde_json::json!(true)),
+            ("challenge", serde_json::json!("flag_gatt")),
+            ("device_pub", serde_json::json!("00".repeat(32))),
+            ("reused", serde_json::json!(1)),
+            ("flag", serde_json::json!("flag{legacy}")),
+            ("load", serde_json::json!(null)),
+            (
+                "load",
+                serde_json::json!([
+                    valid["load"]["pub"],
+                    valid["load"]["n"],
+                    valid["load"]["ct"]
+                ]),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(decode(&invalid).is_err());
+        }
+        for (field, value) in [
+            ("pub", serde_json::json!("aa")),
+            ("pub", serde_json::json!("00".repeat(32))),
+            (
+                "pub",
+                serde_json::json!(
+                    load_json(&load)["pub"]
+                        .as_str()
+                        .unwrap()
+                        .to_ascii_uppercase()
+                ),
+            ),
+            ("n", serde_json::json!("00".repeat(11))),
+            ("n", serde_json::json!("00".repeat(13))),
+            ("ct", serde_json::json!("00".repeat(16))),
+            ("ct", serde_json::json!("00".repeat(MAX_FLAG_BYTES + 17))),
+            ("ct", serde_json::json!("a".repeat(35))),
+            ("ct", serde_json::json!("g".repeat(40))),
+            ("flag", serde_json::json!("flag{legacy}")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["load"][field] = value;
+            assert!(decode(&invalid).is_err());
+        }
+        for bytes in [17, MAX_FLAG_BYTES + 16] {
+            let mut boundary = valid.clone();
+            boundary["load"]["ct"] = serde_json::json!("00".repeat(bytes));
+            decode(&boundary).unwrap(); // Authentication is the box's job, not the relay's.
+        }
+        let duplicate = valid.to_string().replacen("{", "{\"proto\":1,", 1);
+        assert!(serde_json::from_str::<JsonObject<IssueBody>>(&duplicate).is_err());
+        let nested_duplicate = valid.to_string().replace(
+            &valid["load"].to_string(),
+            &valid["load"]
+                .to_string()
+                .replacen("{", "{\"n\":\"000000000000000000000000\",", 1),
+        );
+        assert!(serde_json::from_str::<JsonObject<IssueBody>>(&nested_duplicate).is_err());
+    }
+
+    #[test]
+    fn issue_errors_never_echo_plaintext_or_envelope_values() {
+        let key = [9; 32];
+        let load = seal(&key, "gate", b"flag{must-not-escape}").unwrap();
+        let valid = issue_fixture(&key, &load);
+        let mut extra = valid.clone();
+        extra["reused"] = serde_json::json!("flag{must-not-escape}");
+        let positional =
+            serde_json::json!([1, "gate", hex::encode_lower(&key), false, valid["load"]]);
+        let mut nested_positional = valid.clone();
+        nested_positional["load"] = serde_json::json!([
+            valid["load"]["pub"],
+            valid["load"]["n"],
+            valid["load"]["ct"]
+        ]);
+        for (status, body) in [
+            (
+                200,
+                r#"{"flag":"flag{must-not-escape}","reused":false}"#.into(),
+            ),
+            (200, extra.to_string()),
+            (200, positional.to_string()),
+            (200, nested_positional.to_string()),
+            (400, r#"{"flag":"flag{must-not-escape}"}"#.into()),
+            (502, issue_fixture(&key, &load).to_string()),
+        ] {
+            let url = serve_once(status, &body);
+            let error = format!(
+                "{:#}",
+                Api::at(&url, "tok", "alice")
+                    .issue("gate", &key)
+                    .unwrap_err()
+            );
+            for value in [
+                "must-not-escape",
+                &hex::encode_lower(&load.ct),
+                &hex::encode_lower(&key),
+            ] {
+                assert!(!error.contains(value), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn low_order_keys_fail_before_issue_or_local_encryption() {
+        let api = Api::at("http://127.0.0.1:1", "tok", "alice");
+        let mut one = [0; 32];
+        one[0] = 1;
+        for key in [[0; 32], one] {
+            assert!(
+                api.issue("gate", &key)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid CTF public key")
+            );
+            assert!(seal(&key, "gate", b"flag{local}").is_err());
+        }
+    }
+
+    #[test]
+    fn api_challenges_and_issue_and_submit() {
+        let url = serve_once(
+            200,
+            r#"[{"slug":"gate","title":"Write then notify","difficulty":"medium"}]"#,
+        );
+        let api = Api::at(&url, "tok", "alice");
+        let list = api.challenges().unwrap();
+        assert_eq!(list[0].slug, "gate");
+
+        let device_sk = StaticSecret::random_from_rng(OsRng);
+        let device_pub = PublicKey::from(&device_sk).to_bytes();
+        let flag = b"flag{ish-deadbeefcafebabe}";
+        let load = seal(&device_pub, "gate", flag).unwrap();
+        let envelope = issue_fixture(&device_pub, &load);
+        let (url, worker) = serve_response(200, &envelope.to_string());
+        let api = Api::at(&url, "tok", "alice");
+        let issued = api.issue("gate", &device_pub).unwrap();
+        assert!(!issued.reused);
+        assert_eq!(
+            serde_json::to_value(&issued.load).unwrap(),
+            load_json(&load)
+        );
+        assert_eq!(unseal(&device_sk, "gate", &load).unwrap(), flag);
+        let request = worker.join().unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.starts_with("post /v1/challenges/gate/issue "));
+        assert!(headers.contains("authorization: bearer tok"));
+        assert!(headers.contains("x-user: alice"));
+        assert!(headers.contains("content-type: application/json"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({
+                "proto": 2,
+                "device_pub": hex::encode_lower(&device_pub),
+            })
+        );
+        assert!(!serde_json::to_string(&issued).unwrap().contains("flag"));
+
+        let url = serve_once(409, "already solved; not re-issuing");
+        let api = Api::at(&url, "tok", "alice");
+        let err = api.issue("gate", &device_pub).unwrap_err().to_string();
+        assert!(err.contains("already solved"), "{err}");
+
+        let url = serve_once(200, r#"{"ok":false,"already":false}"#);
+        let api = Api::at(&url, "tok", "alice");
+        let body = api.submit("gate", "flag{ish-deadbeefcafebabe}").unwrap();
+        assert!(!body.ok);
+
+        let url = serve_once(401, "bad token private-provider-body\u{1b}[2J");
+        let api = Api::at(&url, "nope", "alice");
+        let err = api.submit("gate", "flag{x}").unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 401") && err.contains("invalid credentials"),
+            "{err}"
+        );
+        assert!(!err.contains("private-provider-body") && !err.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn api_requires_token() {
+        let api = Api {
+            url: "http://127.0.0.1:1".into(),
+            token: None,
+            user: "alice".into(),
+        };
+        let err = api.issue("gate", &[9; 32]).unwrap_err().to_string();
+        assert!(err.contains("INFISHARK_CTF_TOKEN"), "{err}");
     }
 }
