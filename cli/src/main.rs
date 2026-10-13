@@ -24,6 +24,7 @@ mod tx;
 mod ui;
 mod vendors;
 mod wifi_analysis;
+mod wifi_mitm;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -665,6 +666,86 @@ enum WifiCmd {
         /// Host body wait timeout in ms (host-content mode).
         #[arg(long)]
         host_timeout_ms: Option<u32>,
+    },
+    /// Route clients through the Nano and watch DNS, flows, or captive HTTP.
+    /// With no name, ask for one. Leave that prompt blank to scan.
+    Mitm {
+        /// SoftAP name clients see. Omit to type one.
+        ssid: Option<String>,
+        /// SoftAP passphrase. WPA2 when set (8-63). Omit to be asked; blank is
+        /// open.
+        #[arg(long)]
+        pass: Option<String>,
+        /// Deauth the upstream so its clients rejoin this AP.
+        /// The SoftAP name must already match that network.
+        #[arg(long)]
+        steer: bool,
+        /// Hide the SSID.
+        #[arg(long)]
+        hidden: bool,
+        /// Max associated clients (1-10).
+        #[arg(long, default_value_t = 4)]
+        max_clients: u8,
+        /// Upstream saved-network slot.
+        #[arg(long, conflicts_with_all = ["upstream_ssid", "upstream_none"])]
+        upstream_index: Option<u8>,
+        /// Upstream SSID, instead of a saved slot.
+        #[arg(long, conflicts_with = "upstream_none")]
+        upstream_ssid: Option<String>,
+        /// Password for --upstream-ssid. Empty means open. Prompted if omitted.
+        #[arg(long, requires = "upstream_ssid")]
+        upstream_pass: Option<String>,
+        /// No upstream. The access point is an island on --channel.
+        #[arg(long)]
+        upstream_none: bool,
+        /// Channel 1-13. Only with --upstream-none.
+        #[arg(long)]
+        channel: Option<u8>,
+        /// forward, captive, or static.
+        #[arg(long)]
+        dns: Option<String>,
+        /// Resolver offered when --dns static.
+        #[arg(long)]
+        dns_server: Option<String>,
+        /// Log DNS names.
+        #[arg(long)]
+        dns_log: bool,
+        /// Hold DNS questions so a script can allow, drop, or replace them.
+        /// This command auto-allows.
+        #[arg(long)]
+        intercept_dns: bool,
+        /// Hold budget in ms. Default 500 when intercept is on.
+        #[arg(long)]
+        intercept_timeout_ms: Option<u32>,
+        /// off or portal.
+        #[arg(long, default_value = "off")]
+        http: String,
+        /// Captive HTTP wait, ms.
+        #[arg(long, default_value_t = 15000)]
+        host_timeout_ms: u32,
+        /// Drop this client MAC. Repeat up to 10 times.
+        #[arg(long)]
+        block: Vec<String>,
+        /// Rewrite name=a.b.c.d. Repeat up to 8 times. Forward DNS only.
+        #[arg(long)]
+        rewrite: Vec<String>,
+        /// Watch ip:port or ip:port/in|out|both. Repeat up to 4 times.
+        #[arg(long)]
+        watch: Vec<String>,
+        /// Bytes of each watched packet to keep (1-180).
+        #[arg(long, default_value_t = 64)]
+        watch_bytes: u8,
+        /// Write events as JSON lines.
+        #[arg(long)]
+        capture: Option<String>,
+        /// Print AP, DHCP, and routing diagnostics (new firmware needed for
+        /// DHCP counters).
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// Override the pcap path. The default is `<datetime>.pcap` in the
+        /// current directory. Not a monitor capture.
+        #[arg(long)]
+        pcap: Option<String>,
     },
 }
 
@@ -1892,7 +1973,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
         // Handshake blocks on next_wifi_frame until crackable/timeout/Ctrl-C.
         WifiCmd::Handshake { .. } => cli.timeout_ms.max(3_600_000),
         // Host-streamed portal waits on phone GETs between serial timeouts.
-        WifiCmd::Portal { .. } => cli.timeout_ms.max(3_600_000),
+        WifiCmd::Portal { .. } | WifiCmd::Mitm { .. } => cli.timeout_ms.max(3_600_000),
         _ => cli.timeout_ms,
     };
     let mut dev = cli.open(timeout)?;
@@ -2219,6 +2300,97 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             },
             oui_db,
         ),
+        WifiCmd::Mitm {
+            ssid,
+            pass,
+            steer,
+            hidden,
+            max_clients,
+            upstream_index,
+            upstream_ssid,
+            upstream_pass,
+            upstream_none,
+            channel,
+            dns,
+            dns_server,
+            dns_log,
+            intercept_dns,
+            intercept_timeout_ms,
+            http,
+            host_timeout_ms,
+            block,
+            rewrite,
+            watch,
+            watch_bytes,
+            capture,
+            verbose,
+            pcap,
+        } => {
+            use infishark::wifi_mitm::{WifiDnsMode, WifiHttpMode};
+            let session = wifi_mitm::resolve(
+                &mut dev,
+                ssid.clone(),
+                pass.clone(),
+                *upstream_index,
+                upstream_ssid.clone(),
+                upstream_pass.clone(),
+                *upstream_none,
+                *channel,
+                *steer,
+                cli.json,
+            )?;
+            let dns = match dns.as_deref() {
+                None => None,
+                Some("forward") => Some(WifiDnsMode::Forward),
+                Some("captive") => Some(WifiDnsMode::Captive),
+                Some("static") => Some(WifiDnsMode::Static),
+                Some(other) => bail!("unknown --dns {other}"),
+            };
+            let http = match http.as_str() {
+                "off" => WifiHttpMode::Off,
+                "portal" => WifiHttpMode::Portal,
+                other => bail!("unknown --http {other}"),
+            };
+            wifi_mitm::run(
+                dev,
+                wifi_mitm::Opts {
+                    ssid: session.ssid,
+                    pass: session.pass,
+                    steer: session.steer,
+                    pass_from_upstream: session.pass_from_upstream,
+                    hidden: *hidden,
+                    max_clients: *max_clients,
+                    upstream: session.upstream,
+                    dns,
+                    dns_server: dns_server
+                        .as_deref()
+                        .map(|s| s.parse())
+                        .transpose()
+                        .map_err(|_| anyhow::anyhow!("bad --dns-server"))?,
+                    dns_log: *dns_log,
+                    intercept: *intercept_dns,
+                    intercept_ms: *intercept_timeout_ms,
+                    http,
+                    host_timeout_ms: *host_timeout_ms,
+                    block: block
+                        .iter()
+                        .map(|m| wifi_mitm::parse_block(m))
+                        .collect::<Result<Vec<_>>>()?,
+                    rewrite: rewrite
+                        .iter()
+                        .map(|r| wifi_mitm::parse_rewrite(r))
+                        .collect::<Result<Vec<_>>>()?,
+                    watch: watch
+                        .iter()
+                        .map(|w| wifi_mitm::parse_watch(w))
+                        .collect::<Result<Vec<_>>>()?,
+                    watch_bytes: *watch_bytes,
+                    capture: capture.clone(),
+                    verbose: *verbose,
+                    pcap_path: pcap.clone(),
+                },
+            )
+        }
         WifiCmd::Portal {
             dir,
             ssid,
