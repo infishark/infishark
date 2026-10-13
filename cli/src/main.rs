@@ -216,6 +216,24 @@ enum FlashCmd {
         #[command(flatten)]
         ch: FlashChannel,
     },
+    /// Write a local .bin at the selected offset (defaults to the app
+    /// partition).
+    Write {
+        /// Path to the application image.
+        bin: PathBuf,
+        /// App-partition offset (hex like 0x10000 or decimal). Defaults to
+        /// 0x10000.
+        #[arg(long)]
+        offset: Option<String>,
+        /// Skip the confirm prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Restore stock firmware (same as `flash latest`).
+    Restore {
+        #[command(flatten)]
+        ch: FlashChannel,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1311,6 +1329,14 @@ fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
                 keep_storage: *keep_storage,
             }),
             Some(FlashCmd::Install { tag, ch }) => flash_install(cli, tag.clone(), ch.beta, ch.yes),
+            Some(FlashCmd::Write { bin, offset, yes }) => flash::write_local(flash::Write {
+                bin: bin.clone(),
+                offset: offset.clone(),
+                yes: *yes,
+                json: cli.json,
+                port: cli.port.clone(),
+            }),
+            Some(FlashCmd::Restore { ch }) => flash_install(cli, "latest", ch.beta, ch.yes),
         },
     }
 }
