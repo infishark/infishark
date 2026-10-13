@@ -641,6 +641,9 @@ enum WifiCmd {
         /// Directory of pages (index.html at /). Host-streams bodies over USB.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Print request headers, arguments, and full event details.
+        #[arg(long, short = 'v')]
+        verbose: bool,
         /// SoftAP SSID (default: device settings, usually "Portal").
         #[arg(long)]
         ssid: Option<String>,
@@ -2478,6 +2481,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
         }
         WifiCmd::Portal {
             dir,
+            verbose,
             ssid,
             pass,
             channel,
@@ -2506,7 +2510,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 detailed_capture: detailed_capture.then_some(true),
                 host_timeout_ms: *host_timeout_ms,
             };
-            portal::run(dev, dir.clone(), opts)
+            portal::run(dev, dir.clone(), opts, *verbose)
         }
     }
 }
@@ -4508,5 +4512,27 @@ mod qol_tests {
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(all).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn portal_verbose_is_opt_in() {
+        let cli = Cli::try_parse_from(["infishark", "wifi", "portal"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Wifi {
+                action: WifiCmd::Portal { verbose: false, .. },
+                ..
+            })
+        ));
+        for flag in ["--verbose", "-v"] {
+            let cli = Cli::try_parse_from(["infishark", "wifi", "portal", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Wifi {
+                    action: WifiCmd::Portal { verbose: true, .. },
+                    ..
+                })
+            ));
+        }
     }
 }

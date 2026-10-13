@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use infishark::protocol;
 use infishark::{Device, PortalOpts};
 
-pub fn run(mut dev: Device, dir: Option<PathBuf>, opts: PortalOpts) -> Result<()> {
+pub fn run(mut dev: Device, dir: Option<PathBuf>, opts: PortalOpts, verbose: bool) -> Result<()> {
     dev.set_read_timeout(std::time::Duration::from_millis(300))?;
     let root = if let Some(dir) = dir {
         let root = dir
@@ -24,7 +24,13 @@ pub fn run(mut dev: Device, dir: Option<PathBuf>, opts: PortalOpts) -> Result<()
     crate::signals::install_sigint();
     crate::signals::RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    let eff = dev.wifi_portal_start(&opts)?;
+    let eff = match dev.wifi_portal_start(&opts) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = dev.stop_current_task();
+            return Err(e.into());
+        }
+    };
     print_effective(&eff, root.as_ref());
 
     loop {
@@ -34,13 +40,16 @@ pub fn run(mut dev: Device, dir: Option<PathBuf>, opts: PortalOpts) -> Result<()
         match dev.next_event() {
             Ok((id, payload)) if id == protocol::EVT_PORTAL_REQUEST => {
                 if let Some(root) = &root {
-                    if let Err(e) = handle_request(&mut dev, root, &payload) {
+                    if let Err(e) = handle_request(&mut dev, root, &payload, verbose) {
                         eprintln!("  portal request: {e:#}");
                     }
                 } else {
-                    // On-device HTML; still log the rich request snapshot.
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                        eprintln!("  event: {v}");
+                        if verbose {
+                            eprintln!("  event: {v}");
+                        } else {
+                            eprintln!("{}", request_summary(&v, None));
+                        }
                     }
                 }
             }
@@ -81,12 +90,85 @@ fn print_effective(eff: &serde_json::Value, root: Option<&PathBuf>) {
     }
 }
 
-fn handle_request(dev: &mut Device, root: &Path, payload: &[u8]) -> Result<()> {
+fn handle_request(dev: &mut Device, root: &Path, payload: &[u8], verbose: bool) -> Result<()> {
     let v: serde_json::Value = serde_json::from_slice(payload)?;
     let req_id = v
         .get("id")
         .and_then(|x| x.as_u64())
         .ok_or_else(|| anyhow::anyhow!("missing id"))? as u16;
+    let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("GET");
+    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("/");
+    if verbose {
+        print_request_details(&v, req_id);
+    }
+
+    let response = match method {
+        "GET" => match resolve_file(root, path) {
+            Some((file, ctype)) => {
+                let body = fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+                dev.portal_resp_body(req_id, 200, ctype, &body)?;
+                if verbose {
+                    eprintln!("    -> {} ({} bytes)", file.display(), body.len());
+                }
+                (200, body.len())
+            }
+            None => {
+                let body = b"not found";
+                dev.portal_resp_body(req_id, 404, "text/plain", body)?;
+                if verbose {
+                    eprintln!("    -> 404");
+                }
+                (404, body.len())
+            }
+        },
+        "HEAD" => match resolve_file(root, path) {
+            Some((file, ctype)) => {
+                let len = fs::metadata(&file).map(|m| m.len()).unwrap_or(0) as u32;
+                dev.portal_resp_chunk(req_id, 0, len, 200, ctype, &[])?;
+                if verbose {
+                    eprintln!("    -> {} (HEAD, {len} bytes)", file.display());
+                }
+                (200, 0)
+            }
+            None => {
+                dev.portal_resp_body(req_id, 404, "text/plain", &[])?;
+                if verbose {
+                    eprintln!("    -> 404");
+                }
+                (404, 0)
+            }
+        },
+        _ => {
+            let body = b"method not allowed";
+            dev.portal_resp_body(req_id, 405, "text/plain", body)?;
+            if verbose {
+                eprintln!("    -> 405 (static dir serves GET/HEAD only)");
+            }
+            (405, body.len())
+        }
+    };
+    if !verbose {
+        eprintln!("{}", request_summary(&v, Some(response)));
+    }
+    Ok(())
+}
+
+fn request_summary(v: &serde_json::Value, response: Option<(u16, usize)>) -> String {
+    let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("GET");
+    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("/");
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+    let end = match response {
+        Some((status, bytes)) => format!(" -> {status} ({bytes} bytes, id={id})"),
+        None => format!(" (id={id})"),
+    };
+    format!("  {} {}{end}", method.escape_debug(), path.escape_debug())
+}
+
+fn print_request_details(v: &serde_json::Value, req_id: u16) {
     let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("GET");
     let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("/");
     let request_line = v.get("request_line").and_then(|x| x.as_str());
@@ -131,36 +213,6 @@ fn handle_request(dev: &mut Device, root: &Path, payload: &[u8]) -> Result<()> {
         }
     }
     eprintln!("    event: {v}");
-
-    match method {
-        "GET" => match resolve_file(root, path) {
-            Some((file, ctype)) => {
-                let body = fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-                dev.portal_resp_body(req_id, 200, ctype, &body)?;
-                eprintln!("    -> {} ({} bytes)", file.display(), body.len());
-            }
-            None => {
-                dev.portal_resp_body(req_id, 404, "text/plain", b"not found")?;
-                eprintln!("    -> 404");
-            }
-        },
-        "HEAD" => match resolve_file(root, path) {
-            Some((file, ctype)) => {
-                let len = fs::metadata(&file).map(|m| m.len()).unwrap_or(0) as u32;
-                dev.portal_resp_chunk(req_id, 0, len, 200, ctype, &[])?;
-                eprintln!("    -> {} (HEAD, {len} bytes)", file.display());
-            }
-            None => {
-                dev.portal_resp_body(req_id, 404, "text/plain", &[])?;
-                eprintln!("    -> 404");
-            }
-        },
-        _ => {
-            dev.portal_resp_body(req_id, 405, "text/plain", b"method not allowed")?;
-            eprintln!("    -> 405 (static dir serves GET/HEAD only)");
-        }
-    }
-    Ok(())
 }
 
 fn resolve_file(root: &Path, req_path: &str) -> Option<(PathBuf, &'static str)> {
@@ -225,5 +277,27 @@ mod tests {
     fn resolve_rejects_parent_components() {
         let root = PathBuf::from("/tmp");
         assert!(resolve_file(&root, "/../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn compact_request_summarizes_response_without_event_details() {
+        let request = serde_json::json!({
+            "id": 7,
+            "method": "GET",
+            "path": "/app.js",
+            "headers": { "Accept": "*/*" },
+            "args": { "example": "detail" },
+        });
+        assert_eq!(
+            request_summary(&request, Some((200, 123))),
+            "  GET /app.js -> 200 (123 bytes, id=7)"
+        );
+        assert_eq!(request_summary(&request, None), "  GET /app.js (id=7)");
+    }
+
+    #[test]
+    fn compact_request_keeps_control_characters_on_one_line() {
+        let request = serde_json::json!({ "id": 8, "path": "/one\ntwo" });
+        assert_eq!(request_summary(&request, None), "  GET /one\\ntwo (id=8)");
     }
 }
