@@ -1,6 +1,9 @@
 mod adapter;
 mod bridge;
 mod crack;
+mod ctf;
+mod ctf_account;
+mod ctf_http;
 mod deauth;
 mod flash;
 mod fwota;
@@ -165,6 +168,24 @@ enum Command {
         #[command(subcommand)]
         action: Option<FlashCmd>,
     },
+    /// Hardware CTF.
+    Ctf {
+        #[command(subcommand)]
+        action: CtfCmd,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct CtfApiOpts {
+    /// CTF API base (default https://ctf.infishark.com).
+    #[arg(long)]
+    url: Option<String>,
+    /// Override the saved account token (or INFISHARK_CTF_TOKEN / CTF_TOKEN).
+    #[arg(long)]
+    token: Option<String>,
+    /// Legacy shared-token player id; ignored for account-token identity.
+    #[arg(long)]
+    user: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,6 +254,23 @@ enum FlashCmd {
     Restore {
         #[command(flatten)]
         ch: FlashChannel,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CtfCmd {
+    /// Register, verify, log in, or manage your CTF account and tokens.
+    Account {
+        #[command(subcommand)]
+        action: crate::ctf_account::Command,
+        /// CTF API base; saved tokens are bound to this exact endpoint.
+        #[arg(long, global = true)]
+        url: Option<String>,
+    },
+    /// Show your account's issued and solved challenges.
+    Stats {
+        #[command(flatten)]
+        api: CtfApiOpts,
     },
 }
 
@@ -1304,6 +1342,14 @@ fn run(cli: &Cli) -> Result<()> {
     }
 }
 
+fn api_opts(api: &CtfApiOpts) -> crate::ctf::ApiOpts {
+    crate::ctf::ApiOpts {
+        url: api.url.clone(),
+        token: api.token.clone(),
+        user: api.user.clone(),
+    }
+}
+
 fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
     match command {
         Command::Ports { all } => ports::run(*all, cli.json),
@@ -1337,6 +1383,12 @@ fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
                 port: cli.port.clone(),
             }),
             Some(FlashCmd::Restore { ch }) => flash_install(cli, "latest", ch.beta, ch.yes),
+        },
+        Command::Ctf { action } => match action {
+            CtfCmd::Account { action, url } => {
+                crate::ctf_account::run(action, url.as_deref(), cli.json)
+            }
+            CtfCmd::Stats { api } => crate::ctf_account::stats(cli.json, api_opts(api)),
         },
     }
 }

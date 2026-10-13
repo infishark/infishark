@@ -1136,6 +1136,123 @@ pub fn prompt_secret(prompt: &str) -> Result<String> {
     term.read_secure_line().context("read account secret")
 }
 
+#[derive(Clone, Copy)]
+pub enum CodeEcho {
+    Visible,
+    Masked,
+}
+
+/// Terminal-only codes, outside history/JSON: signup visible, reset masked with
+/// ASCII dots.
+pub fn prompt_code(prompt: &str, echo: CodeEcho) -> Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
+    use crossterm::{event::DisableBracketedPaste, event::EnableBracketedPaste, execute};
+
+    require_interactive("account codes require an interactive terminal")?;
+    if !Term::stderr().is_term() {
+        bail!("account codes require an interactive terminal on stderr");
+    }
+    anyhow::ensure!(prompt.is_ascii(), "code prompt must be ASCII");
+    struct RestoreTerminal(bool);
+    impl Drop for RestoreTerminal {
+        fn drop(&mut self) {
+            let _ = execute!(std::io::stderr(), DisableBracketedPaste);
+            let _ = std::io::stderr().write_all(b"\r\n");
+            if self.0 {
+                let _ = disable_raw_mode();
+            }
+        }
+    }
+    // Disable echo for the entire prompt so pasted reset-code bytes cannot leak.
+    let restore = !is_raw_mode_enabled()?;
+    enable_raw_mode()?;
+    let _terminal = RestoreTerminal(restore);
+    execute!(std::io::stderr(), EnableBracketedPaste)?;
+    let mut input = String::new();
+    let mut rows = 1;
+    render_code(prompt, &input, echo, &mut rows)?;
+    loop {
+        match event::read().context("read account code")? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('c' | 'd') => bail!("code entry cancelled"),
+                        KeyCode::Char('u') => input.clear(),
+                        // Raw LF is decoded as Ctrl-J; accept it like Enter.
+                        KeyCode::Char('j' | 'm') => return Ok(input.trim().to_string()),
+                        _ => continue,
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Enter => return Ok(input.trim().to_string()),
+                        KeyCode::Esc => bail!("code entry cancelled"),
+                        KeyCode::Backspace => {
+                            input.pop();
+                        }
+                        KeyCode::Char(ch) => append_code(&mut input, &ch.to_string())?,
+                        _ => continue,
+                    }
+                }
+            }
+            // Pasting a trailing newline does not submit or enter a password.
+            Event::Paste(text) => append_code(&mut input, text.trim())?,
+            Event::Resize(_, _) => {}
+            _ => continue,
+        }
+        render_code(prompt, &input, echo, &mut rows)?;
+    }
+}
+
+fn append_code(input: &mut String, text: &str) -> Result<()> {
+    anyhow::ensure!(
+        text.bytes().all(|b| b.is_ascii_graphic() || b == b' '),
+        "code must be a single line of printable ASCII characters"
+    );
+    anyhow::ensure!(input.len() + text.len() <= 256, "code input is too long");
+    input.push_str(text);
+    Ok(())
+}
+
+fn code_display_lines(prompt: &str, input: &str, echo: CodeEcho, width: u16) -> Vec<String> {
+    let value = match echo {
+        CodeEcho::Visible => input.to_string(),
+        CodeEcho::Masked => ".".repeat(input.len()),
+    };
+    // Leave the last column free so backspace/clear handles wrapped lines without
+    // auto-wrap.
+    let display: Vec<_> = format!("{prompt}{value}").chars().collect();
+    display
+        .chunks(usize::from(width.saturating_sub(1).max(1)))
+        .map(|row| row.iter().collect())
+        .collect()
+}
+
+fn render_code(prompt: &str, input: &str, echo: CodeEcho, rows: &mut usize) -> Result<()> {
+    use crossterm::{
+        cursor::{MoveToColumn, MoveUp},
+        execute,
+        terminal::{Clear, ClearType},
+    };
+    let mut out = std::io::stderr();
+    for row in 0..*rows {
+        execute!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        if row + 1 < *rows {
+            execute!(out, MoveUp(1))?;
+        }
+    }
+    let width = crossterm::terminal::size()
+        .map(|(w, _)| w)
+        .ok()
+        .filter(|w| *w > 1)
+        .unwrap_or(80);
+    let lines = code_display_lines(prompt, input, echo, width);
+    *rows = lines.len().max(1);
+    out.write_all(lines.join("\r\n").as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
+
 /// Prompt for a Wi-Fi password (blank = open network).
 pub fn prompt_password(ssid: &str) -> Result<String> {
     prompt_line(&format!("Password for {ssid:?} (blank = open): "))
@@ -1656,6 +1773,7 @@ impl Spinner {
         }
     }
 }
+
 #[cfg(all(test, unix))]
 mod prompt_tests {
     use super::read_fd_line;
@@ -2102,5 +2220,49 @@ mod gatt_row_tests {
         assert!(err.to_string().contains("write all"), "{err}");
         let err = select_gatt(&[], &tok("all"), GattOp::Read).unwrap_err();
         assert!(err.to_string().contains("ble gatt enum"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod code_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn visible_code_feedback_shows_the_entire_value_including_wrapped_input() {
+        let code = format!("ctfv_{}", "a".repeat(64));
+        for width in [20, 40, 80, 120] {
+            let rows = code_display_lines("Verification code: ", &code, CodeEcho::Visible, width);
+            assert_eq!(rows.concat(), format!("Verification code: {code}"));
+            assert!(rows.iter().all(|row| row.len() < usize::from(width)));
+        }
+    }
+
+    #[test]
+    fn reset_feedback_has_one_dot_per_character_and_never_the_code() {
+        let code = format!("ctfr_{}", "b".repeat(64));
+        let rows = code_display_lines("Reset code: ", &code, CodeEcho::Masked, 40);
+        assert_eq!(
+            rows.concat(),
+            format!("Reset code: {}", ".".repeat(code.len()))
+        );
+        assert!(!rows.concat().contains(&code));
+        assert!(!rows.concat().contains("ctfr_"));
+    }
+
+    #[test]
+    fn code_input_is_bounded_and_rejects_control_sequences_without_echoing_them() {
+        let mut code = String::new();
+        append_code(&mut code, "ctfv_").unwrap();
+        append_code(&mut code, &"a".repeat(64)).unwrap();
+        let before = code.clone();
+        for invalid in ["\x1b[31m", "\nextra-line", "\0", "\u{e9}", &"a".repeat(257)] {
+            let error = append_code(&mut code, invalid).unwrap_err();
+            assert_eq!(code, before);
+            assert!(!error.to_string().contains(invalid));
+            assert!(!error.to_string().contains(&before));
+        }
+        let mut maximum = String::new();
+        append_code(&mut maximum, &"x".repeat(256)).unwrap();
+        assert!(append_code(&mut maximum, "x").is_err());
     }
 }

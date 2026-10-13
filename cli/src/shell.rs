@@ -34,6 +34,10 @@ pub fn run(base: &Cli) -> Result<()> {
     let mut sh = Shell::new();
     install_sigint();
     sh.banner(utf8_locale() && !base.no_banner);
+    println!(
+        "{MARGIN}{}\n",
+        style(crate::ctf_account::startup_status()).dim()
+    );
     sh.repl()
 }
 
