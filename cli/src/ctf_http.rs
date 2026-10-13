@@ -1,6 +1,7 @@
 //! Shared CTF JSON transport: bounded responses, no redirects, static errors.
 
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -10,11 +11,17 @@ pub(crate) const USER_AGENT: &str = concat!("infishark-cli/", env!("CARGO_PKG_VE
 pub(crate) const MAX_RESPONSE: u64 = 128 * 1024;
 
 pub(crate) fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(Duration::from_secs(15))
-        .timeout(Duration::from_secs(30))
-        .build()
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    // Clones share the pool. Credentials stay on individual requests.
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout_connect(Duration::from_secs(15))
+                .timeout(Duration::from_secs(30))
+                .build()
+        })
+        .clone()
 }
 
 pub(crate) fn request(req: ureq::Request, body: Option<&Value>) -> Result<ureq::Response> {

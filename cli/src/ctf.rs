@@ -192,7 +192,8 @@ pub struct HintBody {
 
 const CTF_PROTO: u32 = 2;
 const REFLASH_REQUIRED: &str = "CTF firmware identity missing, unknown, or invalid; reflash required with a protocol-2 challenge image";
-const MAX_FLAG_BYTES: usize = 95;
+const MAX_FLAG_BYTES: usize = 95; // CtfSlot has 96 bytes including the trailing NUL.
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct IssueLoad {

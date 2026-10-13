@@ -87,22 +87,36 @@ struct Cli {
 impl Cli {
     fn open(&self, timeout: u64) -> Result<Device> {
         let mut dev = Device::open(self.port.as_deref(), timeout)?;
-        warn_firmware(&mut dev);
+        warn_firmware(&mut dev)?;
         Ok(dev)
     }
 }
 
-fn warn_firmware(dev: &mut Device) {
+fn warn_firmware(dev: &mut Device) -> Result<()> {
+    warn_firmware_with(|| dev.firmware_identity())
+}
+
+fn warn_firmware_with(
+    identity: impl FnOnce() -> infishark::Result<infishark::fw::DeviceFw>,
+) -> Result<()> {
     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+        return Ok(());
     }
-    if let Ok(id) = dev.firmware_identity() {
-        if let Some(w) = id.warning() {
-            log::warn(w);
-            log::info("update with `infishark device update` or `infishark flash latest`");
+    match identity() {
+        Ok(id) => {
+            if id.mode == "ctf" {
+                return Ok(());
+            }
+            if let Some(w) = id.warning() {
+                log::warn(w);
+                log::info("update with `infishark device update` or `infishark flash latest`");
+            }
         }
+        Err(infishark::Error::Interrupted) => return Err(signals::cancelled()),
+        Err(_) => {}
     }
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -1511,10 +1525,11 @@ fn cmd_device(cli: &Cli, action: &DeviceCmd) -> Result<()> {
     if let DeviceCmd::Update { ch } = action {
         return flash_install(cli, "latest", ch.beta, ch.yes);
     }
-    let mut dev = cli.open(cli.timeout_ms)?;
     let v = match action {
         DeviceCmd::Info => {
+            let mut dev = Device::open(cli.port.as_deref(), cli.timeout_ms)?;
             let mut info = dev.device_info()?;
+            warn_firmware_with(|| infishark::fw::DeviceFw::from_info(&info))?;
             if let Some(obj) = info.as_object_mut() {
                 obj.insert(
                     "recommended_firmware".into(),
@@ -1523,7 +1538,7 @@ fn cmd_device(cli: &Cli, action: &DeviceCmd) -> Result<()> {
             }
             info
         }
-        DeviceCmd::Status => dev.system_status()?,
+        DeviceCmd::Status => cli.open(cli.timeout_ms)?.system_status()?,
         DeviceCmd::Update { .. } => unreachable!(),
     };
     if cli.json {

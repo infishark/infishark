@@ -411,6 +411,7 @@ fn unprotect(_: Vec<u8>) -> Result<Vec<u8>> {
 #[derive(Clone, Debug, PartialEq)]
 enum StartupStatus {
     NotSignedIn,
+    Checking(String),
     SignedIn(String),
     SignInRequired,
     Unverified(String),
@@ -420,6 +421,9 @@ impl StartupStatus {
     fn message(&self) -> String {
         match self {
             Self::NotSignedIn => "CTF: not signed in".into(),
+            Self::Checking(username) => {
+                format!("CTF: saved account {username}; checking session")
+            }
             Self::SignedIn(username) => format!("CTF: signed in as {username}"),
             Self::SignInRequired => "CTF: sign-in required".into(),
             Self::Unverified(username) => {
@@ -430,39 +434,114 @@ impl StartupStatus {
     }
 }
 
-pub fn startup_status() -> String {
-    match Store::locate() {
-        Ok(store) => startup_status_for(&store, endpoint(None), STARTUP_DEADLINE),
-        Err(_) => StartupStatus::Unavailable,
-    }
-    .message()
+pub struct StartupCheck {
+    status: StartupStatus,
+    pending: Option<(std::sync::mpsc::Receiver<StartupStatus>, StartupStatus)>,
 }
 
-fn startup_status_for(
+impl StartupCheck {
+    fn complete(status: StartupStatus) -> Self {
+        Self {
+            status,
+            pending: None,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        self.status.message()
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Called only by the shell, while it owns terminal output.
+    pub fn poll_update(&mut self) -> Option<String> {
+        use std::sync::mpsc::TryRecvError;
+        let (rx, fallback) = self.pending.as_ref()?;
+        let status = match rx.try_recv() {
+            Ok(status) => status,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => fallback.clone(),
+        };
+        self.status = status;
+        self.pending = None;
+        Some(self.message())
+    }
+}
+
+pub fn startup_status() -> StartupCheck {
+    match Store::locate() {
+        Ok(store) => begin_startup_status_for(&store, endpoint(None), STARTUP_DEADLINE),
+        Err(_) => StartupCheck::complete(StartupStatus::Unavailable),
+    }
+}
+
+fn begin_startup_status_for(
     store: &Store,
     endpoint: Result<String>,
     deadline: Duration,
-) -> StartupStatus {
+) -> StartupCheck {
     let profile = match store.load() {
         Ok(Some(profile)) => profile,
-        Ok(None) => return StartupStatus::NotSignedIn,
-        Err(_) => return StartupStatus::Unavailable,
+        Ok(None) => return StartupCheck::complete(StartupStatus::NotSignedIn),
+        Err(_) => return StartupCheck::complete(StartupStatus::Unavailable),
     };
     let unverified = StartupStatus::Unverified(profile.account.username.clone());
     if endpoint
         .as_ref()
         .map_or(true, |base| base != &profile.endpoint)
     {
-        return unverified; // Never send the credential to an overridden API.
+        // Never send the credential to an overridden API.
+        return StartupCheck::complete(unverified);
     }
     if profile.expires_at <= now() {
-        return StartupStatus::SignInRequired;
+        return StartupCheck::complete(StartupStatus::SignInRequired);
     }
-    // Bound the REPL wait separately from DNS; the read-only probe never edits
-    // storage.
-    with_startup_deadline(deadline, unverified, move || {
+    begin_startup_probe(profile.account.username.clone(), deadline, move || {
         probe_session(profile, deadline)
     })
+}
+
+fn begin_startup_probe(
+    username: String,
+    deadline: Duration,
+    probe: impl FnOnce() -> StartupStatus + Send + 'static,
+) -> StartupCheck {
+    let fallback = StartupStatus::Unverified(username.clone());
+    let worker_fallback = fallback.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // The shell never waits for networking, including DNS. A second, bounded
+    // worker wait still reports an unverified session if DNS stalls.
+    if std::thread::Builder::new()
+        .name("ctf-account-startup".into())
+        .spawn(move || {
+            let status = with_startup_deadline(deadline, worker_fallback, probe);
+            let _ = tx.try_send(status);
+        })
+        .is_err()
+    {
+        return StartupCheck::complete(fallback);
+    }
+    StartupCheck {
+        status: StartupStatus::Checking(username),
+        pending: Some((rx, fallback)),
+    }
+}
+
+#[cfg(test)]
+fn startup_status_for(
+    store: &Store,
+    endpoint: Result<String>,
+    deadline: Duration,
+) -> StartupStatus {
+    let check = begin_startup_status_for(store, endpoint, deadline);
+    match check.pending {
+        Some((rx, fallback)) => rx
+            .recv_timeout(deadline + Duration::from_millis(250))
+            .unwrap_or(fallback),
+        None => check.status,
+    }
 }
 
 fn with_startup_deadline(
@@ -1129,6 +1208,54 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(300));
         worker.join().unwrap();
         assert_eq!(fs::read(t.0.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn startup_check_is_nonblocking_and_reports_a_stalled_probe_once() {
+        let (release, waiting) = std::sync::mpsc::channel();
+        let (started, probing) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let mut check = begin_startup_probe("alice".into(), Duration::from_millis(40), move || {
+            started.send(()).unwrap();
+            waiting.recv().unwrap();
+            done.send(()).unwrap();
+            StartupStatus::SignedIn("alice".into())
+        });
+        assert_eq!(check.status, StartupStatus::Checking("alice".into()));
+        assert!(check.is_pending());
+        assert!(!check.message().contains("signed in as"));
+        probing.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let update = loop {
+            if let Some(update) = check.poll_update() {
+                break update;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe deadline did not report"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(update, StartupStatus::Unverified("alice".into()).message());
+        assert!(!check.is_pending());
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(check.poll_update(), None);
+        assert_eq!(check.status, StartupStatus::Unverified("alice".into()));
+    }
+
+    #[test]
+    fn failed_startup_worker_never_leaves_a_check_pending() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(tx);
+        let fallback = StartupStatus::Unverified("alice".into());
+        let mut check = StartupCheck {
+            status: StartupStatus::Checking("alice".into()),
+            pending: Some((rx, fallback.clone())),
+        };
+        assert_eq!(check.poll_update(), Some(fallback.message()));
+        assert!(!check.is_pending());
+        assert_eq!(check.poll_update(), None);
     }
 
     #[test]

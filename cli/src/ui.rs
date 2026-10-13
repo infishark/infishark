@@ -1758,7 +1758,7 @@ impl Spinner {
                     term.write_str(&format!("{f} {msg} ({}s)", start.elapsed().as_secs()))
                         .ok();
                     i += 1;
-                    std::thread::sleep(Duration::from_millis(120));
+                    std::thread::park_timeout(Duration::from_millis(120));
                 }
                 term.clear_line().ok();
             })
@@ -1769,6 +1769,7 @@ impl Spinner {
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
+            h.thread().unpark();
             h.join().ok();
         }
     }

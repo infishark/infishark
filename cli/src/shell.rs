@@ -34,10 +34,11 @@ pub fn run(base: &Cli) -> Result<()> {
     let mut sh = Shell::new();
     install_sigint();
     sh.banner(utf8_locale() && !base.no_banner);
-    println!(
-        "{MARGIN}{}\n",
-        style(crate::ctf_account::startup_status()).dim()
-    );
+    let account = crate::ctf_account::startup_status();
+    println!("{MARGIN}{}\n", style(account.message()).dim());
+    if account.is_pending() {
+        sh.account_status = Some(account);
+    }
     sh.repl()
 }
 
@@ -86,6 +87,7 @@ struct Shell {
     selected: Option<String>,
     peripheral: Option<&'static str>,
     listen: Option<Listen>,
+    account_status: Option<crate::ctf_account::StartupCheck>,
     // Queued by the listen thread. The shell owns the prompt and prints these.
     notes_tx: SyncSender<String>,
     notes_rx: Receiver<String>,
@@ -99,6 +101,7 @@ impl Shell {
             selected: None,
             peripheral: None,
             listen: None,
+            account_status: None,
             notes_tx,
             notes_rx,
         };
@@ -193,7 +196,7 @@ impl Shell {
             self.flush_notes();
             // Reedline repaints the prompt, which would hide a line printed
             // while it owns the screen. Wait here until a key arrives.
-            if self.listen.is_some() {
+            if self.listen.is_some() || self.account_status.is_some() {
                 self.idle_until_key()?;
             }
             let prompt = NanoPrompt(self.label());
@@ -209,6 +212,7 @@ impl Shell {
                     }
                     if let Some(cmd) = host_command(line) {
                         self.stop_listen();
+                        self.account_status = None;
                         run_host(cmd);
                         continue;
                     }
@@ -307,6 +311,7 @@ impl Shell {
         let is_help = toks.iter().any(|t| matches!(t.as_str(), "--help" | "-h"));
         if !is_help && line.contains(['|', '>', '<']) {
             self.stop_listen();
+            self.account_status = None;
             self.run_external(line);
             return;
         }
@@ -343,6 +348,16 @@ impl Shell {
                     cli.port = self.selected.clone();
                 }
                 if let Some(command) = &cli.command {
+                    if matches!(
+                        command,
+                        CliCommand::Ctf {
+                            action: crate::CtfCmd::Account { .. }
+                        }
+                    ) {
+                        // Login/logout may replace or remove the saved session.
+                        // A startup probe must not print a stale account afterward.
+                        self.account_status = None;
+                    }
                     RUNNING.store(true, Ordering::SeqCst);
                     let result = match command {
                         CliCommand::Ble {
@@ -542,21 +557,21 @@ impl Shell {
         while let Ok(line) = self.notes_rx.try_recv() {
             println!("{line}");
         }
+        if let Some(line) = self.account_update() {
+            println!("{MARGIN}{}", style(line).dim());
+        }
+    }
+
+    fn account_update(&mut self) -> Option<String> {
+        let check = self.account_status.as_mut()?;
+        let update = check.poll_update();
+        if !check.is_pending() {
+            self.account_status = None;
+        }
+        update
     }
 
     fn idle_until_key(&mut self) -> Result<()> {
-        #[cfg(unix)]
-        {
-            self.idle_until_key_unix()
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(())
-        }
-    }
-
-    #[cfg(unix)]
-    fn idle_until_key_unix(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         let label = self.label();
         paint_prompt(&label);
@@ -564,7 +579,19 @@ impl Shell {
             while let Ok(line) = self.notes_rx.try_recv() {
                 paint_above(&label, &line);
             }
-            match stdin_pending(40) {
+            if let Some(line) = self.account_update() {
+                paint_above(&label, &style(line).dim().to_string());
+            }
+            if self.listen.is_none() && self.account_status.is_none() {
+                erase_line();
+                return Ok(());
+            }
+            #[cfg(unix)]
+            let pending = stdin_pending(40);
+            #[cfg(not(unix))]
+            let pending =
+                crossterm::event::poll(Duration::from_millis(40)).map_err(anyhow::Error::from);
+            match pending {
                 Ok(true) => {
                     erase_line();
                     // Leave raw mode on so reedline reads the key that woke us.
@@ -661,7 +688,6 @@ fn stdin_pending(timeout_ms: i32) -> Result<bool> {
     }
 }
 
-#[cfg(unix)]
 fn paint_prompt(label: &str) {
     let mut out = std::io::stdout();
     let head = style(label).white();
@@ -670,7 +696,6 @@ fn paint_prompt(label: &str) {
     let _ = out.flush();
 }
 
-#[cfg(unix)]
 fn paint_above(label: &str, line: &str) {
     let mut out = std::io::stdout();
     let _ = write!(out, "\r\x1b[2K{line}\r\n");
@@ -678,7 +703,6 @@ fn paint_above(label: &str, line: &str) {
     paint_prompt(label);
 }
 
-#[cfg(unix)]
 fn erase_line() {
     let mut out = std::io::stdout();
     let _ = write!(out, "\r\x1b[2K");
@@ -987,6 +1011,7 @@ mod tests {
             selected: Some(port),
             peripheral: None,
             listen: None,
+            account_status: None,
             notes_tx,
             notes_rx,
         };
