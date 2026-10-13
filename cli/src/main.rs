@@ -3015,6 +3015,33 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
     }
 }
 
+fn type_hid_text(
+    text: &str,
+    delay_ms: u64,
+    mut send: impl FnMut(&serde_json::Value) -> Result<()>,
+    mut sleep: impl FnMut(std::time::Duration) -> bool,
+) -> Result<()> {
+    let delay = std::time::Duration::from_millis(delay_ms);
+    for c in text.chars() {
+        let (modifier, usage) =
+            hid::ascii_to_hid(c).ok_or_else(|| anyhow::anyhow!("cannot type character {c:?}"))?;
+        if let Err(error) = send(&hid::hid_key_report(1, modifier, usage)) {
+            let _ = send(&hid::hid_key_report(1, 0, 0));
+            return Err(error);
+        }
+        let running = sleep(delay);
+        let released = send(&hid::hid_key_report(1, 0, 0));
+        if !running {
+            return Err(signals::cancelled());
+        }
+        released?;
+        if !sleep(delay) {
+            return Err(signals::cancelled());
+        }
+    }
+    Ok(())
+}
+
 fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
     match action {
         HidCmd::Start {
@@ -3067,14 +3094,12 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
         HidCmd::Type { text, delay_ms } => {
             let mut dev = cli.open(cli.timeout_ms)?;
             let text = text.replace("\\n", "\n").replace("\\t", "\t");
-            for c in text.chars() {
-                let (modifier, usage) = hid::ascii_to_hid(c)
-                    .ok_or_else(|| anyhow::anyhow!("cannot type character {c:?}"))?;
-                dev.ble_hid_send(&hid::hid_key_report(1, modifier, usage))?;
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-                dev.ble_hid_send(&hid::hid_key_report(1, 0, 0))?;
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            }
+            type_hid_text(
+                &text,
+                *delay_ms,
+                |report| dev.ble_hid_send(report).map_err(Into::into),
+                signals::sleep_while_running,
+            )?;
             print_ok(cli.json)
         }
         HidCmd::Replay {
@@ -3284,8 +3309,11 @@ fn view_hid_timeline(timeline: &[(f64, Vec<u8>)], speed: f64, max_gap: Option<f6
                 wait = mg;
             }
         }
-        if wait.is_finite() && wait > 0.0 {
-            std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+        if wait.is_finite()
+            && wait > 0.0
+            && !signals::sleep_while_running(std::time::Duration::from_secs_f64(wait))
+        {
+            return Err(signals::cancelled());
         }
         for (k, modifier) in new_presses(&mut prev, rep) {
             let shift = modifier & 0x22 != 0;
@@ -3354,9 +3382,14 @@ fn replay_hid_timeline(
         // subscribed, so hold until the first subscribe event arrives.
         eprintln!("Waiting for a host to connect and subscribe (Ctrl-C to abort)…");
         loop {
-            let ev = dev.next_ble_event()?;
-            if ev.get("event").and_then(|x| x.as_str()) == Some("subscribe") {
-                break;
+            if !signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(signals::cancelled());
+            }
+            match dev.next_ble_event() {
+                Ok(ev) if ev.get("event").and_then(|x| x.as_str()) == Some("subscribe") => break,
+                Ok(_) => {}
+                Err(infishark::Error::Interrupted) => return Err(signals::cancelled()),
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -3365,8 +3398,8 @@ fn replay_hid_timeline(
     let start = std::time::Instant::now();
     for (t, rep) in timeline {
         let target = std::time::Duration::from_secs_f64(t / speed);
-        if start.elapsed() < target {
-            std::thread::sleep(target - start.elapsed());
+        if start.elapsed() < target && !signals::sleep_while_running(target - start.elapsed()) {
+            return Err(signals::cancelled());
         }
         let mut bytes = rep.clone();
         if bytes.len() == 7 {
@@ -4224,4 +4257,51 @@ fn print_action(v: serde_json::Value, human: impl std::fmt::Display, as_json: bo
 
 fn print_ok(as_json: bool) -> Result<()> {
     print_action(serde_json::json!({ "ok": true }), "ok", as_json)
+}
+
+#[cfg(test)]
+mod qol_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_typing_attempts_key_release_before_returning() {
+        let mut reports = Vec::new();
+        let result = type_hid_text(
+            "ab",
+            1,
+            |report| {
+                reports.push(report.clone());
+                if reports.len() == 1 {
+                    Err(infishark::Error::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| panic!("a failed key press must not wait"),
+        );
+        assert!(signals::is_cancel(&result.unwrap_err()));
+        assert_eq!(
+            reports,
+            [hid::hid_key_report(1, 0, 4), hid::hid_key_report(1, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn cancelled_typing_releases_the_pressed_key() {
+        let mut reports = Vec::new();
+        let result = type_hid_text(
+            "ab",
+            1,
+            |report| {
+                reports.push(report.clone());
+                Ok(())
+            },
+            |_| false,
+        );
+        assert!(signals::is_cancel(&result.unwrap_err()));
+        assert_eq!(
+            reports,
+            [hid::hid_key_report(1, 0, 4), hid::hid_key_report(1, 0, 0)]
+        );
+    }
 }

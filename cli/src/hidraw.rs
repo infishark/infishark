@@ -144,10 +144,7 @@ mod linux {
         }
     }
 
-    // Strip a descriptor to input-only: drop Output (0x90) and Feature (0xB0) main
-    // items, keep the input items and all structure/globals. If the source is
-    // unnumbered, inject Report ID 1 so HOGP can route the single input report by
-    // id. This function returns (descriptor, input report ids, numbered)
+    // Keep input items. An unnumbered map gets report id 1.
     fn input_only(desc: &[u8]) -> (Vec<u8>, BTreeSet<u8>, bool) {
         let mut out: Vec<Item> = Vec::new();
         let mut cur_id: u8 = 0;
@@ -362,8 +359,7 @@ mod linux {
             } else {
                 (1, &buf[..n])
             };
-            // Reports over 64 bytes are skipped rather than letting one oversized report
-            // tear down the whole clone.
+            // Skip reports over 64 bytes.
             if data.len() > 64 {
                 if !warned_oversize {
                     eprintln!(
