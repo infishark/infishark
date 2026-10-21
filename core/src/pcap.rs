@@ -1,7 +1,7 @@
-//! libpcap writer. The device streams raw frames; the host stamps them with its
-//! own wall-clock and wraps them in pcap for Wireshark/tshark.
+//! libpcap reader and writer. The device streams raw frames; the host stamps
+//! them with its own wall-clock and wraps them in pcap for Wireshark/tshark.
 
-use std::io::{Result, Write};
+use std::io::{Read, Result, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// pcap link type for bare 802.11 MAC frames
@@ -129,6 +129,95 @@ pub fn mitm_event_to_hci(v: &serde_json::Value) -> Option<Vec<u8>> {
     Some(hci_att_frame(host_to_controller, &att))
 }
 
+/// One ATT PDU recovered from a Bluetooth HCI H4 pcap (link type 201).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HciAttRecord {
+    /// Capture timestamp in microseconds since the Unix epoch.
+    pub ts_us: u64,
+    /// True when the packet's direction prefix is host → controller.
+    pub host_to_controller: bool,
+    /// ATT PDU bytes (opcode, then opcode-specific payload).
+    pub pdu: Vec<u8>,
+}
+
+/// Read ATT PDUs from a pcap written with [`LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR`].
+/// Packets that are not ACL/ATT are skipped.
+pub fn read_hci_att_pcap<R: Read>(mut r: R) -> Result<Vec<HciAttRecord>> {
+    let mut hdr = [0u8; 24];
+    r.read_exact(&mut hdr)?;
+    let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    let swapped = match magic {
+        0xa1b2c3d4 => false,
+        0xd4c3b2a1 => true,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not a pcap file",
+            ));
+        }
+    };
+    let linktype = read_u32(&hdr[20..24], swapped);
+    if linktype != LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported pcap linktype {linktype}"),
+        ));
+    }
+
+    let mut out = Vec::new();
+    loop {
+        let mut rec = [0u8; 16];
+        match r.read_exact(&mut rec) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let ts_sec = read_u32(&rec[0..4], swapped) as u64;
+        let ts_usec = read_u32(&rec[4..8], swapped) as u64;
+        let incl_len = read_u32(&rec[8..12], swapped) as usize;
+        if incl_len > 1_048_576 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pcap record too large",
+            ));
+        }
+        let mut frame = vec![0u8; incl_len];
+        r.read_exact(&mut frame)?;
+        if let Some((host_to_controller, pdu)) = parse_hci_att_frame(&frame) {
+            out.push(HciAttRecord {
+                ts_us: ts_sec.saturating_mul(1_000_000).saturating_add(ts_usec),
+                host_to_controller,
+                pdu,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn read_u32(bytes: &[u8], swapped: bool) -> u32 {
+    let n = u32::from_le_bytes(bytes.try_into().unwrap());
+    if swapped { n.swap_bytes() } else { n }
+}
+
+/// Split an HCI H4-with-phdr frame into (host_to_controller, ATT PDU).
+fn parse_hci_att_frame(frame: &[u8]) -> Option<(bool, Vec<u8>)> {
+    if frame.len() < 13 || frame[4] != 0x02 {
+        return None;
+    }
+    let host_to_controller = match u32::from_be_bytes(frame[0..4].try_into().ok()?) {
+        0 => true,
+        1 => false,
+        _ => return None,
+    };
+    let l2cap_len = u16::from_le_bytes(frame[9..11].try_into().ok()?) as usize;
+    let cid = u16::from_le_bytes(frame[11..13].try_into().ok()?);
+    if cid != 4 {
+        return None;
+    }
+    let pdu = frame.get(13..13 + l2cap_len)?.to_vec();
+    Some((host_to_controller, pdu))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +258,22 @@ mod tests {
     fn mitm_status_has_no_pdu() {
         let v = serde_json::json!({"op":"status","step":"ready"});
         assert!(mitm_event_to_hci(&v).is_none());
+    }
+
+    #[test]
+    fn read_hci_att_pcap_roundtrips_notify() {
+        let att = [0x1bu8, 42, 0, 0x00, 0x09];
+        let frame = hci_att_frame(true, &att);
+        let mut buf = Vec::new();
+        write_global_header(&mut buf, LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR).unwrap();
+        write_record(&mut buf, &frame).unwrap();
+        // A non-ACL packet is ignored.
+        write_record(&mut buf, &[0, 0, 0, 0, 0x04]).unwrap();
+
+        let records = read_hci_att_pcap(buf.as_slice()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].host_to_controller);
+        assert_eq!(records[0].pdu, att);
+        assert!(records[0].ts_us > 0);
     }
 }

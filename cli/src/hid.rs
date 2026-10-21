@@ -172,6 +172,21 @@ pub fn ascii_to_hid(c: char) -> Option<(u8, u8)> {
     })
 }
 
+/// Inverse of [`ascii_to_hid`]: keyboard usage plus shift state back to a character.
+/// Non-printing usages (backspace, arrows, …) return `None`.
+pub fn hid_usage_to_ascii(usage: u8, shift: bool) -> Option<char> {
+    const SHIFT: u8 = 0x02;
+    for c in (' '..='~').chain(['\n', '\t']) {
+        let Some((modifier, u)) = ascii_to_hid(c) else {
+            continue;
+        };
+        if u == usage && (modifier & SHIFT != 0) == shift {
+            return Some(c);
+        }
+    }
+    None
+}
+
 /// Dedup classes; assign 1-based report IDs in CANON order.
 pub fn assign(classes: &[HidClass]) -> Vec<(HidClass, u8)> {
     let mut out = Vec::new();
@@ -231,6 +246,18 @@ mod tests {
     #[test]
     fn standalone_class_uses_report_id_1() {
         assert_eq!(assign(&[HidClass::Mouse]), vec![(HidClass::Mouse, 1)]);
+    }
+
+    #[test]
+    fn hid_usage_roundtrips_printable_ascii() {
+        for c in (' '..='~').chain(['\n', '\t']) {
+            let Some((modifier, usage)) = ascii_to_hid(c) else {
+                continue;
+            };
+            let shift = modifier & 0x02 != 0;
+            assert_eq!(hid_usage_to_ascii(usage, shift), Some(c), "{c:?}");
+        }
+        assert_eq!(hid_usage_to_ascii(0x2a, false), None);
     }
 
     #[test]
