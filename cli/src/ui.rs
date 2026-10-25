@@ -1792,8 +1792,8 @@ mod prompt_tests {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
             assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
             (master, std::fs::File::from_raw_fd(slave))
