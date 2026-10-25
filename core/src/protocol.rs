@@ -23,6 +23,7 @@ pub const GRP_BLE: u8 = 0x02;
 pub const GRP_IR: u8 = 0x03;
 pub const GRP_MESH: u8 = 0x04;
 pub const GRP_FILES: u8 = 0x05;
+pub const GRP_CTF: u8 = 0x06;
 pub const GRP_CONTROL: u8 = 0x7F;
 
 // Command opcodes
@@ -47,6 +48,8 @@ pub const CMD_PORTAL_RESP: u16 = 0x0116;
 pub const CMD_WIFI_RAW_TX: u16 = 0x0120;
 pub const CMD_WIFI_RAW_MONITOR: u16 = 0x0121;
 pub const CMD_WIFI_ADAPTER: u16 = 0x0122;
+pub const CMD_WIFI_MITM: u16 = 0x0123;
+pub const CMD_WIFI_MITM_ACTION: u16 = 0x0124;
 // 0x02 BLE
 pub const CMD_BLE_SCAN: u16 = 0x0200;
 pub const CMD_BLE_LIST: u16 = 0x0201;
@@ -68,6 +71,9 @@ pub const CMD_BLE_BONDS_LIST: u16 = 0x0227;
 pub const CMD_BLE_BONDS_REMEMBER: u16 = 0x0228;
 pub const CMD_BLE_BONDS_FORGET: u16 = 0x0229;
 pub const CMD_BLE_MITM_ACTION: u16 = 0x022A;
+// Open GATT link. 0x0226-0x022A are MITM and bonds. Older firmware rejects
+// this.
+pub const CMD_BLE_GATT_LINK: u16 = 0x022B;
 // 0x03 IR
 pub const CMD_IR_RX: u16 = 0x0300;
 pub const CMD_IR_TX: u16 = 0x0310;
@@ -83,6 +89,11 @@ pub const CMD_FILES_LIST: u16 = 0x0500;
 pub const CMD_FILES_READ_CHUNK: u16 = 0x0501;
 pub const CMD_FILES_WRITE: u16 = 0x0502;
 pub const CMD_FILES_DELETE: u16 = 0x0503;
+// 0x06 CTF (challenge-box firmware; not stock)
+pub const CMD_CTF_HELLO: u16 = 0x0600;
+pub const CMD_CTF_LOAD: u16 = 0x0601;
+pub const CMD_CTF_RESET: u16 = 0x0602;
+
 // 0x7F CONTROL
 pub const CMD_STOP: u16 = 0x7F00;
 
@@ -124,3 +135,6 @@ pub const EVT_IR: u16 = 0x000D;
 pub const EVT_PORTAL_REQUEST: u16 = 0x000E;
 pub const EVT_WIFI_TX: u16 = 0x000F;
 pub const EVT_BLE_MITM: u16 = 0x0010;
+pub const EVT_WIFI_MITM: u16 = 0x0011;
+/// GATT-central pairing progress: `{op,step,pin,compare}`.
+pub const EVT_BLE_PAIR: u16 = 0x0012;

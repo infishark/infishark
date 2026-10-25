@@ -55,6 +55,37 @@ wifi scan
 ble scan
 ```
 
+Capture and reuse IR signals in the same shell session:
+
+```text
+ir rx                         # Ctrl-C stops and retains the captures
+ir show                       # list captures, numbered from 1
+ir save remote.ir             # save all captures
+ir save selected.ir 1,3        # save selected captures in the given order
+ir tx --capture 1             # retransmit a retained code or raw waveform
+ir tx --capture 1 --repeats 2  # repeat a decoded code
+```
+
+Saving works without a connected Nano and retains the original `Capture_N`
+button names. Duplicate selections are saved once. Existing destination files
+are replaced, as with `ir rx --out`. The cache lasts for the current shell
+session; use the saved `.ir` file in later sessions.
+
+Monitor presets accept compatible address, signal, PHY, length, byte-match, and
+dedup refinements:
+
+```text
+wifi monitor --channel 6 --filter beacons --bssid AA:BB:CC:DD:EE:FF --min-rssi=-70 --out beacons.pcap
+```
+
+Frame types, subtypes, and EtherType remain fixed by the preset. Encryption
+options must agree with any encryption rule built into it.
+
+Portal logs show one request/response summary per request in host-content mode,
+or one request line with on-device content. Use `wifi portal --dir pages --verbose` (or `-v`) for full
+headers, arguments, and event details. Host-content summaries include HTTP
+status, response-body bytes, and request ID.
+
 [Full docs](https://docs.infishark.com/docs/sdk)
 
 ## License

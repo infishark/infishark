@@ -9,7 +9,7 @@ use infishark::{Device, hex};
 use sha2::{Digest, Sha256};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 const APP_OFFSET: u32 = 0x10000;
@@ -34,6 +34,102 @@ pub struct Setup {
     pub json: bool,
     pub port: Option<String>,
     pub keep_storage: bool,
+}
+
+pub struct Write {
+    pub bin: PathBuf,
+    pub offset: Option<String>,
+    pub yes: bool,
+    pub json: bool,
+    pub port: Option<String>,
+}
+
+pub fn parse_offset(s: Option<&str>) -> Result<u32> {
+    match s {
+        None => Ok(APP_OFFSET),
+        Some(v) => {
+            let v = v.trim();
+            let parsed = if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                u32::from_str_radix(hex, 16)
+            } else {
+                v.parse::<u32>()
+            };
+            parsed.with_context(|| format!("invalid offset: {v}"))
+        }
+    }
+}
+
+pub fn require_bin(path: &Path) -> Result<()> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        bail!("binary not found: {}", path.display());
+    }
+}
+
+pub fn write_local(opts: Write) -> Result<()> {
+    let written = write_local_image(&opts)?;
+    crate::print_action(
+        serde_json::json!({
+            "ok": true,
+            "bin": opts.bin,
+            "port": written.port,
+            "offset": written.offset,
+        }),
+        format!(
+            "wrote {} @ {:#x} to {}",
+            opts.bin.display(),
+            written.offset,
+            written.port
+        ),
+        opts.json,
+    )
+}
+
+pub(crate) struct WrittenImage {
+    pub port: String,
+    pub offset: u32,
+}
+
+/// Flash without printing a final result, for composite commands such as CTF
+/// start.
+pub(crate) fn write_local_image(opts: &Write) -> Result<WrittenImage> {
+    crate::signals::install_sigint();
+    crate::signals::ensure_running()?;
+    require_bin(&opts.bin)?;
+    let offset = parse_offset(opts.offset.as_deref())?;
+    let port = pick_flash_port(opts.port.as_deref())?;
+    confirm(
+        opts.yes,
+        opts.json,
+        &format!(
+            "write {} @ {offset:#x} to {port}? this rewrites flash at the selected offset.",
+            opts.bin.display()
+        ),
+    )?;
+    crate::signals::ensure_running()?;
+    flash_bin(&port, &opts.bin, offset)?;
+    Ok(WrittenImage { port, offset })
+}
+
+trait FlasherCommand {
+    fn status_on_stderr(&mut self) -> io::Result<ExitStatus>;
+}
+
+impl FlasherCommand for Command {
+    fn status_on_stderr(&mut self) -> io::Result<ExitStatus> {
+        crate::signals::ensure_running()
+            .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "cancelled"))?;
+        // Flasher progress belongs on stderr, leaving stdout available for JSON.
+        let mut child = self.stdout(Stdio::piped()).spawn()?;
+        let mut output = child.stdout.take().expect("stdout was piped");
+        if let Err(error) = io::copy(&mut output, &mut io::stderr().lock()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        child.wait()
+    }
 }
 
 pub fn catalog(json: bool, port: Option<&str>) -> Result<()> {
@@ -130,16 +226,16 @@ pub fn install(opts: Install) -> Result<()> {
     };
 
     let mut dev = Device::open(opts.port.as_deref(), opts.timeout_ms.max(8_000))?;
-    let ident = dev.firmware_identity()?;
+    let ident = fwota::stock_ident(dev.firmware_identity()?);
     let port = dev.port().to_string();
     drop(dev);
 
-    if let Some(w) = ident.warning() {
+    if let Some(w) = ident.warning().filter(|_| ident.mode != "ctf") {
         crate::log::warn(w);
         eprintln!("         run `infishark flash latest` to flash over USB.");
     }
 
-    if fw::same(&ident.version, &tag) {
+    if ident.mode != "ctf" && fw::same(&ident.version, &tag) {
         if opts.json {
             println!(
                 "{}",
@@ -181,7 +277,9 @@ pub fn install(opts: Install) -> Result<()> {
 
     flash_bin(&port, &dest, APP_OFFSET)?;
     eprintln!("waiting for the Nano to reboot...");
-    std::thread::sleep(Duration::from_secs(3));
+    if !crate::signals::sleep_while_running(Duration::from_secs(3)) {
+        return Err(crate::signals::cancelled());
+    }
     let new_ver = wait_version(Some(&port), 12)?;
     if !fw::same(&new_ver, &tag) {
         bail!(
@@ -217,15 +315,16 @@ fn wait_version(port: Option<&str>, attempts: u32) -> Result<String> {
     let mut last = String::new();
     for i in 0..attempts {
         match Device::open(port, 5_000) {
-            Ok(mut d) => {
-                if let Ok(id) = d.firmware_identity() {
-                    return Ok(id.version);
-                }
-            }
+            Ok(mut d) => match d.firmware_identity() {
+                Ok(id) => return Ok(id.version),
+                Err(infishark::Error::Interrupted) => return Err(crate::signals::cancelled()),
+                Err(_) => {}
+            },
+            Err(infishark::Error::Interrupted) => return Err(crate::signals::cancelled()),
             Err(e) => last = e.to_string(),
         }
-        if i + 1 < attempts {
-            std::thread::sleep(Duration::from_millis(750));
+        if i + 1 < attempts && !crate::signals::sleep_while_running(Duration::from_millis(750)) {
+            return Err(crate::signals::cancelled());
         }
     }
     bail!("device did not come back after flash ({last})");
@@ -401,6 +500,8 @@ fn flash_bin(port: &str, image: &Path, offset: u32) -> Result<()> {
 }
 
 fn flash_bins(port: &str, parts: &[(u32, PathBuf)], erase_all: bool) -> Result<()> {
+    crate::signals::install_sigint();
+    crate::signals::ensure_running()?;
     let tool = find_flasher()?;
     for (offset, image) in parts {
         eprintln!(
@@ -467,7 +568,7 @@ impl Flasher {
                     "--after",
                     "no-reset",
                 ])
-                .status()
+                .status_on_stderr()
                 .with_context(|| format!("running {}", bin.display()))?;
             if !status.success() {
                 bail!("espflash erase-flash failed ({status})");
@@ -488,7 +589,7 @@ impl Flasher {
                     &format!("{OTADATA_OFFSET:#x}"),
                     &format!("{OTADATA_SIZE:#x}"),
                 ])
-                .status()
+                .status_on_stderr()
                 .with_context(|| format!("running {}", bin.display()))?;
             if !status.success() {
                 bail!("espflash erase-region (otadata) failed ({status})");
@@ -518,7 +619,7 @@ impl Flasher {
                     &format!("{offset:#x}"),
                 ])
                 .arg(image)
-                .status()
+                .status_on_stderr()
                 .with_context(|| format!("running {}", bin.display()))?;
             if !status.success() {
                 bail!("espflash write-bin failed ({status})");
@@ -560,7 +661,9 @@ impl Flasher {
                 &format!("{OTADATA_OFFSET:#x}"),
                 &format!("{OTADATA_SIZE:#x}"),
             ]);
-            let status = c.status().context("running esptool erase_region")?;
+            let status = c
+                .status_on_stderr()
+                .context("running esptool erase_region")?;
             if !status.success() {
                 bail!("esptool erase_region (otadata) failed ({status})");
             }
@@ -575,7 +678,7 @@ impl Flasher {
             c.arg(format!("{offset:#x}"));
             c.arg(image);
         }
-        let status = c.status().context("running esptool")?;
+        let status = c.status_on_stderr().context("running esptool")?;
         if !status.success() {
             bail!("esptool failed ({status})");
         }
@@ -596,7 +699,8 @@ struct EspflashAsset {
     sha256: &'static str,
 }
 
-/// Host builds we ship. x86_64 Linux uses the musl binary so an older glibc still runs it.
+/// Host builds we ship. x86_64 Linux uses the musl binary so an older glibc
+/// still runs it.
 fn espflash_asset(os: &str, arch: &str) -> Option<EspflashAsset> {
     let (archive, sha256) = match (os, arch) {
         ("linux", "x86_64") => (
@@ -863,5 +967,30 @@ mod tests {
             false,
             &[(OTADATA_OFFSET, ota), (APP_OFFSET, app)]
         ));
+    }
+    #[test]
+    fn require_bin_rejects_missing_file() {
+        let p = PathBuf::from("/no/such/infishark-app.bin");
+        let e = require_bin(&p).unwrap_err().to_string();
+        assert!(e.contains("binary not found"), "{e}");
+    }
+
+    #[test]
+    fn require_bin_accepts_existing_file() {
+        let p = std::env::temp_dir().join("infishark_flash_write_test.bin");
+        std::fs::write(&p, b"x").unwrap();
+        require_bin(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn parse_offset_defaults_to_app_partition() {
+        assert_eq!(parse_offset(None).unwrap(), APP_OFFSET);
+    }
+
+    #[test]
+    fn parse_offset_hex_and_decimal() {
+        assert_eq!(parse_offset(Some("0x20000")).unwrap(), 0x20000);
+        assert_eq!(parse_offset(Some("65536")).unwrap(), 65536);
     }
 }

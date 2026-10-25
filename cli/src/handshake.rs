@@ -211,7 +211,11 @@ fn capture_one(
 
     status.clear();
     dev.stop_current_task().ok();
-    outcome?;
+    match outcome {
+        Ok(()) => {}
+        Err(e) if crate::signals::is_cancel(&e) => {}
+        Err(e) => return Err(e),
+    }
     write_output(
         &hs,
         &target.label,

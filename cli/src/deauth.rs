@@ -59,14 +59,15 @@ pub fn run(dev: &mut Device, opts: &DeauthOpts, oui_db: Option<&str>) -> Result<
     let (mut sent, mut failed) = (0u64, 0u64);
     let mut last_draw = Instant::now();
 
-    while RUNNING.load(Ordering::SeqCst) {
+    'send: while RUNNING.load(Ordering::SeqCst) {
         for (frame, channel) in &frames {
             if !RUNNING.load(Ordering::SeqCst) {
-                break;
+                break 'send;
             }
             match dev.wifi_raw_tx(frame, *channel) {
                 Ok(true) => sent += 1,
                 Ok(false) => failed += 1,
+                Err(infishark::Error::Interrupted) => break 'send,
                 Err(e) => {
                     status.clear();
                     dev.stop_current_task().ok();
@@ -84,8 +85,10 @@ pub fn run(dev: &mut Device, opts: &DeauthOpts, oui_db: Option<&str>) -> Result<
             ));
             last_draw = Instant::now();
         }
-        if opts.interval_ms > 0 {
-            std::thread::sleep(Duration::from_millis(opts.interval_ms));
+        if opts.interval_ms > 0
+            && !crate::signals::sleep_while_running(Duration::from_millis(opts.interval_ms))
+        {
+            break;
         }
     }
 

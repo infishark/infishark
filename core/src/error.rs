@@ -11,6 +11,8 @@ pub enum Error {
     /// A blocking read hit the serial timeout before data arrived. A capture
     /// loop can treat this as "no data yet" and continue.
     Timeout,
+    /// Interrupted read, usually Ctrl-C. Do not retry.
+    Interrupted,
     /// The serial link closed unexpectedly.
     Closed,
     /// Serial port I/O error.
@@ -35,6 +37,7 @@ impl fmt::Display for Error {
         match self {
             Error::Device { code, message } => write!(f, "device error {code}: {message}"),
             Error::Timeout => f.write_str("timed out waiting for the device"),
+            Error::Interrupted => f.write_str("cancelled"),
             Error::Closed => f.write_str("connection closed"),
             Error::Io(e) => write!(f, "{e}"),
             Error::Serial(e) => write!(f, "{e}"),
@@ -57,7 +60,11 @@ impl std::error::Error for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            Error::Interrupted
+        } else {
+            Error::Io(e)
+        }
     }
 }
 

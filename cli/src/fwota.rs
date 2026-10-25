@@ -17,6 +17,7 @@ const UA: &str = "BLEShark Nano";
 type HmacSha256 = Hmac<Sha256>;
 
 const SIG_SEED: &[u8] = b"d0d1b164131df4509658c68f3c2b414f";
+const SERIAL_SEED: &[u8] = b"cfef5656aab3c0743051a5291e2bd01b";
 const CHECKSUM_KEY: &[u8] = b"Ch3cksumBL3Sh4rk";
 
 fn hmac_sha256(msg: &[u8], key: &[u8]) -> [u8; 32] {
@@ -35,6 +36,43 @@ pub fn signature_from_efuse(efuse: &[u8; 6]) -> [u8; 32] {
 pub fn device_signature(id: &infishark::DeviceFw) -> [u8; 32] {
     id.signature
         .unwrap_or_else(|| signature_from_efuse(&id.efuse))
+}
+
+fn base36(mut v: u64) -> String {
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    if v == 0 {
+        return "0".into();
+    }
+    let mut tmp = Vec::new();
+    while v > 0 {
+        tmp.push(CHARS[(v % 36) as usize]);
+        v /= 36;
+    }
+    tmp.reverse();
+    String::from_utf8(tmp).unwrap()
+}
+
+pub fn serial_from_efuse(efuse: &[u8; 6]) -> String {
+    let efuse_hex = hex::encode_lower(efuse);
+    let hmac = hmac_sha256(efuse_hex.as_bytes(), SERIAL_SEED);
+    let mut salt = 0u64;
+    for b in &hmac[..8] {
+        salt = (salt << 8) | u64::from(*b);
+    }
+    let mut id = 0u64;
+    for b in efuse {
+        id = (id << 8) | u64::from(*b);
+    }
+    format!("BLS-N-{}", base36(id ^ salt))
+}
+
+/// OTA API wants the manufacturing serial, not a CTF-mode label.
+pub fn stock_ident(mut id: infishark::DeviceFw) -> infishark::DeviceFw {
+    if id.mode == "ctf" || id.serial.starts_with("CTF-") {
+        id.serial = serial_from_efuse(&id.efuse);
+        id.signature = Some(signature_from_efuse(&id.efuse));
+    }
+    id
 }
 
 fn checksum_sig(kind: &str, tag: &str) -> String {
@@ -229,6 +267,10 @@ fn copy_to(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<u64>
     let mut buf = [0u8; 16 * 1024];
     let mut total = 0u64;
     loop {
+        if !crate::signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = std::fs::remove_file(dest);
+            return Err(crate::signals::cancelled());
+        }
         let n = reader.read(&mut buf).context("reading firmware")?;
         if n == 0 {
             break;
@@ -334,6 +376,28 @@ mod tests {
         assert_eq!(
             main.versions[0].released.as_deref().unwrap().get(..10),
             Some("2026-07-14")
+        );
+    }
+    #[test]
+    fn serial_from_efuse_matches_firmware() {
+        let efuse = [0x58, 0x8C, 0x81, 0x9E, 0x2E, 0xE0];
+        assert_eq!(serial_from_efuse(&efuse), "BLS-N-FK42J1WEHAS4");
+    }
+
+    #[test]
+    fn stock_ident_rewrites_ctf_serial() {
+        let id = infishark::DeviceFw {
+            serial: "CTF-588C819E2EE0".into(),
+            version: "0.0.1".into(),
+            mode: "ctf".into(),
+            efuse: [0x58, 0x8C, 0x81, 0x9E, 0x2E, 0xE0],
+            signature: None,
+        };
+        let s = stock_ident(id);
+        assert_eq!(s.serial, "BLS-N-FK42J1WEHAS4");
+        assert_eq!(
+            s.signature.unwrap(),
+            signature_from_efuse(&[0x58, 0x8C, 0x81, 0x9E, 0x2E, 0xE0])
         );
     }
 }

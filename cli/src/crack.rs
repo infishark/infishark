@@ -61,8 +61,8 @@ pub fn crack_22000(hashfile: &Path, wordlist: &Path) -> Result<Option<String>> {
     Ok(show.lines().find_map(parse_cracked).map(str::to_string))
 }
 
-// A hashcat 22000 --show line is `<hashline>:<password>`; the star-delimited hex
-// hashline has no colon, so the first colon is the separator.
+// A hashcat 22000 --show line is `<hashline>:<password>`; the star-delimited
+// hex hashline has no colon, so the first colon is the separator.
 fn parse_cracked(line: &str) -> Option<&str> {
     line.split_once(':')
         .map(|(_, pw)| pw)

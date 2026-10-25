@@ -1,4 +1,5 @@
-//! Single source of truth for where InfiShark host data (lookup DBs, caches) lives on disk.
+//! Single source of truth for where InfiShark host data (lookup DBs, caches)
+//! lives on disk.
 
 use std::path::PathBuf;
 

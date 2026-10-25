@@ -1,15 +1,4 @@
-//! InfiShark device SDK: framed transport, a typed [`Device`] client.
-//! Talk to a device with a few lines:
-//!
-//! ```no_run
-//! let mut dev = infishark::Device::open(None, 15_000)?;
-//! // Default scan is active (names/scan responses). Set passive for dense RF.
-//! for d in dev.ble_scan(&infishark::BleScanOpts::default())? {
-//!     let name = d.name.as_deref().unwrap_or("<unknown>");
-//!     println!("{}  {} dBm  {name}", d.address, d.rssi);
-//! }
-//! # Ok::<(), infishark::Error>(())
-//! ```
+#![doc = include_str!("../README.md")]
 
 #[macro_use]
 mod error;
@@ -36,6 +25,7 @@ mod registry;
 pub(crate) mod response;
 pub mod serial;
 pub(crate) mod transport;
+pub mod wifi_mitm;
 
 pub use client::Device;
 pub use error::{Context, Error, Result};
@@ -50,3 +40,4 @@ pub use model::{
 };
 pub use monitor::MonitorFilter;
 pub use transport::Response;
+pub use wifi_mitm::{WifiDnsMode, WifiHttpMode, WifiMitmAction, WifiMitmOpts, WifiUpstream};

@@ -1,9 +1,15 @@
 mod adapter;
 mod bridge;
 mod crack;
+mod ctf;
+mod ctf_account;
+mod ctf_http;
 mod deauth;
 mod flash;
 mod fwota;
+mod gatt_assigned;
+mod gatt_names;
+mod gatt_recon;
 mod handshake;
 mod hid;
 mod hidraw;
@@ -19,9 +25,11 @@ mod signals;
 mod target;
 mod tx;
 mod ui;
+mod vendors;
 mod wifi_analysis;
+mod wifi_mitm;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -36,10 +44,12 @@ use infishark::json::insert_opt;
 use infishark::model::{
     AdapterConfig, AdapterTarget, BleScanOpts, GattConnectOpts, PortalOpts, WifiScanOpts,
 };
-use infishark::{company, hex, oui, pcap};
+use infishark::{hex, pcap};
 
 // Host-held last scans (the device streams results; it doesn't retain them).
 static LAST_BLE: std::sync::Mutex<Vec<infishark::model::BleDevice>> =
+    std::sync::Mutex::new(Vec::new());
+static LAST_BLE_ROWS: std::sync::Mutex<Vec<infishark::model::BleDevice>> =
     std::sync::Mutex::new(Vec::new());
 static LAST_WIFI: std::sync::Mutex<Vec<infishark::model::Network>> =
     std::sync::Mutex::new(Vec::new());
@@ -47,6 +57,8 @@ static LAST_IR: std::sync::Mutex<Vec<infishark::ir::IrCapture>> = std::sync::Mut
 // Files from the last `files ls`, largest first - lets `files pull 1` etc.
 // resolve a row #.
 static LAST_FILES: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+// Characteristic rows from the last `ble gatt enum`, in table order.
+static LAST_GATT: std::sync::Mutex<Vec<ui::GattRow>> = std::sync::Mutex::new(Vec::new());
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,22 +87,36 @@ struct Cli {
 impl Cli {
     fn open(&self, timeout: u64) -> Result<Device> {
         let mut dev = Device::open(self.port.as_deref(), timeout)?;
-        warn_firmware(&mut dev);
+        warn_firmware(&mut dev)?;
         Ok(dev)
     }
 }
 
-fn warn_firmware(dev: &mut Device) {
+fn warn_firmware(dev: &mut Device) -> Result<()> {
+    warn_firmware_with(|| dev.firmware_identity())
+}
+
+fn warn_firmware_with(
+    identity: impl FnOnce() -> infishark::Result<infishark::fw::DeviceFw>,
+) -> Result<()> {
     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+        return Ok(());
     }
-    if let Ok(id) = dev.firmware_identity() {
-        if let Some(w) = id.warning() {
-            log::warn(w);
-            log::info("update with `infishark device update` or `infishark flash latest`");
+    match identity() {
+        Ok(id) => {
+            if id.mode == "ctf" {
+                return Ok(());
+            }
+            if let Some(w) = id.warning() {
+                log::warn(w);
+                log::info("update with `infishark device update` or `infishark flash latest`");
+            }
         }
+        Err(infishark::Error::Interrupted) => return Err(signals::cancelled()),
+        Err(_) => {}
     }
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +182,24 @@ enum Command {
         #[command(subcommand)]
         action: Option<FlashCmd>,
     },
+    /// Hardware CTF.
+    Ctf {
+        #[command(subcommand)]
+        action: CtfCmd,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct CtfApiOpts {
+    /// CTF API base (default https://ctf.infishark.com).
+    #[arg(long)]
+    url: Option<String>,
+    /// Override the saved account token (or INFISHARK_CTF_TOKEN / CTF_TOKEN).
+    #[arg(long)]
+    token: Option<String>,
+    /// Legacy shared-token player id; ignored for account-token identity.
+    #[arg(long)]
+    user: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -207,23 +251,109 @@ enum FlashCmd {
         #[command(flatten)]
         ch: FlashChannel,
     },
+    /// Write a local .bin at the selected offset (defaults to the app
+    /// partition).
+    Write {
+        /// Path to the application image.
+        bin: PathBuf,
+        /// App-partition offset (hex like 0x10000 or decimal). Defaults to
+        /// 0x10000.
+        #[arg(long)]
+        offset: Option<String>,
+        /// Skip the confirm prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Restore stock firmware (same as `flash latest`).
+    Restore {
+        #[command(flatten)]
+        ch: FlashChannel,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CtfCmd {
+    /// Register, verify, log in, or manage your CTF account and tokens.
+    Account {
+        #[command(subcommand)]
+        action: crate::ctf_account::Command,
+        /// CTF API base; saved tokens are bound to this exact endpoint.
+        #[arg(long, global = true)]
+        url: Option<String>,
+    },
+    /// Show your account's issued and solved challenges.
+    Stats {
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// List challenges from the CTF server.
+    Challenges {
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Download and verify a box, flash it, and load a RAM flag.
+    Start {
+        /// Challenge slug, or a .bin path with --local.
+        target: String,
+        /// Optional local .bin override; required with --local.
+        bin: Option<PathBuf>,
+        /// Skip the CTF server; generate a local flag and wait at flag>.
+        #[arg(long)]
+        local: bool,
+        /// Skip the confirm prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Read a challenge hint, with more detail at each level.
+    Hint {
+        /// Challenge slug.
+        slug: String,
+        /// Hint level (starts at 1).
+        #[arg(default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        level: u32,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Restart the box like the left+right button chord; keep its loaded flag.
+    Reset,
+    /// Reload the connected CTF challenge (auto-detected from firmware).
+    Load {
+        /// Optional assertion: must match the connected firmware's challenge.
+        slug: Option<String>,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
+    /// Submit a flag{...} string.
+    Submit {
+        /// Challenge slug.
+        challenge: String,
+        /// The flag string (flag{...}, not a hex dump).
+        flag: String,
+        #[command(flatten)]
+        api: CtfApiOpts,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum IrCmd {
     /// Blast the TV-B-Gone power-off sweep.
     Tvbgone,
-    /// Transmit a code (`ir tx nec 20DF10EF`) or a `.ir` button (`ir tx
-    /// remote.ir` / `ir tx remote.ir Power`).
+    /// Transmit a code, a `.ir` button, or a cached capture with --capture.
     Tx {
         /// Protocol name, or path to a `.ir` file.
-        target: String,
+        #[arg(required_unless_present = "capture", conflicts_with = "capture")]
+        target: Option<String>,
         /// Hex data (protocol mode), or button name/# (file mode).
         arg: Option<String>,
+        /// Capture index from the last `ir rx` session (1-based #).
+        #[arg(long, conflicts_with_all = ["target", "arg", "bits"])]
+        capture: Option<usize>,
         /// Bit count (protocol mode; 0 = the protocol's default).
         #[arg(long, default_value_t = 0)]
         bits: u16,
-        /// Repeat count (0 = the protocol's minimum).
+        /// Repeat count for decoded codes (0 = the protocol's minimum).
         #[arg(long, default_value_t = 0)]
         repeats: u16,
     },
@@ -260,6 +390,14 @@ enum IrCmd {
     Show {
         /// Capture index from the last session table; omit to re-list.
         index: Option<usize>,
+    },
+    /// Save captures from the last `ir rx` session to a local `.ir` file.
+    Save {
+        /// Destination file.
+        file: PathBuf,
+        /// Capture indexes (1-based, comma/space-separated); omit to save all.
+        #[arg(value_delimiter = ',')]
+        captures: Vec<usize>,
     },
 }
 
@@ -328,8 +466,8 @@ enum WifiCmd {
         /// Scan table row #, SSID, or BSSID.
         target: String,
     },
-    /// Deep recon: lock an AP's channel and summarize clients / probes /
-    /// airtime.
+    /// Lock an AP's channel and watch clients, probes, and airtime. The tables
+    /// refresh while it listens.
     Recon {
         /// Scan table row #, SSID, or BSSID (omit to pick interactively).
         target: Option<String>,
@@ -339,8 +477,8 @@ enum WifiCmd {
         /// Target AP by BSSID.
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
-        /// Seconds to dwell (0 = until Ctrl-C). Default 15.
-        #[arg(long, short = 't', default_value_t = 15)]
+        /// Stop after this many seconds. Default is until Ctrl-C.
+        #[arg(long, short = 't', default_value_t = 0)]
         seconds: u64,
     },
     /// Manage the networks saved on the device (used by Connect, the adapter,
@@ -404,7 +542,8 @@ enum WifiCmd {
         #[arg(long, conflicts_with = "ssid")]
         index: Option<u8>,
         /// Named filter preset: all, eapol, deauth, probe-req, beacons,
-        /// no-beacons.
+        /// no-beacons. Combine with address, RSSI, PHY, length, byte-match,
+        /// or dedup refinements; frame types/subtypes and EtherType stay fixed.
         #[arg(long)]
         filter: Option<String>,
         /// Raw: frame types to forward (mgmt,data,ctrl).
@@ -426,6 +565,7 @@ enum WifiCmd {
         #[arg(long)]
         ethertype: Option<String>,
         /// Raw: only frames carrying this MAC in addr1/addr2/addr3.
+        /// A row # from the last `wifi scan` uses that AP's BSSID.
         #[arg(long, visible_alias = "addr")]
         bssid: Option<String>,
         /// Raw: drop frames weaker than this RSSI (dBm).
@@ -487,11 +627,13 @@ enum WifiCmd {
         /// Gap between on-device TX attempts in ms (not 802.11 Duration/ID).
         #[arg(long, default_value_t = 0)]
         interval_ms: u16,
-        /// AP MAC (alias of --bssid). If omitted for AP-required templates,
-        /// scan + pick. Beacon: omitted = local BSSID (no scan).
+        /// AP MAC (alias of --bssid), or a row # from the last `wifi scan`.
+        /// If omitted for AP-required templates, scan + pick. Beacon: omitted
+        /// = local BSSID (no scan).
         #[arg(long)]
         ap: Option<String>,
-        /// AP BSSID (needs --channel when set without a scan).
+        /// AP BSSID, a raw MAC needs --channel and a row # from the last
+        /// `wifi scan` uses that AP's channel.
         #[arg(long)]
         bssid: Option<String>,
         /// Scan filter for AP-required templates. Beacon/probe-req: the
@@ -531,10 +673,11 @@ enum WifiCmd {
         /// Target AP by name; hits every BSSID advertising it.
         #[arg(long)]
         ssid: Option<String>,
-        /// Target a single AP by BSSID (needs --channel).
+        /// Target a single AP by BSSID (needs --channel), or a row # from the
+        /// last `wifi scan`.
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
-        /// Channel of --bssid.
+        /// Channel of a raw --bssid. Omitted when --bssid is a scan row #.
         #[arg(long, requires = "bssid", value_parser = clap::value_parser!(u8).range(1..=14))]
         channel: Option<u8>,
         /// Deauth one station (default: broadcast to all clients).
@@ -552,10 +695,11 @@ enum WifiCmd {
         /// Target AP by name; strongest BSSID if several.
         #[arg(long)]
         ssid: Option<String>,
-        /// Target a single AP by BSSID (needs --channel).
+        /// Target a single AP by BSSID (needs --channel), or a row # from the
+        /// last `wifi scan`.
         #[arg(long, conflicts_with = "ssid")]
         bssid: Option<String>,
-        /// Channel of --bssid.
+        /// Channel of a raw --bssid. Omitted when --bssid is a scan row #.
         #[arg(long, requires = "bssid", value_parser = clap::value_parser!(u8).range(1..=14))]
         channel: Option<u8>,
         /// Deauth one station (default: broadcast until a client is seen).
@@ -615,6 +759,9 @@ enum WifiCmd {
         /// Directory of pages (index.html at /). Host-streams bodies over USB.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Print request headers, arguments, and full event details.
+        #[arg(long, short = 'v')]
+        verbose: bool,
         /// SoftAP SSID (default: device settings, usually "Portal").
         #[arg(long)]
         ssid: Option<String>,
@@ -651,6 +798,86 @@ enum WifiCmd {
         /// Host body wait timeout in ms (host-content mode).
         #[arg(long)]
         host_timeout_ms: Option<u32>,
+    },
+    /// Route clients through the Nano and watch DNS, flows, or captive HTTP.
+    /// With no name, ask for one. Leave that prompt blank to scan.
+    Mitm {
+        /// SoftAP name clients see. Omit to type one.
+        ssid: Option<String>,
+        /// SoftAP passphrase. WPA2 when set (8-63). Omit to be asked; blank is
+        /// open.
+        #[arg(long)]
+        pass: Option<String>,
+        /// Deauth the upstream so its clients rejoin this AP.
+        /// The SoftAP name must already match that network.
+        #[arg(long)]
+        steer: bool,
+        /// Hide the SSID.
+        #[arg(long)]
+        hidden: bool,
+        /// Max associated clients (1-10).
+        #[arg(long, default_value_t = 4)]
+        max_clients: u8,
+        /// Upstream saved-network slot.
+        #[arg(long, conflicts_with_all = ["upstream_ssid", "upstream_none"])]
+        upstream_index: Option<u8>,
+        /// Upstream SSID, instead of a saved slot.
+        #[arg(long, conflicts_with = "upstream_none")]
+        upstream_ssid: Option<String>,
+        /// Password for --upstream-ssid. Empty means open. Prompted if omitted.
+        #[arg(long, requires = "upstream_ssid")]
+        upstream_pass: Option<String>,
+        /// No upstream. The access point is an island on --channel.
+        #[arg(long)]
+        upstream_none: bool,
+        /// Channel 1-13. Only with --upstream-none.
+        #[arg(long)]
+        channel: Option<u8>,
+        /// forward, captive, or static.
+        #[arg(long)]
+        dns: Option<String>,
+        /// Resolver offered when --dns static.
+        #[arg(long)]
+        dns_server: Option<String>,
+        /// Log DNS names.
+        #[arg(long)]
+        dns_log: bool,
+        /// Hold DNS questions so a script can allow, drop, or replace them.
+        /// This command auto-allows.
+        #[arg(long)]
+        intercept_dns: bool,
+        /// Hold budget in ms. Default 500 when intercept is on.
+        #[arg(long)]
+        intercept_timeout_ms: Option<u32>,
+        /// off or portal.
+        #[arg(long, default_value = "off")]
+        http: String,
+        /// Captive HTTP wait, ms.
+        #[arg(long, default_value_t = 15000)]
+        host_timeout_ms: u32,
+        /// Drop this client MAC. Repeat up to 10 times.
+        #[arg(long)]
+        block: Vec<String>,
+        /// Rewrite name=a.b.c.d. Repeat up to 8 times. Forward DNS only.
+        #[arg(long)]
+        rewrite: Vec<String>,
+        /// Watch ip:port or ip:port/in|out|both. Repeat up to 4 times.
+        #[arg(long)]
+        watch: Vec<String>,
+        /// Bytes of each watched packet to keep (1-180).
+        #[arg(long, default_value_t = 64)]
+        watch_bytes: u8,
+        /// Write events as JSON lines.
+        #[arg(long)]
+        capture: Option<String>,
+        /// Print AP, DHCP, and routing diagnostics (new firmware needed for
+        /// DHCP counters).
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// Override the pcap path. The default is `<datetime>.pcap` in the
+        /// current directory. Not a monitor capture.
+        #[arg(long)]
+        pcap: Option<String>,
     },
 }
 
@@ -729,7 +956,7 @@ enum BleCmd {
     },
     /// Show full detail for one device from the last scan (by list number).
     Show {
-        /// Device number from `ble scan`/`ble list` (omit to re-list).
+        /// Device number from `ble scan` / `ble list` (omit to re-list).
         index: Option<usize>,
     },
     /// GATT central: connect out to a peripheral and act on its attributes.
@@ -836,11 +1063,13 @@ enum BleCmd {
     },
     /// Dual-link GATT proxy: clone a peripheral, wait for a central, relay ATT.
     Mitm {
-        /// Target address, e.g. AA:BB:CC:DD:EE:FF (omit to scan and pick).
+        /// Target address, or a row # from the last ble table (omit to scan
+        /// and pick).
         address: Option<String>,
-        /// Address type: 0=public, 1=random.
-        #[arg(long, default_value_t = 0)]
-        addr_type: u8,
+        /// Address type: 0=public, 1=random. Omit to use the type
+        /// from that row (0 if the row has none).
+        #[arg(long)]
+        addr_type: Option<u8>,
         /// Advertised name (default: the target's GAP name).
         #[arg(long)]
         name: Option<String>,
@@ -918,8 +1147,9 @@ impl HidPreset {
 enum BondsCmd {
     /// List saved peers (default).
     List,
-    /// Remove one address, or --all.
+    /// Remove one peer, or --all.
     Forget {
+        /// Address, or a row # from the last `ble bonds` / `ble scan` table.
         address: Option<String>,
         #[arg(long)]
         all: bool,
@@ -993,7 +1223,8 @@ enum HidCmd {
     Replay {
         /// HCI pcap to read (written by `ble mitm --pcap`).
         pcap: String,
-        /// Playback speed multiplier (2 = twice as fast, 0 = as fast as possible).
+        /// Playback speed multiplier (2 = twice as fast, 0 = as fast as
+        /// possible).
         #[arg(long, default_value_t = 1.0)]
         speed: f64,
         /// ATT handle of the HID input report characteristic. Default: the
@@ -1046,16 +1277,16 @@ enum HidCmd {
 
 #[derive(Debug, Subcommand)]
 enum GattCmd {
-    /// Connect to a peripheral by address (omit to scan and pick
+    /// Connect to a peripheral by address or table row (omit to scan and pick
     /// interactively).
     Connect {
-        /// Target address, e.g. AA:BB:CC:DD:EE:FF.
+        /// Target address, or a row # from the last `ble scan` / `ble bonds`
+        /// table.
         address: Option<String>,
-        /// Address type: 0=public, 1=random. Prefer the type from `ble scan`
-        /// (interactive pick uses it). Wrong type is a common cause of
-        /// connect timeout / HCI 0x3E.
-        #[arg(long, default_value_t = 0)]
-        addr_type: u8,
+        /// Address type: 0=public, 1=random. Omit to use the type
+        /// from that row.
+        #[arg(long)]
+        addr_type: Option<u8>,
         /// BLE connection-attempt timeout in ms (distinct from the global
         /// --timeout-ms).
         #[arg(long)]
@@ -1072,35 +1303,51 @@ enum GattCmd {
         /// Supervision timeout (10 ms units).
         #[arg(long)]
         supervision_timeout: Option<u16>,
-        /// Initiate pairing/encryption right after connecting.
+        /// Force Just Works pairing. A HID advertisement already pairs with
+        /// a PIN; other peers pair when they refuse access until encrypted.
         #[arg(long)]
         secure: bool,
-        /// Persist keys (bond/trust across reconnects).
+        /// Connect without pairing.
+        #[arg(long)]
+        no_pair: bool,
+        /// Persist keys (bond/trust across reconnects). On for --secure and
+        /// --mitm.
         #[arg(long)]
         bond: bool,
-        /// Require MITM protection (passkey / numeric comparison).
+        /// Require MITM protection. The method comes from --io-cap.
+        /// Default is 0: the Nano shows a PIN for the peer to type.
         #[arg(long)]
         mitm: bool,
-        /// Use LE Secure Connections.
+        /// Use LE Secure Connections. On for --secure and --mitm.
         #[arg(long)]
         sc: bool,
-        /// Pairing IO capability (3=Just Works, 2=Keyboard for passkey entry).
+        /// Pairing IO capability. 0 = Nano shows a PIN for the peer to type.
+        /// 1 = both sides show the same number; nothing to type.
+        /// 2 = peer shows a PIN; pass it with --passkey.
+        /// 3 = Just Works. Default is 0 with --mitm, and 3 otherwise.
         #[arg(long)]
         io_cap: Option<u8>,
         /// Passkey to supply when the peer requests one.
         #[arg(long)]
         passkey: Option<u32>,
     },
-    /// Discover and print the service/characteristic tree.
+    /// Discover characteristics and print them as a numbered table.
     Enum,
-    /// Read a characteristic value by UUID.
+    /// Profile the open connection: link, identity, and live notifications.
+    /// Refreshes until Ctrl-C.
+    Recon {
+        /// Stop after this many seconds. Default is until Ctrl-C.
+        #[arg(long, short = 't', default_value_t = 0)]
+        seconds: u64,
+    },
+    /// Read one characteristic, or every readable row with `all`.
     Read {
-        /// Characteristic UUID.
+        /// UUID, a row # from the last `ble gatt enum`, or `all`.
         uuid: String,
     },
-    /// Write a hex value to a characteristic by UUID.
+    /// Write a hex value to a characteristic by UUID or enum row.
     Write {
-        /// Characteristic UUID.
+        /// Characteristic UUID, or a row # from the last `ble gatt enum`.
         uuid: String,
         /// Value as hex, e.g. AF or 01020304.
         data: String,
@@ -1108,19 +1355,21 @@ enum GattCmd {
         #[arg(long)]
         no_response: bool,
     },
-    /// Subscribe to one or more characteristics and stream values (NDJSON)
-    /// until interrupted.
+    /// Subscribe and stream values until interrupted. In the shell, return
+    /// immediately and keep listening. `all` subscribes every notify or
+    /// indicate row.
     Subscribe {
-        /// Characteristic UUID(s) to subscribe to.
+        /// UUID(s), row #s from the last `ble gatt enum`, or `all`.
         #[arg(required = true)]
         uuids: Vec<String>,
-        /// Use indications (acked) instead of notifications.
+        /// Use indications. With `all`, only indicatable rows. An indicate-only
+        /// row uses indications without this flag.
         #[arg(long)]
         indicate: bool,
     },
     /// Stop notifications/indications on a characteristic.
     Unsubscribe {
-        /// Characteristic UUID.
+        /// Characteristic UUID, or a row # from the last `ble gatt enum`.
         uuid: String,
     },
     /// Disconnect the current GATT session.
@@ -1131,6 +1380,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if signals::is_cancel(&e) => {
+            let _ = writeln!(std::io::stderr());
+            ExitCode::from(130)
+        }
         Err(e) => {
             // Keep the failure path machine-parseable under --json; anyhow's
             // default would print plain text even there.
@@ -1148,6 +1401,14 @@ fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Some(command) => dispatch(cli, command),
         None => shell::run(cli),
+    }
+}
+
+fn api_opts(api: &CtfApiOpts) -> crate::ctf::ApiOpts {
+    crate::ctf::ApiOpts {
+        url: api.url.clone(),
+        token: api.token.clone(),
+        user: api.user.clone(),
     }
 }
 
@@ -1176,6 +1437,58 @@ fn dispatch(cli: &Cli, command: &Command) -> Result<()> {
                 keep_storage: *keep_storage,
             }),
             Some(FlashCmd::Install { tag, ch }) => flash_install(cli, tag.clone(), ch.beta, ch.yes),
+            Some(FlashCmd::Write { bin, offset, yes }) => flash::write_local(flash::Write {
+                bin: bin.clone(),
+                offset: offset.clone(),
+                yes: *yes,
+                json: cli.json,
+                port: cli.port.clone(),
+            }),
+            Some(FlashCmd::Restore { ch }) => flash_install(cli, "latest", ch.beta, ch.yes),
+        },
+        Command::Ctf { action } => match action {
+            CtfCmd::Account { action, url } => {
+                crate::ctf_account::run(action, url.as_deref(), cli.json)
+            }
+            CtfCmd::Stats { api } => crate::ctf_account::stats(cli.json, api_opts(api)),
+            CtfCmd::Challenges { api } => crate::ctf::challenges(cli.json, api_opts(api)),
+            CtfCmd::Reset => crate::ctf::reset(cli.json, cli.port.as_deref(), cli.timeout_ms),
+            CtfCmd::Hint { slug, level, api } => {
+                crate::ctf::hint(slug, *level, cli.json, api_opts(api))
+            }
+            CtfCmd::Start {
+                target,
+                bin,
+                local,
+                yes,
+                api,
+            } => crate::ctf::start(crate::ctf::Start {
+                target: target.clone(),
+                bin: bin.clone(),
+                local: *local,
+                yes: *yes,
+                json: cli.json,
+                port: cli.port.clone(),
+                timeout_ms: cli.timeout_ms,
+                api: api_opts(api),
+            }),
+            CtfCmd::Load { slug, api } => crate::ctf::load(crate::ctf::LoadOpts {
+                slug: slug.clone(),
+                json: cli.json,
+                port: cli.port.clone(),
+                timeout_ms: cli.timeout_ms,
+                api: api_opts(api),
+            }),
+            CtfCmd::Submit {
+                challenge,
+                flag,
+                api,
+            } => crate::ctf::submit(crate::ctf::Submit {
+                challenge: challenge.clone(),
+                flag: flag.clone(),
+                json: cli.json,
+                api: api_opts(api),
+            }),
         },
     }
 }
@@ -1212,10 +1525,11 @@ fn cmd_device(cli: &Cli, action: &DeviceCmd) -> Result<()> {
     if let DeviceCmd::Update { ch } = action {
         return flash_install(cli, "latest", ch.beta, ch.yes);
     }
-    let mut dev = cli.open(cli.timeout_ms)?;
     let v = match action {
         DeviceCmd::Info => {
+            let mut dev = Device::open(cli.port.as_deref(), cli.timeout_ms)?;
             let mut info = dev.device_info()?;
+            warn_firmware_with(|| infishark::fw::DeviceFw::from_info(&info))?;
             if let Some(obj) = info.as_object_mut() {
                 obj.insert(
                     "recommended_firmware".into(),
@@ -1224,7 +1538,7 @@ fn cmd_device(cli: &Cli, action: &DeviceCmd) -> Result<()> {
             }
             info
         }
-        DeviceCmd::Status => dev.system_status()?,
+        DeviceCmd::Status => cli.open(cli.timeout_ms)?.system_status()?,
         DeviceCmd::Update { .. } => unreachable!(),
     };
     if cli.json {
@@ -1235,8 +1549,7 @@ fn cmd_device(cli: &Cli, action: &DeviceCmd) -> Result<()> {
     }
 }
 
-/// Stream the Wi-Fi monitor to `w`, sending the device a stop on exit (Ctrl-C
-/// or a closed sink) so it doesn't keep pushing frames and appear frozen.
+/// Stream monitor frames. Stop the device when the stream ends.
 fn stream_wifi_monitor<W: Write>(dev: &mut Device, w: &mut W) -> Result<()> {
     signals::install_sigint();
     loop {
@@ -1439,6 +1752,15 @@ fn cmd_ir(cli: &Cli, action: &IrCmd) -> Result<()> {
     if let IrCmd::Show { index } = action {
         return cmd_ir_show(cli, *index);
     }
+    if let IrCmd::Save { file, captures } = action {
+        return cmd_ir_save(cli, file, captures);
+    }
+    let cached = match action {
+        IrCmd::Tx {
+            capture: Some(n), ..
+        } => Some((*n, cached_ir_capture(*n)?)),
+        _ => None,
+    };
 
     let mut dev = cli.open(cli.timeout_ms)?;
     match action {
@@ -1456,7 +1778,27 @@ fn cmd_ir(cli: &Cli, action: &IrCmd) -> Result<()> {
             arg,
             bits,
             repeats,
-        } => cmd_ir_tx(cli, &mut dev, target, arg.as_deref(), *bits, *repeats),
+            ..
+        } => {
+            if let Some((n, cap)) = cached {
+                let note = dev.ir_tx_capture(&cap, *repeats)?;
+                print_ir_note(note, cli.json);
+                print_action(
+                    ir_capture_json(n, &cap, false),
+                    format!("Sent capture #{n}."),
+                    cli.json,
+                )
+            } else {
+                cmd_ir_tx(
+                    cli,
+                    &mut dev,
+                    target.as_deref().context("IR protocol or file required")?,
+                    arg.as_deref(),
+                    *bits,
+                    *repeats,
+                )
+            }
+        }
         IrCmd::Raw { khz, timings } => {
             if timings.is_empty() {
                 bail!("--timings is required");
@@ -1477,7 +1819,7 @@ fn cmd_ir(cli: &Cli, action: &IrCmd) -> Result<()> {
             cmd_ir_rx(cli, &mut dev, *once, *verbose, out.as_deref())
         }
         IrCmd::Push { file, slot } => cmd_ir_push(cli, &mut dev, file, *slot),
-        IrCmd::Show { .. } => unreachable!("handled above"),
+        IrCmd::Show { .. } | IrCmd::Save { .. } => unreachable!("handled above"),
     }
 }
 
@@ -1677,6 +2019,51 @@ fn cmd_ir_show(cli: &Cli, index: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+fn cached_ir_capture(n: usize) -> Result<IrCapture> {
+    let caps = LAST_IR.lock().unwrap();
+    if caps.is_empty() {
+        bail!("no cached captures; run `ir rx` first");
+    }
+    n.checked_sub(1)
+        .and_then(|i| caps.get(i))
+        .cloned()
+        .with_context(|| format!("capture #{n} out of range (1..{})", caps.len()))
+}
+
+fn cmd_ir_save(cli: &Cli, path: &Path, indexes: &[usize]) -> Result<()> {
+    let caps = LAST_IR.lock().unwrap().clone();
+    if caps.is_empty() {
+        bail!("no cached captures; run `ir rx` first");
+    }
+    let mut remote = IrRemote::from_captures(&caps);
+    if !indexes.is_empty() {
+        let mut selected = Vec::new();
+        let mut seen = Vec::new();
+        for &n in indexes {
+            let button = n
+                .checked_sub(1)
+                .and_then(|i| remote.buttons.get(i))
+                .with_context(|| format!("capture #{n} out of range (1..{})", caps.len()))?;
+            if !seen.contains(&n) {
+                seen.push(n);
+                selected.push(button.clone());
+            }
+        }
+        remote.buttons = selected;
+    }
+    std::fs::write(path, remote.to_ir_string())
+        .with_context(|| format!("write {}", path.display()))?;
+    print_action(
+        serde_json::json!({ "file": path.display().to_string(), "count": remote.buttons.len() }),
+        format!(
+            "Saved {} capture(s) to {}.",
+            remote.buttons.len(),
+            path.display()
+        ),
+        cli.json,
+    )
+}
+
 fn ir_capture_json(n: usize, cap: &IrCapture, with_timings: bool) -> serde_json::Value {
     match cap {
         IrCapture::Code(c) => serde_json::json!({
@@ -1719,7 +2106,6 @@ fn cmd_ir_rx(
     signals::RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
     let note = dev.ir_rx_start()?;
     print_ir_note(note, cli.json);
-    // Short reads so Ctrl-C is noticed between captures.
     dev.set_read_timeout(Duration::from_millis(300))?;
     if !cli.json {
         log::info("listening for IR (ctrl-c to stop)");
@@ -1747,6 +2133,7 @@ fn cmd_ir_rx(
                     break;
                 }
             }
+            Err(infishark::Error::Interrupted) => break,
             // Transport/serial failure: stop listening, keep what we have.
             Err(e) => {
                 if !cli.json {
@@ -1780,6 +2167,7 @@ fn cmd_ir_rx(
 }
 
 fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
+    vendors::set_oui(oui_db);
     if let WifiCmd::List { verbose } = action {
         let mut nets = LAST_WIFI.lock().unwrap().clone();
         if nets.is_empty() {
@@ -1791,7 +2179,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             enrich_wifi(oui_db, &mut nets);
             *LAST_WIFI.lock().unwrap() = nets.clone();
         }
-        return print_networks(&nets, cli.json, *verbose);
+        return print_networks(&mut nets, cli.json, *verbose);
     }
     if let WifiCmd::Show { target } = action {
         let mut nets = LAST_WIFI.lock().unwrap().clone();
@@ -1804,19 +2192,19 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             enrich_wifi(oui_db, &mut nets);
             *LAST_WIFI.lock().unwrap() = nets.clone();
         }
-        let n = recon::resolve_from_cache(&nets, Some(target), None, None)?;
+        let mut n = recon::resolve_from_cache(&nets, Some(target), None, None)?;
+        vendors::fill_wifi(std::slice::from_mut(&mut n));
         if cli.json {
             return print_value(&serde_json::to_value(&n)?, true);
         }
-        ui::network_detail(&n);
+        ui::network_detail(&mut n);
         return Ok(());
     }
     // TUN needs root; fail before opening the device or picking a network.
     if matches!(action, WifiCmd::Adapter { .. }) {
         privs::require_root("wifi adapter")?;
     }
-    // Monitor streams indefinitely; give the read loop a long ceiling so a quiet
-    // channel doesn't error between frames (Ctrl-C ends it).
+    // A quiet channel is not an error. These waits are long on purpose.
     let timeout = match action {
         WifiCmd::Monitor { .. } => cli.timeout_ms.max(3_600_000),
         // A full scan sweeps every channel; wait for the device's SCAN_DONE.
@@ -1852,7 +2240,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
         // Handshake blocks on next_wifi_frame until crackable/timeout/Ctrl-C.
         WifiCmd::Handshake { .. } => cli.timeout_ms.max(3_600_000),
         // Host-streamed portal waits on phone GETs between serial timeouts.
-        WifiCmd::Portal { .. } => cli.timeout_ms.max(3_600_000),
+        WifiCmd::Portal { .. } | WifiCmd::Mitm { .. } => cli.timeout_ms.max(3_600_000),
         _ => cli.timeout_ms,
     };
     let mut dev = cli.open(timeout)?;
@@ -1880,7 +2268,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             let mut nets = nets?;
             enrich_wifi(oui_db, &mut nets);
             *LAST_WIFI.lock().unwrap() = nets.clone();
-            print_networks(&nets, cli.json, *verbose)
+            print_networks(&mut nets, cli.json, *verbose)
         }
         WifiCmd::List { .. } | WifiCmd::Show { .. } => {
             unreachable!("served from cache before the device opens")
@@ -1914,7 +2302,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 if cli.json {
                     bail!("pass a target, --ssid, or --bssid (no interactive picker under --json)");
                 }
-                ui::pick_network(&nets)?
+                ui::pick_network(&mut nets)?
             } else {
                 recon::resolve_from_cache(
                     &nets,
@@ -1923,8 +2311,8 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                     bssid.as_deref(),
                 )?
             };
-            let oui = load_oui(oui_db);
-            recon::run(&mut dev, &net, *seconds, oui.as_ref(), cli.json)
+            let oui = vendors::oui();
+            recon::run(&mut dev, &net, *seconds, oui.as_deref(), cli.json)
         }
         WifiCmd::Saved { action } => cmd_wifi_saved(&mut dev, cli, oui_db, action),
         WifiCmd::Adapter {
@@ -2002,6 +2390,11 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             dst,
             out,
         } => {
+            let bssid_from_row = match bssid.as_deref() {
+                Some(b) if ui::is_row_index(b) => Some(recon::wifi_scan_row(b)?.bssid),
+                _ => None,
+            };
+            let bssid_ref = bssid_from_row.as_deref().or(bssid.as_deref());
             let mf = monitor::build_monitor_filter(&monitor::MonitorArgs {
                 filter: filter.as_deref(),
                 types: r#type,
@@ -2010,7 +2403,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 data_subtype,
                 block: *block,
                 ethertype: ethertype.as_deref(),
-                bssid: bssid.as_deref(),
+                bssid: bssid_ref,
                 min_rssi: *min_rssi,
                 max_rssi: *max_rssi,
                 phy: phy.as_deref(),
@@ -2028,13 +2421,17 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             if ssid.is_some() || index.is_some() {
                 dev.set_read_timeout(std::time::Duration::from_millis(cli.timeout_ms.max(30_000)))?;
             }
-            if let Some(i) = index {
-                dev.wifi_monitor_start_saved(*channel, &mf, *i)?;
+            let started = if let Some(i) = index {
+                dev.wifi_monitor_start_saved(*channel, &mf, *i)
             } else if let Some(s) = ssid {
                 let p = pass.as_deref().unwrap_or("");
-                dev.wifi_monitor_start(*channel, &mf, Some((s.as_str(), p)))?;
+                dev.wifi_monitor_start(*channel, &mf, Some((s.as_str(), p)))
             } else {
-                dev.wifi_monitor_start(*channel, &mf, None)?;
+                dev.wifi_monitor_start(*channel, &mf, None)
+            };
+            if let Err(e) = started {
+                let _ = dev.stop_current_task();
+                return Err(e.into());
             }
             let mut w: Box<dyn Write> = match out {
                 Some(f) => Box::new(std::io::BufWriter::new(ui::create_secure(f)?)),
@@ -2170,8 +2567,100 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
             },
             oui_db,
         ),
+        WifiCmd::Mitm {
+            ssid,
+            pass,
+            steer,
+            hidden,
+            max_clients,
+            upstream_index,
+            upstream_ssid,
+            upstream_pass,
+            upstream_none,
+            channel,
+            dns,
+            dns_server,
+            dns_log,
+            intercept_dns,
+            intercept_timeout_ms,
+            http,
+            host_timeout_ms,
+            block,
+            rewrite,
+            watch,
+            watch_bytes,
+            capture,
+            verbose,
+            pcap,
+        } => {
+            use infishark::wifi_mitm::{WifiDnsMode, WifiHttpMode};
+            let session = wifi_mitm::resolve(
+                &mut dev,
+                ssid.clone(),
+                pass.clone(),
+                *upstream_index,
+                upstream_ssid.clone(),
+                upstream_pass.clone(),
+                *upstream_none,
+                *channel,
+                *steer,
+                cli.json,
+            )?;
+            let dns = match dns.as_deref() {
+                None => None,
+                Some("forward") => Some(WifiDnsMode::Forward),
+                Some("captive") => Some(WifiDnsMode::Captive),
+                Some("static") => Some(WifiDnsMode::Static),
+                Some(other) => bail!("unknown --dns {other}"),
+            };
+            let http = match http.as_str() {
+                "off" => WifiHttpMode::Off,
+                "portal" => WifiHttpMode::Portal,
+                other => bail!("unknown --http {other}"),
+            };
+            wifi_mitm::run(
+                dev,
+                wifi_mitm::Opts {
+                    ssid: session.ssid,
+                    pass: session.pass,
+                    steer: session.steer,
+                    pass_from_upstream: session.pass_from_upstream,
+                    hidden: *hidden,
+                    max_clients: *max_clients,
+                    upstream: session.upstream,
+                    dns,
+                    dns_server: dns_server
+                        .as_deref()
+                        .map(|s| s.parse())
+                        .transpose()
+                        .map_err(|_| anyhow::anyhow!("bad --dns-server"))?,
+                    dns_log: *dns_log,
+                    intercept: *intercept_dns,
+                    intercept_ms: *intercept_timeout_ms,
+                    http,
+                    host_timeout_ms: *host_timeout_ms,
+                    block: block
+                        .iter()
+                        .map(|m| wifi_mitm::parse_block(m))
+                        .collect::<Result<Vec<_>>>()?,
+                    rewrite: rewrite
+                        .iter()
+                        .map(|r| wifi_mitm::parse_rewrite(r))
+                        .collect::<Result<Vec<_>>>()?,
+                    watch: watch
+                        .iter()
+                        .map(|w| wifi_mitm::parse_watch(w))
+                        .collect::<Result<Vec<_>>>()?,
+                    watch_bytes: *watch_bytes,
+                    capture: capture.clone(),
+                    verbose: *verbose,
+                    pcap_path: pcap.clone(),
+                },
+            )
+        }
         WifiCmd::Portal {
             dir,
+            verbose,
             ssid,
             pass,
             channel,
@@ -2200,7 +2689,7 @@ fn cmd_wifi(cli: &Cli, oui_db: Option<&str>, action: &WifiCmd) -> Result<()> {
                 detailed_capture: detailed_capture.then_some(true),
                 host_timeout_ms: *host_timeout_ms,
             };
-            portal::run(dev, dir.clone(), opts)
+            portal::run(dev, dir.clone(), opts, *verbose)
         }
     }
 }
@@ -2221,11 +2710,9 @@ fn cmd_wifi_saved(
                 Ok(())
             }
         }
-        SavedCmd::Add {
-            ssid,
-            pass,
-            scan_ms,
-        } => cmd_wifi_add(dev, cli, oui_db, ssid.clone(), pass.clone(), *scan_ms),
+        SavedCmd::Add { ssid, pass, .. } => {
+            cmd_wifi_add(dev, cli, oui_db, ssid.clone(), pass.clone())
+        }
         SavedCmd::Rm { index } => {
             let count = dev.wifi_saved_delete(*index)?;
             print_action(
@@ -2243,14 +2730,13 @@ fn cmd_wifi_add(
     oui_db: Option<&str>,
     ssid: Option<String>,
     pass: Option<String>,
-    scan_ms: u32,
 ) -> Result<()> {
     if cli.json && (ssid.is_none() || pass.is_none()) {
         bail!("wifi saved add under --json needs --ssid and --pass");
     }
     let ssid = match ssid {
         Some(s) => s,
-        None => pick_ssid_interactively(dev, oui_db, scan_ms)?,
+        None => pick_ssid_interactively(dev, oui_db)?,
     };
     // Prompt is echoed (personal-machine tool); pass --pass to avoid it in scripts.
     let pass = match pass {
@@ -2266,14 +2752,13 @@ fn cmd_wifi_add(
 }
 
 /// Scan, then pick via the shared Wi-Fi table (`ui::pick_network`)
-fn pick_ssid_interactively(dev: &mut Device, oui_db: Option<&str>, scan_ms: u32) -> Result<String> {
+fn pick_ssid_interactively(dev: &mut Device, oui_db: Option<&str>) -> Result<String> {
     let opts = WifiScanOpts {
         active: true,
         hide_hidden: true,
         ..Default::default()
     };
-    let spin_msg = format!("scanning networks (~{}s)", (scan_ms / 1000).max(1));
-    let sp = ui::Spinner::start(&spin_msg);
+    let sp = ui::Spinner::start("scanning networks");
     let nets = dev.wifi_scan(&opts);
     sp.stop();
     let mut nets = nets?;
@@ -2282,7 +2767,7 @@ fn pick_ssid_interactively(dev: &mut Device, oui_db: Option<&str>, scan_ms: u32)
         anyhow::bail!("no networks found (use --ssid for a hidden network)");
     }
     enrich_wifi(oui_db, &mut nets);
-    Ok(ui::pick_network(&nets)?.ssid)
+    Ok(ui::pick_network(&mut nets)?.ssid)
 }
 
 fn pick_saved_index(dev: &mut Device) -> Result<u8> {
@@ -2296,8 +2781,197 @@ fn pick_saved_index(dev: &mut Device) -> Result<u8> {
     Ok(pick.index)
 }
 
-/// Scan briefly, then pick a BLE peer by number. Returns its address and the
-/// address type to connect with (so a random-address peer resolves correctly).
+fn publish_ble_rows(devs: &[infishark::model::BleDevice]) {
+    *LAST_BLE_ROWS.lock().unwrap() = ui::ble_in_display_order(devs);
+}
+
+/// Scan cache and the active row table, both in the order `ble scan` prints.
+fn publish_ble_scan(devs: &[infishark::model::BleDevice]) {
+    let ordered = ui::ble_in_display_order(devs);
+    *LAST_BLE.lock().unwrap() = ordered.clone();
+    *LAST_BLE_ROWS.lock().unwrap() = ordered;
+}
+
+/// Row number or MAC. `type_known` is set when the type came from the table
+/// or from `--addr-type`. An address we have not seen defaults to public.
+fn resolve_ble_arg(token: &str, explicit_type: Option<u8>) -> Result<ui::ResolvedBle> {
+    let rows = LAST_BLE_ROWS.lock().unwrap().clone();
+    ui::resolve_ble_target(&rows, token, explicit_type)
+}
+
+fn gatt_table() -> Vec<ui::GattRow> {
+    LAST_GATT.lock().unwrap().clone()
+}
+
+fn gatt_select(tokens: &[String], op: ui::GattOp) -> Result<ui::GattSelection> {
+    ui::select_gatt(&gatt_table(), tokens, op)
+}
+
+fn gatt_subscribe_selection(uuids: &[String], indicate: bool) -> Result<ui::GattSelection> {
+    gatt_select(uuids, ui::GattOp::Subscribe { indicate })
+}
+
+fn watch_pair(cli: &Cli, v: &serde_json::Value) {
+    if cli.json {
+        let _ = writeln!(std::io::stdout(), "{v}");
+    } else {
+        print_pair_event(v);
+    }
+}
+
+fn report_selection_misses(cli: &Cli, sel: &ui::GattSelection) {
+    for r in &sel.rejected {
+        report_gatt_miss(cli, &ui::gatt_rejection_line(r), r.row, &r.name);
+    }
+}
+
+fn report_gatt_miss(cli: &Cli, line: &str, row: Option<usize>, name: &str) {
+    if cli.json {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            serde_json::json!({ "n": row, "name": name, "error": line })
+        );
+    } else {
+        log::err(line);
+    }
+}
+
+fn report_target_err(cli: &Cli, t: &ui::GattTarget, err: &str) {
+    if cli.json {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            serde_json::json!({
+                "n": t.row,
+                "name": t.name,
+                "uuid": t.uuid,
+                "handle": t.handle,
+                "error": err,
+            })
+        );
+    } else {
+        log::err(format!("{}  {err}", ui::gatt_target_label(t)));
+    }
+}
+
+fn apply_gatt_read(cli: &Cli, dev: &mut Device, sel: &ui::GattSelection) -> Result<()> {
+    report_selection_misses(cli, sel);
+    if !sel.bulk {
+        let Some(t) = sel.targets.first() else {
+            bail!("no characteristic could be read");
+        };
+        let bytes = dev.gatt_read_at_with(&t.uuid, t.handle, |v| watch_pair(cli, v))?;
+        let hex_s = hex::encode(&bytes);
+        if cli.json {
+            return print_value(&serde_json::json!({ "hex": hex_s }), true);
+        }
+        println!("{hex_s}");
+        return Ok(());
+    }
+    let mut values = Vec::new();
+    let mut ok = 0usize;
+    for t in &sel.targets {
+        match dev.gatt_read_at_with(&t.uuid, t.handle, |v| watch_pair(cli, v)) {
+            Ok(bytes) => {
+                ok += 1;
+                let hex_s = hex::encode(&bytes);
+                if !cli.json {
+                    println!("{}  {hex_s}", ui::gatt_target_label(t));
+                }
+                values.push(serde_json::json!({
+                    "n": t.row,
+                    "name": t.name,
+                    "uuid": t.uuid,
+                    "handle": t.handle,
+                    "hex": hex_s,
+                }));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                report_target_err(cli, t, &msg);
+                values.push(serde_json::json!({
+                    "n": t.row,
+                    "name": t.name,
+                    "uuid": t.uuid,
+                    "handle": t.handle,
+                    "error": msg,
+                }));
+            }
+        }
+    }
+    if ok == 0 {
+        if cli.json {
+            let _ = print_value(
+                &serde_json::json!({ "count": values.len(), "values": values }),
+                true,
+            );
+        }
+        bail!("no characteristic could be read");
+    }
+    if cli.json {
+        print_value(
+            &serde_json::json!({ "count": values.len(), "values": values }),
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_gatt_subscribe(cli: &Cli, dev: &mut Device, sel: &ui::GattSelection) -> Result<()> {
+    report_selection_misses(cli, sel);
+    let mut ok = 0usize;
+    for t in &sel.targets {
+        match dev.gatt_subscribe_at(&t.uuid, t.handle, t.indicate) {
+            Ok(()) => {
+                ok += 1;
+                if sel.bulk && !cli.json {
+                    let mode = if t.indicate { "indicate" } else { "notify" };
+                    log::info(format!("{}  {mode}", ui::gatt_target_label(t)));
+                }
+            }
+            Err(e) => {
+                if !sel.bulk {
+                    return Err(e.into());
+                }
+                report_target_err(cli, t, &e.to_string());
+            }
+        }
+    }
+    if ok == 0 {
+        bail!("subscribe failed");
+    }
+    Ok(())
+}
+
+fn log_ble_connecting(address: &str, addr_type: u8) {
+    match ble_cached_name(address) {
+        Some(n) => log::info(format!(
+            "connecting to {n} ({address}, addr-type {addr_type})"
+        )),
+        None => log::info(format!("connecting to {address} (addr-type {addr_type})")),
+    }
+}
+
+fn ble_cached(address: &str) -> Option<infishark::model::BleDevice> {
+    let hit = |devs: &[infishark::model::BleDevice]| {
+        devs.iter()
+            .find(|d| d.address.eq_ignore_ascii_case(address))
+            .cloned()
+    };
+    hit(&LAST_BLE_ROWS.lock().unwrap()).or_else(|| hit(&LAST_BLE.lock().unwrap()))
+}
+
+fn ble_cached_name(address: &str) -> Option<String> {
+    let hit = |devs: &[infishark::model::BleDevice]| {
+        devs.iter()
+            .find(|d| d.address.eq_ignore_ascii_case(address))
+            .and_then(|d| d.name.clone())
+            .filter(|s| !s.is_empty())
+    };
+    hit(&LAST_BLE_ROWS.lock().unwrap()).or_else(|| hit(&LAST_BLE.lock().unwrap()))
+}
+
 fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
     let mut dev = cli.open(cli.timeout_ms.max(8_000))?;
     match action {
@@ -2306,12 +2980,14 @@ fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
             for d in &mut devices {
                 d.paired = true;
             }
+            publish_ble_rows(&devices);
+            let mut devices = LAST_BLE_ROWS.lock().unwrap().clone();
             if cli.json {
                 println!("{}", serde_json::to_string(&devices)?);
             } else if devices.is_empty() {
                 log::info("no saved BLE devices");
             } else {
-                ui::ble_table(&devices);
+                ui::ble_table(&mut devices);
             }
             Ok(())
         }
@@ -2321,15 +2997,16 @@ fn cmd_bonds(cli: &Cli, action: Option<&BondsCmd>) -> Result<()> {
             } else {
                 let addr = address
                     .clone()
-                    .ok_or_else(|| anyhow::anyhow!("pass an address or --all"))?;
-                dev.ble_bond_forget(Some(&addr))?;
+                    .ok_or_else(|| anyhow::anyhow!("pass an address, a row number, or --all"))?;
+                let resolved = resolve_ble_arg(&addr, None)?;
+                dev.ble_bond_forget(Some(&resolved.address))?;
             }
             print_ok(cli.json)
         }
     }
 }
 
-fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
+fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8, bool)> {
     let mut devices = match dev.ble_bonds() {
         Ok(v) => v,
         Err(e) => {
@@ -2340,12 +3017,13 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
     for d in &mut devices {
         d.paired = true;
     }
-    log::info("scanning for BLE devices (~5s)");
     let opts = BleScanOpts {
         duration_ms: Some(5000),
         ..Default::default()
     };
+    let sp = ui::Spinner::start("scanning BLE");
     let nearby = dev.ble_scan(&opts);
+    sp.stop();
     match nearby {
         Ok(mut scan) => {
             enrich_ble(db, &mut scan);
@@ -2362,6 +3040,7 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
                 }
             }
         }
+        Err(e @ infishark::Error::Interrupted) => return Err(e.into()),
         Err(e) => {
             if devices.is_empty() {
                 return Err(e.into());
@@ -2369,11 +3048,15 @@ fn pick_ble_target(dev: &mut Device, db: &DbOpts) -> Result<(String, u8)> {
             log::warn(format!("scan failed ({e}); showing saved devices only"));
         }
     }
-    let pick = ui::pick_ble_device(&devices)?;
-    Ok((pick.address.clone(), pick.addr_type.unwrap_or(0)))
+    publish_ble_rows(&devices);
+    let pick = ui::pick_ble_device(&mut devices)?;
+    let known = pick.addr_type.is_some();
+    Ok((pick.address.clone(), pick.addr_type.unwrap_or(0), known))
 }
 
 fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
+    vendors::set_oui(db.oui_db.as_deref());
+    vendors::set_company(db.company_db.as_deref());
     match action {
         BleCmd::Scan {
             duration,
@@ -2391,8 +3074,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
                 dedup: *dedup,
                 scan_phy: phy.map(|p| p.mask()),
             };
-            // A sighting streams per advert; size the read timeout to the scan duration
-            // plus headroom (0 = run until stopped, so fall back to a long idle ceiling).
+            // duration 0 scans until stopped, so the read wait stays long.
             let dur = duration.unwrap_or(10_000);
             let timeout = if dur == 0 {
                 cli.timeout_ms.max(30_000)
@@ -2405,8 +3087,7 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             sp.stop();
             let mut devices = devices?;
             enrich_ble(db, &mut devices);
-            *LAST_BLE.lock().unwrap() = devices.clone();
-            print_devices(&devices, cli.json)
+            print_devices(&mut devices, cli.json)
         }
         BleCmd::Bonds { action } => cmd_bonds(cli, action.as_ref()),
         BleCmd::List => {
@@ -2422,9 +3103,8 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
                 sp.stop();
                 devices = scanned?;
                 enrich_ble(db, &mut devices);
-                *LAST_BLE.lock().unwrap() = devices.clone();
             }
-            print_devices(&devices, cli.json)
+            print_devices(&mut devices, cli.json)
         }
         BleCmd::Show { index } => {
             let mut devices = LAST_BLE.lock().unwrap().clone();
@@ -2439,22 +3119,26 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
                 sp.stop();
                 devices = scanned?;
                 enrich_ble(db, &mut devices);
-                *LAST_BLE.lock().unwrap() = devices.clone();
+                publish_ble_scan(&devices);
+                devices = LAST_BLE.lock().unwrap().clone();
             }
-            devices.sort_by_key(|d| std::cmp::Reverse(d.rssi));
             match index {
                 Some(i) => {
-                    let d = devices
-                        .get(*i)
-                        .ok_or_else(|| anyhow::anyhow!("no device #{i}; run 'ble scan' first"))?;
+                    let mut d = match ui::resolve_ble_token(&devices, &i.to_string())? {
+                        ui::BleToken::Row(d) => d,
+                        ui::BleToken::Address(_) => {
+                            bail!("no device #{i}; run 'ble scan' or 'ble bonds' first")
+                        }
+                    };
+                    vendors::fill_ble(std::slice::from_mut(&mut d));
                     if cli.json {
-                        print_value(&serde_json::to_value(d)?, true)
+                        print_value(&serde_json::to_value(&d)?, true)
                     } else {
-                        ui::ble_detail(d);
+                        ui::ble_detail(&mut d);
                         Ok(())
                     }
                 }
-                None => print_devices(&devices, cli.json),
+                None => print_devices(&mut devices, cli.json),
             }
         }
         BleCmd::Gatt { action } => cmd_gatt(cli, db, action),
@@ -2534,20 +3218,19 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             log::info(format!(
                 "streaming stdin to notify {char} (one hex value per line, ctrl-d to end)"
             ));
-            let stdin = std::io::stdin();
-            let mut line = String::new();
             loop {
-                line.clear();
-                if stdin.read_line(&mut line)? == 0 {
+                let Some(line) = ui::read_stdin_line()? else {
                     break;
-                }
+                };
                 let hex = line.trim();
                 if hex.is_empty() {
                     continue;
                 }
                 dev.ble_char_set(&char_set_spec(char, hex, true))?;
-                if *interval_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(*interval_ms));
+                if *interval_ms > 0
+                    && !signals::sleep_while_running(std::time::Duration::from_millis(*interval_ms))
+                {
+                    return Err(signals::cancelled());
                 }
             }
             print_ok(cli.json)
@@ -2598,6 +3281,33 @@ fn cmd_ble(cli: &Cli, db: &DbOpts, action: &BleCmd) -> Result<()> {
             print_ok(cli.json)
         }
     }
+}
+
+fn type_hid_text(
+    text: &str,
+    delay_ms: u64,
+    mut send: impl FnMut(&serde_json::Value) -> Result<()>,
+    mut sleep: impl FnMut(std::time::Duration) -> bool,
+) -> Result<()> {
+    let delay = std::time::Duration::from_millis(delay_ms);
+    for c in text.chars() {
+        let (modifier, usage) =
+            hid::ascii_to_hid(c).ok_or_else(|| anyhow::anyhow!("cannot type character {c:?}"))?;
+        if let Err(error) = send(&hid::hid_key_report(1, modifier, usage)) {
+            let _ = send(&hid::hid_key_report(1, 0, 0));
+            return Err(error);
+        }
+        let running = sleep(delay);
+        let released = send(&hid::hid_key_report(1, 0, 0));
+        if !running {
+            return Err(signals::cancelled());
+        }
+        released?;
+        if !sleep(delay) {
+            return Err(signals::cancelled());
+        }
+    }
+    Ok(())
 }
 
 fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
@@ -2652,14 +3362,12 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
         HidCmd::Type { text, delay_ms } => {
             let mut dev = cli.open(cli.timeout_ms)?;
             let text = text.replace("\\n", "\n").replace("\\t", "\t");
-            for c in text.chars() {
-                let (modifier, usage) = hid::ascii_to_hid(c)
-                    .ok_or_else(|| anyhow::anyhow!("cannot type character {c:?}"))?;
-                dev.ble_hid_send(&hid::hid_key_report(1, modifier, usage))?;
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-                dev.ble_hid_send(&hid::hid_key_report(1, 0, 0))?;
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            }
+            type_hid_text(
+                &text,
+                *delay_ms,
+                |report| dev.ble_hid_send(report).map_err(Into::into),
+                signals::sleep_while_running,
+            )?;
             print_ok(cli.json)
         }
         HidCmd::Replay {
@@ -2720,7 +3428,8 @@ fn cmd_hid(cli: &Cli, action: &HidCmd) -> Result<()> {
     }
 }
 
-/// ATT opcode for Handle Value Notification (HID input reports arrive as these).
+/// ATT opcode for Handle Value Notification (HID input reports arrive as
+/// these).
 const ATT_OP_NOTIFY: u8 = 0x1b;
 
 /// Extract one handle's HID input-report timeline from a MITM HCI pcap:
@@ -2793,7 +3502,8 @@ fn new_presses(prev: &mut [u8; 6], rep: &[u8]) -> Vec<(u8, u8)> {
     out
 }
 
-/// Print label for a non-printing usage (shift picks shifted glyphs for chords).
+/// Print label for a non-printing usage (shift picks shifted glyphs for
+/// chords).
 fn key_label(k: u8, shift: bool) -> String {
     match k {
         0x2a => "<BS>".into(),
@@ -2845,7 +3555,7 @@ fn view_hid_timeline(timeline: &[(f64, Vec<u8>)], speed: f64, max_gap: Option<f6
         "as fast as possible".into()
     };
     eprintln!("Playing back {n} reports over {duration:.1}s of capture at {pace}. Ctrl-C stops.");
-    let dim = if unsafe { libc::isatty(1) } == 1 {
+    let dim = if std::io::stdout().is_terminal() {
         "\x1b[2m"
     } else {
         ""
@@ -2867,8 +3577,11 @@ fn view_hid_timeline(timeline: &[(f64, Vec<u8>)], speed: f64, max_gap: Option<f6
                 wait = mg;
             }
         }
-        if wait.is_finite() && wait > 0.0 {
-            std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+        if wait.is_finite()
+            && wait > 0.0
+            && !signals::sleep_while_running(std::time::Duration::from_secs_f64(wait))
+        {
+            return Err(signals::cancelled());
         }
         for (k, modifier) in new_presses(&mut prev, rep) {
             let shift = modifier & 0x22 != 0;
@@ -2937,9 +3650,14 @@ fn replay_hid_timeline(
         // subscribed, so hold until the first subscribe event arrives.
         eprintln!("Waiting for a host to connect and subscribe (Ctrl-C to abort)…");
         loop {
-            let ev = dev.next_ble_event()?;
-            if ev.get("event").and_then(|x| x.as_str()) == Some("subscribe") {
-                break;
+            if !signals::RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(signals::cancelled());
+            }
+            match dev.next_ble_event() {
+                Ok(ev) if ev.get("event").and_then(|x| x.as_str()) == Some("subscribe") => break,
+                Ok(_) => {}
+                Err(infishark::Error::Interrupted) => return Err(signals::cancelled()),
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -2948,8 +3666,8 @@ fn replay_hid_timeline(
     let start = std::time::Instant::now();
     for (t, rep) in timeline {
         let target = std::time::Duration::from_secs_f64(t / speed);
-        if start.elapsed() < target {
-            std::thread::sleep(target - start.elapsed());
+        if start.elapsed() < target && !signals::sleep_while_running(target - start.elapsed()) {
+            return Err(signals::cancelled());
         }
         let mut bytes = rep.clone();
         if bytes.len() == 7 {
@@ -3190,7 +3908,7 @@ fn cmd_mitm(
     cli: &Cli,
     db: &DbOpts,
     address: &Option<String>,
-    addr_type: u8,
+    addr_type: Option<u8>,
     name: &Option<String>,
     mac: &Option<String>,
     no_spoof: bool,
@@ -3207,8 +3925,14 @@ fn cmd_mitm(
         .max(connect_timeout_ms.unwrap_or(0) as u64 + 120_000);
     let mut dev = cli.open(timeout)?;
     let (address, addr_type) = match address {
-        Some(a) => (a.clone(), addr_type),
-        None => pick_ble_target(&mut dev, db)?,
+        Some(a) => {
+            let r = resolve_ble_arg(a, addr_type)?;
+            (r.address, r.addr_type)
+        }
+        None => {
+            let (a, t, _) = pick_ble_target(&mut dev, db)?;
+            (a, t)
+        }
     };
     let mut spec = serde_json::Map::new();
     spec.insert("address".into(), address.clone().into());
@@ -3234,30 +3958,22 @@ fn cmd_mitm(
         insert_opt(&mut spec, "intercept_timeout_ms", intercept_timeout_ms);
     }
     warn_if_mesh_active(&mut dev);
-    let label = LAST_BLE
-        .lock()
-        .ok()
-        .and_then(|devs| {
-            devs.iter()
-                .find(|d| d.address.eq_ignore_ascii_case(&address))
-                .and_then(|d| d.name.clone())
-        })
-        .filter(|s| !s.is_empty());
     if !cli.json {
-        match &label {
-            Some(n) => log::info(format!(
-                "connecting to {n} ({address}, addr-type {addr_type})"
-            )),
-            None => log::info(format!("connecting to {address} (addr-type {addr_type})")),
-        }
+        log_ble_connecting(&address, addr_type);
     }
-    let ident = dev.ble_mitm_start(&serde_json::Value::Object(spec), |v| {
+    let ident = match dev.ble_mitm_start(&serde_json::Value::Object(spec), |v| {
         if cli.json {
             let _ = writeln!(std::io::stdout(), "{}", v);
         } else {
             print_mitm_event(&v);
         }
-    })?;
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = dev.stop_current_task();
+            return Err(e.into());
+        }
+    };
     if cli.json {
         println!("{}", serde_json::to_string(&ident)?);
     } else {
@@ -3326,6 +4042,7 @@ fn cmd_mitm(
             }
             Ok(_) => {}
             Err(infishark::Error::Timeout) => continue,
+            Err(infishark::Error::Interrupted) => break,
             Err(e) => {
                 let _ = dev.stop_current_task();
                 return Err(e.into());
@@ -3342,6 +4059,32 @@ fn cmd_mitm(
         log::ok("mitm stopped");
     }
     Ok(())
+}
+
+fn print_pair_event(v: &serde_json::Value) {
+    let step = v.get("step").and_then(|x| x.as_str()).unwrap_or("");
+    if step == "passkey" {
+        if let Some(pin) = v.get("pin").and_then(|x| x.as_u64()) {
+            let compare = v.get("compare").and_then(|x| x.as_bool()).unwrap_or(false);
+            if compare {
+                log::info(format!(
+                    "confirm this PIN (or type it on the keyboard): {pin:06}"
+                ));
+            } else {
+                log::info(format!("type this PIN on the keyboard: {pin:06}"));
+            }
+        }
+        return;
+    }
+    let msg = match step {
+        "need" => "peer requires pairing",
+        "pair" => "waiting for pairing...",
+        "bonded" => "using stored bond (no PIN)",
+        other => other,
+    };
+    if !msg.is_empty() {
+        log::info(msg);
+    }
 }
 
 fn print_mitm_event(v: &serde_json::Value) {
@@ -3372,7 +4115,7 @@ fn print_mitm_event(v: &serde_json::Value) {
             "bonded" => "using stored bond (no PIN)",
             "pair" => "waiting for pairing (type the PIN on the keyboard)...",
             "advertise" => "advertising as the clone...",
-            "ready" => "ready — waiting for a central",
+            "ready" => "ready; waiting for a central",
             other => other,
         };
         log::info(format!("{msg}{heap_s}"));
@@ -3397,21 +4140,36 @@ fn print_mitm_event(v: &serde_json::Value) {
     }
 }
 
-fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
+fn gatt_timeout(cli: &Cli, action: &GattCmd) -> u64 {
     // connect/enum can take a few seconds (cold discovery); later ATT ops use
     // the on-device cache and should be fast.
     let base = cli.timeout_ms.max(12_000);
-    let timeout = match action {
+    match action {
         GattCmd::Connect {
             connect_timeout_ms, ..
-        } => base.max(connect_timeout_ms.unwrap_or(0) as u64 + 3_000),
+        } => {
+            let link = connect_timeout_ms.unwrap_or(12_000) as u64;
+            // Auto-pair can still end in a 90s PIN after a short Just Works try.
+            base.max(2 * (link + 4_000) + 110_000)
+        }
+        GattCmd::Read { .. } | GattCmd::Write { .. } => base.max(110_000),
         GattCmd::Enum => base.max(30_000),
+        // A pairing read during the profile can still take the PIN window.
+        // The dwell itself polls at 200 ms.
+        GattCmd::Recon { .. } => base.max(110_000),
         // A subscription streams indefinitely; wait a long time between values
-        // (Ctrl-C ends it).
+        // (Ctrl-C ends it). The shell does not use this path.
         GattCmd::Subscribe { .. } => 3_600_000,
         _ => base,
-    };
-    let mut dev = cli.open(timeout)?;
+    }
+}
+
+fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
+    let mut dev = cli.open(gatt_timeout(cli, action))?;
+    gatt_on(cli, db, action, &mut dev)
+}
+
+fn gatt_on(cli: &Cli, db: &DbOpts, action: &GattCmd, mut dev: &mut Device) -> Result<()> {
     match action {
         GattCmd::Connect {
             address,
@@ -3422,16 +4180,46 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
             latency,
             supervision_timeout,
             secure,
+            no_pair,
             bond,
             mitm,
             sc,
             io_cap,
             passkey,
         } => {
-            let (address, addr_type) = match address {
-                Some(a) => (a.clone(), *addr_type),
-                None => pick_ble_target(&mut dev, db)?,
+            let resolved = match address {
+                Some(a) => resolve_ble_arg(a, *addr_type)?,
+                None => {
+                    let (address, addr_type, type_known) = pick_ble_target(&mut dev, db)?;
+                    ui::ResolvedBle {
+                        address,
+                        addr_type,
+                        type_known,
+                    }
+                }
             };
+            let address = resolved.address;
+            let addr_type = resolved.addr_type;
+            {
+                let rows = LAST_BLE_ROWS.lock().unwrap();
+                let scan = LAST_BLE.lock().unwrap();
+                ui::refuse_unconnectable(&rows, &scan, &address)?;
+            }
+            *LAST_GATT.lock().unwrap() = Vec::new();
+            let hid = ble_cached(&address).is_some_and(|d| ui::ble_prefers_passkey(&d));
+            let mode = if *no_pair {
+                "off"
+            } else if *mitm || matches!(*io_cap, Some(0)) {
+                "passkey"
+            } else if *secure || io_cap.is_some() {
+                "justworks"
+            } else if hid {
+                "passkey"
+            } else {
+                "auto"
+            };
+            let hid_notice = hid && mode == "passkey" && !*mitm && !*secure;
+            let forced = mode == "passkey" || mode == "justworks";
             let opts = GattConnectOpts {
                 addr_type,
                 timeout_ms: *connect_timeout_ms,
@@ -3439,41 +4227,94 @@ fn cmd_gatt(cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
                 max_interval: *max_interval,
                 latency: *latency,
                 supervision_timeout: *supervision_timeout,
-                secure: *secure,
-                bond: *bond,
-                mitm: *mitm,
-                sc: *sc,
-                io_cap: *io_cap,
+                secure: false,
+                pair: forced,
+                bond: if mode != "off" { true } else { *bond },
+                mitm: mode == "passkey",
+                sc: if mode != "off" { true } else { *sc },
+                io_cap: match mode {
+                    "passkey" => Some((*io_cap).unwrap_or(0)),
+                    "justworks" => Some((*io_cap).unwrap_or(3)),
+                    _ => *io_cap,
+                },
                 passkey: *passkey,
+                pair_mode: Some(mode.to_string()),
             };
             warn_if_mesh_active(&mut dev);
-            match dev.gatt_connect(&address, &opts) {
+            if hid_notice && !cli.json {
+                log::info("HID peripheral; pairing (--no-pair to skip)");
+            }
+            let json = cli.json;
+            let saw_pair = std::cell::Cell::new(false);
+            // Known type, and no pairing wait: one retry. Otherwise one try
+            // per address type so a PIN is not started twice.
+            let tries = if resolved.type_known && mode == "off" {
+                2
+            } else {
+                1
+            };
+            let connect = |dev: &mut Device, opts: &GattConnectOpts| {
+                if !json {
+                    log_ble_connecting(&address, opts.addr_type);
+                }
+                let sp = ui::Spinner::start("connecting");
+                let result = dev.gatt_connect_tries(&address, opts, tries, |v| {
+                    saw_pair.set(true);
+                    if json {
+                        let _ = writeln!(std::io::stdout(), "{v}");
+                    } else {
+                        print_pair_event(v);
+                    }
+                });
+                sp.stop();
+                result
+            };
+            let remember = |dev: &mut Device, used_type: u8| {
+                let name = ble_cached_name(&address);
+                let _ = dev.ble_bond_remember(&address, used_type, name.as_deref());
+            };
+            match connect(&mut dev, &opts) {
+                Err(e @ infishark::Error::Interrupted) => {
+                    let _ = dev.stop_current_task();
+                    return Err(e.into());
+                }
                 Ok(()) => {
-                    let name = LAST_BLE.lock().ok().and_then(|devs| {
-                        devs.iter()
-                            .find(|d| d.address.eq_ignore_ascii_case(&address))
-                            .and_then(|d| d.name.clone())
-                    });
-                    let _ = dev.ble_bond_remember(&address, addr_type, name.as_deref());
+                    remember(&mut dev, addr_type);
+                    if forced && !saw_pair.get() && !cli.json {
+                        log::warn(
+                            "connected, but this firmware did not start pairing; flash the Nano to use --secure",
+                        );
+                    }
                     print_ok(cli.json)
                 }
-                Err(e) if matches!(addr_type, 0 | 1) => {
+                Err(e)
+                    if !resolved.type_known
+                        && matches!(addr_type, 0 | 1)
+                        && !bad_ble_address(&e)
+                        && !is_pairing_failure(&e) =>
+                {
                     let alt = if addr_type == 0 { 1 } else { 0 };
                     let mut flipped = opts.clone();
                     flipped.addr_type = alt;
-                    match dev.gatt_connect(&address, &flipped) {
+                    match connect(&mut dev, &flipped) {
+                        Err(e2 @ infishark::Error::Interrupted) => {
+                            let _ = dev.stop_current_task();
+                            return Err(e2.into());
+                        }
                         Ok(()) => {
-                            if !cli.json {
-                                eprintln!("connected with --addr-type {alt}");
+                            remember(&mut dev, alt);
+                            if forced && !saw_pair.get() && !cli.json {
+                                log::warn(
+                                    "connected, but this firmware did not start pairing; flash the Nano to use --secure",
+                                );
                             }
                             print_ok(cli.json)
                         }
                         Err(_) => {
                             if !cli.json {
-                                eprintln!(
-                                    "hint: link-layer connect failed before GATT. \
-retry {address} with --addr-type {alt}"
-                                );
+                                log::warn(format!(
+                                    "{address} did not connect as addr-type {addr_type} or {alt}"
+                                ));
                             }
                             Err(e.into())
                         }
@@ -3483,99 +4324,81 @@ retry {address} with --addr-type {alt}"
             }
         }
         GattCmd::Enum => {
-            let services = dev.gatt_enum()?;
+            let sp = ui::Spinner::start("discovering services");
+            let services = dev.gatt_enum();
+            sp.stop();
+            let services = services?;
+            *LAST_GATT.lock().unwrap() = ui::gatt_rows(&services);
             if cli.json {
-                print_items("services", &services, true)
+                print_value(&gatt_names::named_services(&services)?, true)
             } else {
                 ui::gatt_services(&services);
                 Ok(())
             }
         }
+        GattCmd::Recon { seconds } => gatt_recon::run(cli, dev, *seconds),
         GattCmd::Read { uuid } => {
-            let bytes = dev.gatt_read(uuid)?;
-            if cli.json {
-                print_value(&serde_json::json!({ "hex": hex::encode(&bytes) }), true)
-            } else {
-                println!("{}", hex::encode(&bytes));
-                Ok(())
-            }
+            let sel = gatt_select(std::slice::from_ref(uuid), ui::GattOp::Read)?;
+            apply_gatt_read(cli, dev, &sel)
         }
         GattCmd::Write {
             uuid,
             data,
             no_response,
         } => {
+            let sel = gatt_select(std::slice::from_ref(uuid), ui::GattOp::Write)?;
+            let Some(t) = sel.targets.first() else {
+                bail!("not writable");
+            };
             let bytes = hex::decode(data)?;
-            dev.gatt_write(uuid, &bytes, !no_response)?;
+            dev.gatt_write_at_with(&t.uuid, t.handle, &bytes, !no_response, |v| {
+                watch_pair(cli, v)
+            })?;
             print_ok(cli.json)
         }
         GattCmd::Subscribe { uuids, indicate } => {
-            for u in uuids {
-                dev.gatt_subscribe(u, *indicate)?;
-            }
+            let sel = gatt_select(
+                uuids,
+                ui::GattOp::Subscribe {
+                    indicate: *indicate,
+                },
+            )?;
+            apply_gatt_subscribe(cli, dev, &sel)?;
             stream_ndjson(|| dev.next_notification().map_err(Into::into))
         }
         GattCmd::Unsubscribe { uuid } => {
-            dev.gatt_unsubscribe(uuid)?;
+            let sel = gatt_select(std::slice::from_ref(uuid), ui::GattOp::Unsubscribe)?;
+            let Some(t) = sel.targets.first() else {
+                bail!("pass a row number or a characteristic UUID");
+            };
+            dev.gatt_unsubscribe_at(&t.uuid, t.handle)?;
             print_ok(cli.json)
         }
         GattCmd::Disconnect => {
             dev.gatt_disconnect()?;
+            *LAST_GATT.lock().unwrap() = Vec::new();
             print_ok(cli.json)
         }
     }
 }
 
-/// Load a reference database, emitting `note` (not an error) if absent so recon
-/// still works without it.
-fn load_db<T>(open: impl FnOnce() -> Result<T>, note: &str) -> Option<T> {
-    match open() {
-        Ok(db) => Some(db),
-        Err(_) => {
-            eprintln!("{note}");
-            None
-        }
-    }
-}
-
-fn load_oui(oui_db: Option<&str>) -> Option<oui::Db> {
-    load_db(
-        || {
-            oui::db_path(oui_db)
-                .and_then(|p| oui::Db::load(&p))
-                .map_err(Into::into)
-        },
-        "note: OUI database not installed; run `infishark manage oui update` for vendor names",
-    )
-}
-
-fn load_company(company_db: Option<&str>) -> Option<company::Db> {
-    load_db(
-        || {
-            company::db_path(company_db)
-                .and_then(|p| company::Db::load(&p))
-                .map_err(Into::into)
-        },
-        "note: BLE company database not installed; run `infishark manage company update` for manufacturer names",
-    )
-}
-
 pub(crate) fn enrich_wifi(oui_db: Option<&str>, nets: &mut [infishark::model::Network]) {
-    let oui = load_oui(oui_db);
-    for n in nets {
-        n.enrich(oui.as_ref());
-    }
+    vendors::set_oui(oui_db);
+    vendors::fill_wifi(nets);
 }
 
 fn enrich_ble(db: &DbOpts, devices: &mut [infishark::model::BleDevice]) {
-    let oui = load_oui(db.oui_db.as_deref());
-    let company = load_company(db.company_db.as_deref());
-    for d in devices {
-        d.enrich(oui.as_ref(), company.as_ref());
-    }
+    vendors::set_oui(db.oui_db.as_deref());
+    vendors::set_company(db.company_db.as_deref());
+    vendors::fill_ble(devices);
 }
 
-fn print_networks(nets: &[infishark::model::Network], as_json: bool, verbose: bool) -> Result<()> {
+fn print_networks(
+    nets: &mut [infishark::model::Network],
+    as_json: bool,
+    verbose: bool,
+) -> Result<()> {
+    vendors::fill_wifi(nets);
     if as_json {
         // Host-only enrichment (posture/flags/summary) stays off the device wire;
         // attach it here for machine consumers of `--json`.
@@ -3638,11 +4461,23 @@ fn print_networks(nets: &[infishark::model::Network], as_json: bool, verbose: bo
     }
 }
 
-fn print_devices(devs: &[infishark::model::BleDevice], as_json: bool) -> Result<()> {
+fn is_pairing_failure(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("pairing") || msg.contains("pair ")
+}
+
+fn bad_ble_address(e: &infishark::Error) -> bool {
+    matches!(e, infishark::Error::Device { message, .. } if message.contains("bad address"))
+}
+
+fn print_devices(devs: &mut [infishark::model::BleDevice], as_json: bool) -> Result<()> {
+    vendors::fill_ble(devs);
+    publish_ble_scan(devs);
+    let mut devs = LAST_BLE.lock().unwrap().clone();
     if as_json {
-        print_items("devices", devs, true)
+        print_items("devices", &devs, true)
     } else {
-        ui::ble_table(devs);
+        ui::ble_table(&mut devs);
         Ok(())
     }
 }
@@ -3690,4 +4525,193 @@ fn print_action(v: serde_json::Value, human: impl std::fmt::Display, as_json: bo
 
 fn print_ok(as_json: bool) -> Result<()> {
     print_action(serde_json::json!({ "ok": true }), "ok", as_json)
+}
+
+#[cfg(test)]
+mod qol_tests {
+    use super::*;
+    use infishark::ir::{IrCode, Protocol, RawIr};
+
+    #[test]
+    fn interrupted_typing_attempts_key_release_before_returning() {
+        let mut reports = Vec::new();
+        let result = type_hid_text(
+            "ab",
+            1,
+            |report| {
+                reports.push(report.clone());
+                if reports.len() == 1 {
+                    Err(infishark::Error::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| panic!("a failed key press must not wait"),
+        );
+        assert!(signals::is_cancel(&result.unwrap_err()));
+        assert_eq!(
+            reports,
+            [hid::hid_key_report(1, 0, 4), hid::hid_key_report(1, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn cancelled_typing_releases_the_pressed_key() {
+        let mut reports = Vec::new();
+        let result = type_hid_text(
+            "ab",
+            1,
+            |report| {
+                reports.push(report.clone());
+                Ok(())
+            },
+            |_| false,
+        );
+        assert!(signals::is_cancel(&result.unwrap_err()));
+        assert_eq!(
+            reports,
+            [hid::hid_key_report(1, 0, 4), hid::hid_key_report(1, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn ir_capture_tx_keeps_legacy_forms_and_rejects_conflicting_sources() {
+        let cli =
+            Cli::try_parse_from(["infishark", "ir", "tx", "--capture", "3", "--repeats", "2"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ir {
+                action: IrCmd::Tx {
+                    target: None,
+                    arg: None,
+                    capture: Some(3),
+                    repeats: 2,
+                    ..
+                }
+            })
+        ));
+        for args in [
+            vec!["infishark", "ir", "tx", "nec", "20DF10EF"],
+            vec!["infishark", "ir", "tx", "remote.ir", "Power"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["infishark", "ir", "tx"],
+            vec!["infishark", "ir", "tx", "nec", "--capture", "3"],
+            vec!["infishark", "ir", "tx", "--capture", "3", "--bits", "32"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn cached_ir_save_and_capture_validation_work_without_a_device() {
+        let captures = vec![
+            IrCapture::Code(IrCode {
+                protocol: Protocol::Nec,
+                data: 0x20DF10EF,
+                bits: 32,
+            }),
+            IrCapture::Raw(RawIr {
+                khz: 38,
+                timings: vec![9000, 4500, 560, 1690],
+            }),
+        ];
+        *LAST_IR.lock().unwrap() = captures.clone();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("infishark-ir-save-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("selected.ir");
+        let cli = Cli::try_parse_from([
+            "infishark",
+            "--port",
+            "/no-nano-for-cached-ir-test",
+            "--json",
+            "ir",
+            "save",
+            path.to_str().unwrap(),
+            "2,1",
+            "2",
+        ])
+        .unwrap();
+        let Some(Command::Ir { action }) = &cli.command else {
+            panic!("expected IR command");
+        };
+        cmd_ir(&cli, action).unwrap();
+        let saved = IrRemote::load_strict(&path).unwrap();
+        assert_eq!(saved.buttons.len(), 2);
+        assert_eq!(saved.buttons[0].name, "Capture_2");
+        assert_eq!(saved.buttons[0].capture, captures[1]);
+        assert_eq!(saved.buttons[1].name, "Capture_1");
+        assert_eq!(saved.buttons[1].capture, captures[0]);
+        assert_eq!(cached_ir_capture(2).unwrap(), captures[1]);
+
+        let original = std::fs::read(&path).unwrap();
+        assert!(cmd_ir_save(&cli, &path, &[1, 3]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let invalid_tx = Cli::try_parse_from([
+            "infishark",
+            "--port",
+            "/no-nano-for-cached-ir-test",
+            "ir",
+            "tx",
+            "--capture",
+            "0",
+        ])
+        .unwrap();
+        let Some(Command::Ir { action }) = &invalid_tx.command else {
+            panic!("expected IR command");
+        };
+        assert!(
+            cmd_ir(&invalid_tx, action)
+                .unwrap_err()
+                .to_string()
+                .contains("capture #0 out of range")
+        );
+
+        let all = dir.join("all.ir");
+        cmd_ir_save(&cli, &all, &[]).unwrap();
+        let saved = IrRemote::load_strict(&all).unwrap();
+        assert_eq!(saved.buttons[0].capture, captures[0]);
+        assert_eq!(saved.buttons[1].capture, captures[1]);
+        LAST_IR.lock().unwrap().clear();
+        assert!(
+            cached_ir_capture(1)
+                .unwrap_err()
+                .to_string()
+                .contains("run `ir rx` first")
+        );
+        assert!(cmd_ir_save(&cli, &all, &[]).is_err());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(all).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn portal_verbose_is_opt_in() {
+        let cli = Cli::try_parse_from(["infishark", "wifi", "portal"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Wifi {
+                action: WifiCmd::Portal { verbose: false, .. },
+                ..
+            })
+        ));
+        for flag in ["--verbose", "-v"] {
+            let cli = Cli::try_parse_from(["infishark", "wifi", "portal", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Wifi {
+                    action: WifiCmd::Portal { verbose: true, .. },
+                    ..
+                })
+            ));
+        }
+    }
 }

@@ -442,9 +442,7 @@ mod linux {
         if detected.is_empty() {
             bail!("no supported input devices found");
         }
-        // "all" (the flag or typed at the prompt) grabs every input except the power
-        // button, which would swallow the host's own power key. It stays
-        // explicitly selectable by number.
+        // "all" skips the power button so the host can still use it.
         let grab_all = || -> Vec<InputDev> {
             detected
                 .iter()

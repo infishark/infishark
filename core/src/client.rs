@@ -21,6 +21,17 @@ pub struct Device {
     port: String,
 }
 
+/// UUID plus an optional attribute handle. Handle 0 is omitted so older
+/// firmware, which ignores unknown fields, still resolves a unique UUID.
+fn char_spec(char_uuid: &str, handle: Option<u16>) -> Result<serde_json::Value> {
+    let uuid = hex::bluetooth_uuid(char_uuid)?;
+    let mut spec = serde_json::json!({ "char": uuid });
+    if let Some(h) = handle.filter(|h| *h != 0) {
+        spec["handle"] = serde_json::json!(h);
+    }
+    Ok(spec)
+}
+
 impl Device {
     /// Open the device's serial port (auto-selected when `port` is `None`).
     /// `timeout_ms` bounds every blocking read including event waits
@@ -53,6 +64,22 @@ impl Device {
         crate::fw::DeviceFw::from_info(&self.device_info()?)
     }
 
+    pub fn ctf_hello(&mut self) -> Result<serde_json::Value> {
+        self.json_command(protocol::CMD_CTF_HELLO, b"")
+    }
+
+    pub fn ctf_load(&mut self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.json_command(protocol::CMD_CTF_LOAD, body.to_string().as_bytes())
+    }
+
+    /// Restart a challenge box while retaining its loaded RAM flag.
+    pub fn ctf_reset(&mut self) -> Result<serde_json::Value> {
+        // A reset must not be retried if its acknowledgement is lost.
+        let resp = self.transport.transact(protocol::CMD_CTF_RESET, b"")?;
+        check(&resp)?;
+        Ok(serde_json::from_slice(&resp.body)?)
+    }
+
     /// Live status (uptime, heap, battery, mesh).
     pub fn system_status(&mut self) -> Result<serde_json::Value> {
         self.json_command(protocol::CMD_SYSTEM_STATUS, b"")
@@ -72,7 +99,10 @@ impl Device {
         }
         let _ = self.stop_current_task();
         let _ = self.transport.drain_events();
-        self.command_ok_local(protocol::CMD_WIFI_SCAN, &opts.to_json())?;
+        if let Err(e) = self.command_ok_local(protocol::CMD_WIFI_SCAN, &opts.to_json()) {
+            let _ = self.stop_current_task();
+            return Err(e);
+        }
         let _ = self.transport.drain_events();
         let mut nets: std::collections::BTreeMap<String, Network> =
             std::collections::BTreeMap::new();
@@ -90,7 +120,10 @@ impl Device {
                 Ok((protocol::EVT_SCAN_DONE, _)) => break,
                 Ok(_) => {}
                 Err(Error::Timeout) => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let _ = self.stop_current_task();
+                    return Err(e);
+                }
             }
         }
         let _ = self.stop_current_task();
@@ -130,6 +163,120 @@ impl Device {
             bail!("adapter failed to associate with {target}");
         }
         Ok(v)
+    }
+
+    /// Start a router session and wait for its terminal association event.
+    pub fn wifi_mitm_start(
+        &mut self,
+        opts: &crate::wifi_mitm::WifiMitmOpts,
+        mut on_event: impl FnMut(serde_json::Value),
+    ) -> Result<serde_json::Value> {
+        let start = opts.to_json()?;
+        let old_timeout = self.transport.stream_mut().timeout();
+        self.set_read_timeout(Duration::from_millis(300))?;
+        let result = (|| {
+            self.stop_current_task()?;
+            for mac in &opts.block {
+                self.wifi_mitm_control(&serde_json::json!({
+                    "op":"block", "mac":format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
+                }))?;
+            }
+            let mut terminal = None;
+            let resp = self.transport.transact_with_events(
+                protocol::CMD_WIFI_MITM,
+                &local_args(&start),
+                |id, payload| {
+                    if id == protocol::EVT_WIFI_MITM {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                            if v.get("type").and_then(|x| x.as_str()) == Some("phase")
+                                && matches!(
+                                    v.get("phase").and_then(|x| x.as_str()),
+                                    Some("active" | "failed")
+                                )
+                            {
+                                terminal = Some(v.clone());
+                            }
+                            on_event(v);
+                        }
+                    }
+                },
+            )?;
+            check_mitm(&resp)?;
+            let ack: serde_json::Value = serde_json::from_slice(&resp.body)?;
+            let phase = ack.get("phase").and_then(|x| x.as_str()).unwrap_or("");
+            if phase == "failed" {
+                return Err(Error::msg("Wi-Fi MITM AP failed to start"));
+            }
+            if phase == "active" {
+                return Ok(ack);
+            }
+            if phase != "connecting" {
+                return Err(Error::msg("Wi-Fi MITM start returned no phase"));
+            }
+            if let Some(v) = terminal {
+                if v["phase"] == "active" {
+                    return Ok(v);
+                }
+                return Err(Error::msg("Wi-Fi MITM association failed"));
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                match self.next_event() {
+                    Ok((protocol::EVT_WIFI_MITM, payload)) => {
+                        let v: serde_json::Value = serde_json::from_slice(&payload)?;
+                        let phase = v.get("phase").and_then(|x| x.as_str()).unwrap_or("");
+                        on_event(v.clone());
+                        if phase == "active" {
+                            return Ok(v);
+                        }
+                        if phase == "failed" {
+                            return Err(Error::msg("Wi-Fi MITM association failed"));
+                        }
+                    }
+                    Ok(_) | Err(Error::Timeout) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(Error::msg("Wi-Fi MITM association timed out"))
+        })();
+        if result.is_err() {
+            let _ = self.stop_current_task();
+            let _ = self.wifi_mitm_control(&serde_json::json!({"op":"status"}));
+        }
+        let _ = self.set_read_timeout(old_timeout);
+        result
+    }
+
+    /// Send a scoped router control verb.
+    pub fn wifi_mitm_control(&mut self, spec: &serde_json::Value) -> Result<serde_json::Value> {
+        let resp = self.transact(protocol::CMD_WIFI_MITM, &local_args(spec))?;
+        check_mitm(&resp)?;
+        if resp.body.is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        Ok(serde_json::from_slice(&resp.body)?)
+    }
+
+    pub fn wifi_mitm_action(
+        &mut self,
+        id: u16,
+        action: crate::wifi_mitm::WifiMitmAction,
+    ) -> Result<()> {
+        let spec = match action {
+            crate::wifi_mitm::WifiMitmAction::Allow => {
+                serde_json::json!({"id":id,"action":"allow"})
+            }
+            crate::wifi_mitm::WifiMitmAction::Drop => serde_json::json!({"id":id,"action":"drop"}),
+            crate::wifi_mitm::WifiMitmAction::ReplaceA(a) => {
+                serde_json::json!({"id":id,"action":"replace","a":a.to_string()})
+            }
+        };
+        self.command_ok(protocol::CMD_WIFI_MITM_ACTION, &spec)
+    }
+
+    pub fn wifi_mitm_stop(&mut self) -> Result<()> {
+        self.stop_current_task()
     }
 
     /// Consume the device and return its raw serial port, for SLIP once the
@@ -543,10 +690,11 @@ impl Device {
         self.command_ok(protocol::CMD_BLE_HID_SEND, spec)
     }
 
-    /// Dual-link GATT proxy: connect to `spec.address`, clone its table, advertise.
-    /// Out: cloned identity (`name`, `mac`, `peer`, `chars`). Progress and ATT
-    /// traffic arrive as [`protocol::EVT_BLE_MITM`]; `on_event` is called for
-    /// progress frames that arrive before the command completes.
+    /// Dual-link GATT proxy: connect to `spec.address`, clone its table,
+    /// advertise. Out: cloned identity (`name`, `mac`, `peer`, `chars`).
+    /// Progress and ATT traffic arrive as [`protocol::EVT_BLE_MITM`];
+    /// `on_event` is called for progress frames that arrive before the
+    /// command completes.
     pub fn ble_mitm_start(
         &mut self,
         spec: &serde_json::Value,
@@ -618,20 +766,51 @@ impl Device {
     }
 
     /// Connect to a peripheral as a GATT central. Holds the BLE radio until
-    /// [`Device::gatt_disconnect`].
+    /// [`Device::gatt_disconnect`]. Retries a failed link a few times.
+    /// Pairing progress arrives as [`protocol::EVT_BLE_PAIR`] and is discarded.
     pub fn gatt_connect(&mut self, address: &str, opts: &GattConnectOpts) -> Result<()> {
-        let args = opts.to_json(address);
+        self.gatt_connect_tries(address, opts, 4, |_| {})
+    }
+
+    /// [`Device::gatt_connect`] with an explicit attempt count. `on_event`
+    /// receives pairing progress (`step` of `passkey`, `pair`, or `bonded`)
+    /// while the command is still running.
+    pub fn gatt_connect_tries(
+        &mut self,
+        address: &str,
+        opts: &GattConnectOpts,
+        tries: u32,
+        mut on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<()> {
+        let args = opts.to_json(address).to_string();
         let mut last = Error::msg("gatt connect failed");
-        for attempt in 0..4u32 {
-            match self.command_ok(protocol::CMD_BLE_GATT_CONNECT, &args) {
-                Ok(()) => return Ok(()),
-                Err(e) if gatt_connect_retryable(&e) && attempt < 3 => {
-                    let _ = self.stop_current_task();
-                    std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
-                    last = e;
-                }
-                Err(e) => return Err(e),
+        let n = tries.max(1);
+        for attempt in 0..n {
+            let resp = self.transport.transact_with_events(
+                protocol::CMD_BLE_GATT_CONNECT,
+                args.as_bytes(),
+                |id, payload| {
+                    if id == protocol::EVT_BLE_PAIR {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                            on_event(&v);
+                        }
+                    }
+                },
+            );
+            let err = match resp {
+                Ok(resp) => match check(&resp) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            };
+            if gatt_connect_retryable(&err) && attempt + 1 < n {
+                let _ = self.stop_current_task();
+                std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
+                last = err;
+                continue;
             }
+            return Err(err);
         }
         Err(last)
     }
@@ -645,42 +824,114 @@ impl Device {
 
     /// Read a characteristic value by UUID.
     pub fn gatt_read(&mut self, char_uuid: &str) -> Result<Vec<u8>> {
-        let uuid = hex::bluetooth_uuid(char_uuid)?;
-        let args = serde_json::json!({ "char": uuid }).to_string();
-        let v = self.json_command(protocol::CMD_BLE_GATT_READ, args.as_bytes())?;
+        self.gatt_read_at(char_uuid, None)
+    }
+
+    /// Read the attribute `handle` when it is set. HID Report reuses one UUID,
+    /// so the handle is which copy; zero and `None` keep the UUID lookup.
+    pub fn gatt_read_at(&mut self, char_uuid: &str, handle: Option<u16>) -> Result<Vec<u8>> {
+        self.gatt_read_at_with(char_uuid, handle, |_| {})
+    }
+
+    /// [`Device::gatt_read`], delivering pairing progress while the read waits.
+    pub fn gatt_read_with(
+        &mut self,
+        char_uuid: &str,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<Vec<u8>> {
+        self.gatt_read_at_with(char_uuid, None, on_event)
+    }
+
+    /// [`Device::gatt_read_at`] with pairing progress.
+    pub fn gatt_read_at_with(
+        &mut self,
+        char_uuid: &str,
+        handle: Option<u16>,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<Vec<u8>> {
+        let spec = char_spec(char_uuid, handle)?;
+        let v = self.command_watching(protocol::CMD_BLE_GATT_READ, &spec, on_event)?;
         let h = v.get("hex").and_then(|x| x.as_str()).unwrap_or("");
         hex::decode(h)
     }
 
     /// Write bytes to a characteristic by UUID.
     pub fn gatt_write(&mut self, char_uuid: &str, data: &[u8], with_response: bool) -> Result<()> {
-        let uuid = hex::bluetooth_uuid(char_uuid)?;
-        self.command_ok(
-            protocol::CMD_BLE_GATT_WRITE,
-            &serde_json::json!({
-                "char": uuid,
-                "data": hex::encode(data),
-                "response": with_response,
-            }),
-        )
+        self.gatt_write_at(char_uuid, None, data, with_response)
+    }
+
+    /// [`Device::gatt_write`] aimed at `handle` when it is set.
+    pub fn gatt_write_at(
+        &mut self,
+        char_uuid: &str,
+        handle: Option<u16>,
+        data: &[u8],
+        with_response: bool,
+    ) -> Result<()> {
+        self.gatt_write_at_with(char_uuid, handle, data, with_response, |_| {})
+    }
+
+    /// [`Device::gatt_write`], delivering pairing progress while the write
+    /// waits.
+    pub fn gatt_write_with(
+        &mut self,
+        char_uuid: &str,
+        data: &[u8],
+        with_response: bool,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<()> {
+        self.gatt_write_at_with(char_uuid, None, data, with_response, on_event)
+    }
+
+    /// [`Device::gatt_write_at`] with pairing progress.
+    pub fn gatt_write_at_with(
+        &mut self,
+        char_uuid: &str,
+        handle: Option<u16>,
+        data: &[u8],
+        with_response: bool,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<()> {
+        let mut spec = char_spec(char_uuid, handle)?;
+        spec["data"] = serde_json::json!(hex::encode(data));
+        spec["response"] = serde_json::json!(with_response);
+        self.command_watching(protocol::CMD_BLE_GATT_WRITE, &spec, on_event)
+            .map(|_| ())
     }
 
     /// Enable notifications (or indications) on a characteristic.
     pub fn gatt_subscribe(&mut self, char_uuid: &str, indicate: bool) -> Result<()> {
-        let uuid = hex::bluetooth_uuid(char_uuid)?;
-        self.command_ok(
-            protocol::CMD_BLE_GATT_SUBSCRIBE,
-            &serde_json::json!({ "char": uuid, "indicate": indicate }),
-        )
+        self.gatt_subscribe_at(char_uuid, None, indicate)
+    }
+
+    /// [`Device::gatt_subscribe`] aimed at `handle` when it is set.
+    pub fn gatt_subscribe_at(
+        &mut self,
+        char_uuid: &str,
+        handle: Option<u16>,
+        indicate: bool,
+    ) -> Result<()> {
+        let mut spec = char_spec(char_uuid, handle)?;
+        spec["indicate"] = serde_json::json!(indicate);
+        self.command_ok(protocol::CMD_BLE_GATT_SUBSCRIBE, &spec)
     }
 
     /// Stop notifications/indications on a characteristic.
     pub fn gatt_unsubscribe(&mut self, char_uuid: &str) -> Result<()> {
-        let uuid = hex::bluetooth_uuid(char_uuid)?;
-        self.command_ok(
-            protocol::CMD_BLE_GATT_UNSUBSCRIBE,
-            &serde_json::json!({ "char": uuid }),
-        )
+        self.gatt_unsubscribe_at(char_uuid, None)
+    }
+
+    /// [`Device::gatt_unsubscribe`] aimed at `handle` when it is set.
+    pub fn gatt_unsubscribe_at(&mut self, char_uuid: &str, handle: Option<u16>) -> Result<()> {
+        let spec = char_spec(char_uuid, handle)?;
+        self.command_ok(protocol::CMD_BLE_GATT_UNSUBSCRIBE, &spec)
+    }
+
+    /// Parameters of the open GATT link (RSSI, interval, MTU, encryption).
+    /// Older firmware returns [`Error::Device`] with
+    /// [`protocol::ERR_UNKNOWN_COMMAND`].
+    pub fn gatt_link(&mut self) -> Result<serde_json::Value> {
+        self.json_command(protocol::CMD_BLE_GATT_LINK, b"")
     }
 
     /// Block for the next notification/indication from any subscription. The
@@ -688,6 +939,16 @@ impl Device {
     pub fn next_notification(&mut self) -> Result<GattNotification> {
         let payload = self.wait_for_event(protocol::EVT_BLE_NOTIFY)?;
         Ok(serde_json::from_slice(&payload)?)
+    }
+
+    /// One read-timeout wait. `Ok(None)` on timeout or a non-notify event.
+    pub fn poll_notification(&mut self) -> Result<Option<GattNotification>> {
+        match self.transport.next_event() {
+            Ok((protocol::EVT_BLE_NOTIFY, payload)) => Ok(Some(serde_json::from_slice(&payload)?)),
+            Ok(_) => Ok(None),
+            Err(Error::Timeout) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Drop the GATT session.
@@ -772,6 +1033,30 @@ impl Device {
             offset = end as u32;
         }
         Ok(())
+    }
+
+    /// JSON command that prints [`protocol::EVT_BLE_PAIR`] while it runs.
+    fn command_watching(
+        &mut self,
+        opcode: u16,
+        spec: &serde_json::Value,
+        mut on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<serde_json::Value> {
+        let args = spec.to_string();
+        let resp =
+            self.transport
+                .transact_with_events(opcode, args.as_bytes(), |id, payload| {
+                    if id == protocol::EVT_BLE_PAIR {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                            on_event(&v);
+                        }
+                    }
+                })?;
+        check(&resp)?;
+        if resp.body.is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        Ok(serde_json::from_slice(&resp.body)?)
     }
 
     /// Send a JSON command whose only reply is success/error (no body used).
@@ -934,6 +1219,9 @@ fn gatt_connect_retryable(e: &Error) -> bool {
     match e {
         Error::Timeout => true,
         Error::Device { code, message } => {
+            if message.contains("pair") {
+                return false;
+            }
             *code == protocol::ERR_BUSY
                 || *code == protocol::ERR_INTERNAL
                 || message.contains("connect failed")
@@ -961,6 +1249,20 @@ fn check(resp: &Response) -> Result<()> {
     Ok(())
 }
 
+fn check_mitm(resp: &Response) -> Result<()> {
+    if resp.error == protocol::ERR_UNKNOWN_COMMAND
+        || (resp.error == protocol::ERR_BAD_ARGS
+            && serde_json::from_slice::<serde_json::Value>(&resp.body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|x| x.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some("not in this firmware"))
+    {
+        return Err(Error::msg("wifi mitm is not in this firmware"));
+    }
+    check(resp)
+}
+
 /// Read the `count` field from a mutation reply, defaulting to 0.
 fn count_field(v: &serde_json::Value) -> u8 {
     v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as u8
@@ -975,4 +1277,23 @@ fn parse_array<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str)
         out.push(serde_json::from_value(item.clone())?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod connect_retry_tests {
+    use super::*;
+
+    #[test]
+    fn pairing_failure_is_not_retried() {
+        let paired = Error::Device {
+            code: protocol::ERR_INTERNAL,
+            message: "{\"error\":\"disconnected during pairing (520)\"}".into(),
+        };
+        assert!(!gatt_connect_retryable(&paired));
+        let missed = Error::Device {
+            code: protocol::ERR_INTERNAL,
+            message: "{\"error\":\"connect failed\"}".into(),
+        };
+        assert!(gatt_connect_retryable(&missed));
+    }
 }

@@ -1,4 +1,5 @@
-//! Bluetooth SIG company-identifier resolution (the 16-bit IDs in BLE manufacturer data). Mirrors the oui module but for the SIG registry.
+//! Bluetooth SIG company-identifier resolution (the 16-bit IDs in BLE
+//! manufacturer data). Mirrors the oui module but for the SIG registry.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -71,7 +72,7 @@ impl Db {
 
     pub fn load(path: &std::path::Path) -> Result<Db> {
         let hint = format!(
-            "reading BLE company database {} (run infishark company update to install it)",
+            "reading BLE company database {} (run `infishark manage company update` to install it)",
             path.display()
         );
         Ok(Db(crate::registry::Db::load(path, &hint, |h| {

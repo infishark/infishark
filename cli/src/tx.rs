@@ -136,6 +136,27 @@ fn synthesize(o: &Opts) -> Result<Synth> {
         }
     }
     match o.ap.as_deref().or(o.bssid.as_deref()) {
+        Some(b) if crate::ui::is_row_index(b) => {
+            let net = crate::recon::wifi_scan_row(b)?;
+            if o.channel != 0 && o.channel != net.channel {
+                bail!(
+                    "--channel {} is not the AP channel {} ({})",
+                    o.channel,
+                    net.channel,
+                    net.bssid
+                );
+            }
+            let channel = if o.channel != 0 {
+                o.channel
+            } else {
+                net.channel
+            };
+            Ok(Synth {
+                ap: ieee80211::parse_mac(&net.bssid)?,
+                ssid: o.ssid.clone().filter(|s| !s.is_empty()).unwrap_or(net.ssid),
+                channel: require_2ghz(channel)?,
+            })
+        }
         Some(b) => {
             if o.channel == 0 {
                 bail!("--bssid/--ap needs --channel");
@@ -279,9 +300,6 @@ fn resolve_ap(dev: &mut Device, o: &Opts, oui_db: Option<&str>, json: bool) -> R
     }
     let bssid = o.ap.as_deref().or(o.bssid.as_deref());
     let channel = (o.channel != 0).then_some(o.channel);
-    if bssid.is_none() && o.ssid.is_none() {
-        crate::log::info("no --ap/--bssid; scanning for targets");
-    }
     let targets = crate::target::resolve_targets_ex(
         dev,
         o.ssid.as_deref(),

@@ -1,18 +1,27 @@
 //! Interactive reedline shell over the command tree; one device per session.
+//! `ble gatt subscribe` keeps that device open and prints notifications above
+//! the prompt.
 
 use std::borrow::Cow;
-use std::io::IsTerminal;
-use std::sync::atomic::Ordering;
+use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Arg, Command, CommandFactory, Parser};
 use console::style;
 use infishark::Device;
+use infishark::model::GattNotification;
 use reedline::{Color, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::ports::{DeviceIdent, PortEntry};
 use crate::signals::{RUNNING, install_sigint};
-use crate::{Cli, dispatch, ports};
+use crate::{BleCmd, Cli, Command as CliCommand, DbOpts, GattCmd, dispatch, ports};
+
+const LISTEN_MS: u64 = 200;
 
 const SHARK: &str = include_str!("art/shark.txt");
 const WORDMARK: &str = include_str!("art/wordmark.txt");
@@ -25,6 +34,11 @@ pub fn run(base: &Cli) -> Result<()> {
     let mut sh = Shell::new();
     install_sigint();
     sh.banner(utf8_locale() && !base.no_banner);
+    let account = crate::ctf_account::startup_status();
+    println!("{MARGIN}{}\n", style(account.message()).dim());
+    if account.is_pending() {
+        sh.account_status = Some(account);
+    }
     sh.repl()
 }
 
@@ -51,18 +65,45 @@ fn port_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+struct Listen {
+    dev: Arc<Mutex<Device>>,
+    port: String,
+    stop: Arc<AtomicBool>,
+    // Pause listener reads while a command owns the port.
+    pause: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+struct Unpause(Arc<AtomicBool>);
+
+impl Drop for Unpause {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 struct Shell {
     devices: Vec<PortEntry>,
     selected: Option<String>,
     peripheral: Option<&'static str>,
+    listen: Option<Listen>,
+    account_status: Option<crate::ctf_account::StartupCheck>,
+    // Queued by the listen thread. The shell owns the prompt and prints these.
+    notes_tx: SyncSender<String>,
+    notes_rx: Receiver<String>,
 }
 
 impl Shell {
     fn new() -> Self {
+        let (notes_tx, notes_rx) = sync_channel(64);
         let mut sh = Shell {
             devices: vec![],
             selected: None,
             peripheral: None,
+            listen: None,
+            account_status: None,
+            notes_tx,
+            notes_rx,
         };
         sh.refresh();
         sh.selected = sh.devices.first().map(|d| d.name.clone());
@@ -144,7 +185,7 @@ impl Shell {
         println!(
             "{MARGIN}{}   {}",
             style("https://docs.infishark.com").dim(),
-            style("help for commands, exit to quit").dim()
+            style("help for commands, !cmd runs a shell command, exit or :q quits").dim()
         );
         println!();
     }
@@ -152,6 +193,12 @@ impl Shell {
     fn repl(&mut self) -> Result<()> {
         let mut editor = Reedline::create();
         loop {
+            self.flush_notes();
+            // Reedline repaints the prompt, which would hide a line printed
+            // while it owns the screen. Wait here until a key arrives.
+            if self.listen.is_some() || self.account_status.is_some() {
+                self.idle_until_key()?;
+            }
             let prompt = NanoPrompt(self.label());
             match editor.read_line(&prompt) {
                 Ok(Signal::Success(line)) => {
@@ -159,16 +206,27 @@ impl Shell {
                     if line.is_empty() {
                         continue;
                     }
-                    if matches!(line, "exit" | "quit") {
+                    if is_quit(line) {
+                        self.stop_listen();
                         break;
+                    }
+                    if let Some(cmd) = host_command(line) {
+                        self.stop_listen();
+                        self.account_status = None;
+                        run_host(cmd);
+                        continue;
                     }
                     if !self.builtin(line) {
                         self.exec(line);
                     }
                 }
                 Ok(Signal::CtrlC) => continue,
-                Ok(Signal::CtrlD) => break,
+                Ok(Signal::CtrlD) => {
+                    self.stop_listen();
+                    break;
+                }
                 Err(e) => {
+                    self.stop_listen();
                     crate::log::err(format!("input: {e}"));
                     break;
                 }
@@ -220,8 +278,10 @@ impl Shell {
             .ok()
             .or_else(|| arg.strip_prefix("nano")?.parse().ok());
         if let Some(i) = idx.filter(|&i| i < self.devices.len()) {
+            self.stop_listen();
             self.selected = Some(self.devices[i].name.clone());
         } else if self.index_of(arg).is_some() || port_exists(arg) {
+            self.stop_listen();
             self.selected = Some(arg.to_string());
         } else {
             crate::log::err(format!("no such device '{arg}' (try 'ports' or 'select')"));
@@ -237,7 +297,8 @@ impl Shell {
             .as_slice()
         {
             ["ble", "adv"] => self.peripheral = Some("adv"),
-            ["ble", "stop"] => self.peripheral = None,
+            ["ble", "gatt", "subscribe"] => self.peripheral = Some("gatt"),
+            ["ble", "gatt", "disconnect"] | ["ble", "stop"] => self.peripheral = None,
             _ => {}
         }
     }
@@ -249,6 +310,8 @@ impl Shell {
         };
         let is_help = toks.iter().any(|t| matches!(t.as_str(), "--help" | "-h"));
         if !is_help && line.contains(['|', '>', '<']) {
+            self.stop_listen();
+            self.account_status = None;
             self.run_external(line);
             return;
         }
@@ -285,9 +348,35 @@ impl Shell {
                     cli.port = self.selected.clone();
                 }
                 if let Some(command) = &cli.command {
+                    if matches!(
+                        command,
+                        CliCommand::Ctf {
+                            action: crate::CtfCmd::Account { .. }
+                        }
+                    ) {
+                        // Login/logout may replace or remove the saved session.
+                        // A startup probe must not print a stale account afterward.
+                        self.account_status = None;
+                    }
                     RUNNING.store(true, Ordering::SeqCst);
-                    match dispatch(&cli, command) {
+                    let result = match command {
+                        CliCommand::Ble {
+                            db,
+                            action: BleCmd::Gatt { action },
+                        } => self.gatt_cmd(&cli, db, action),
+                        CliCommand::Ir {
+                            action: crate::IrCmd::Save { .. },
+                        } => dispatch(&cli, command),
+                        _ => {
+                            self.stop_listen();
+                            dispatch(&cli, command)
+                        }
+                    };
+                    match result {
                         Ok(()) => self.track_peripheral(&path),
+                        Err(e) if crate::signals::is_cancel(&e) => {
+                            let _ = writeln!(std::io::stderr());
+                        }
                         Err(e) => crate::log::err(format!("{e:#}")),
                     }
                 }
@@ -335,11 +424,291 @@ impl Shell {
         println!("{}", style("shell").bold());
         help_row("select", Some("switch active device (N | port)".into()), 6);
         help_row("clear", Some("clear the screen".into()), 6);
-        help_row("exit", Some("leave the shell".into()), 6);
+        help_row("!cmd", Some("run a shell command".into()), 6);
+        help_row("exit", Some("leave the shell (quit, :q)".into()), 6);
+    }
+
+    fn gatt_cmd(&mut self, cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
+        if let (Some(listen), Some(port)) = (&self.listen, cli.port.as_deref()) {
+            if listen.port != port {
+                self.stop_listen();
+            }
+        }
+        match action {
+            GattCmd::Subscribe { uuids, indicate } => self.start_listen(cli, uuids, *indicate),
+            GattCmd::Disconnect if self.listen.is_some() => {
+                let r = self.run_gatt(cli, db, action);
+                self.stop_listen();
+                r
+            }
+            _ if self.listen.is_some() => self.run_gatt(cli, db, action),
+            _ => crate::cmd_gatt(cli, db, action),
+        }
+    }
+
+    fn start_listen(&mut self, cli: &Cli, uuids: &[String], indicate: bool) -> Result<()> {
+        let sel = crate::gatt_subscribe_selection(uuids, indicate)?;
+        if sel.targets.is_empty() {
+            crate::report_selection_misses(cli, &sel);
+            anyhow::bail!("subscribe failed");
+        }
+        let fresh = self.listen.is_none();
+        self.ensure_listen(cli)?;
+        let subscribed = self.run_on_dev(cli.timeout_ms.max(12_000), |dev| {
+            crate::apply_gatt_subscribe(cli, dev, &sel)
+        });
+        match subscribed {
+            Ok(()) => {
+                if cli.json {
+                    crate::print_ok(true)
+                } else {
+                    crate::log::info("listening");
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                if fresh {
+                    self.stop_listen();
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn ensure_listen(&mut self, cli: &Cli) -> Result<()> {
+        if self.listen.is_some() {
+            return Ok(());
+        }
+        let mut dev = cli.open(cli.timeout_ms.max(12_000))?;
+        let port = dev.port().to_string();
+        dev.set_read_timeout(Duration::from_millis(LISTEN_MS))?;
+        let dev = Arc::new(Mutex::new(dev));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let d2 = Arc::clone(&dev);
+        let s2 = Arc::clone(&stop);
+        let p2 = Arc::clone(&pause);
+        let tx = self.notes_tx.clone();
+        let thread = std::thread::spawn(move || listen_loop(d2, s2, p2, tx));
+        self.listen = Some(Listen {
+            dev,
+            port,
+            stop,
+            pause,
+            thread: Some(thread),
+        });
+        Ok(())
+    }
+
+    fn run_gatt(&mut self, cli: &Cli, db: &DbOpts, action: &GattCmd) -> Result<()> {
+        self.run_on_dev(crate::gatt_timeout(cli, action), |dev| {
+            crate::gatt_on(cli, db, action, dev)
+        })
+    }
+
+    fn run_on_dev(
+        &mut self,
+        timeout_ms: u64,
+        f: impl FnOnce(&mut Device) -> Result<()>,
+    ) -> Result<()> {
+        let listen = self
+            .listen
+            .as_ref()
+            .ok_or_else(|| anyhow!("not listening"))?;
+        // Unlock the device before clearing pause, or the listener can steal the port.
+        listen.pause.store(true, Ordering::SeqCst);
+        let _unpause = Unpause(Arc::clone(&listen.pause));
+        let mut dev = listen
+            .dev
+            .lock()
+            .map_err(|_| anyhow!("device lock poisoned"))?;
+        dev.set_read_timeout(Duration::from_millis(timeout_ms))?;
+        let r = f(&mut dev);
+        let _ = dev.set_read_timeout(Duration::from_millis(1));
+        // Drain queued notifications until quiet so a stream cannot hold the prompt.
+        for _ in 0..32 {
+            match dev.poll_notification() {
+                Ok(Some(n)) => println!("{}", notify_line(&n)),
+                Err(infishark::Error::Json(e)) => {
+                    println!("notify: {e}");
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let _ = dev.set_read_timeout(Duration::from_millis(LISTEN_MS));
+        r
+    }
+
+    fn stop_listen(&mut self) {
+        let Some(mut l) = self.listen.take() else {
+            return;
+        };
+        l.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = l.thread.take() {
+            let _ = t.join();
+        }
+        if self.peripheral == Some("gatt") {
+            self.peripheral = None;
+        }
+    }
+
+    fn flush_notes(&mut self) {
+        while let Ok(line) = self.notes_rx.try_recv() {
+            println!("{line}");
+        }
+        if let Some(line) = self.account_update() {
+            println!("{MARGIN}{}", style(line).dim());
+        }
+    }
+
+    fn account_update(&mut self) -> Option<String> {
+        let check = self.account_status.as_mut()?;
+        let update = check.poll_update();
+        if !check.is_pending() {
+            self.account_status = None;
+        }
+        update
+    }
+
+    fn idle_until_key(&mut self) -> Result<()> {
+        crossterm::terminal::enable_raw_mode()?;
+        let label = self.label();
+        paint_prompt(&label);
+        loop {
+            while let Ok(line) = self.notes_rx.try_recv() {
+                paint_above(&label, &line);
+            }
+            if let Some(line) = self.account_update() {
+                paint_above(&label, &style(line).dim().to_string());
+            }
+            if self.listen.is_none() && self.account_status.is_none() {
+                erase_line();
+                return Ok(());
+            }
+            #[cfg(unix)]
+            let pending = stdin_pending(40);
+            #[cfg(not(unix))]
+            let pending =
+                crossterm::event::poll(Duration::from_millis(40)).map_err(anyhow::Error::from);
+            match pending {
+                Ok(true) => {
+                    erase_line();
+                    // Leave raw mode on so reedline reads the key that woke us.
+                    return Ok(());
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 
-// Best-effort live stats for a device (opens it briefly for `device status`).
+fn notify_line(n: &GattNotification) -> String {
+    let kind = if n.is_notify { "notify" } else { "indicate" };
+    let id = brief_uuid(&n.characteristic);
+    // Handle distinguishes two characteristics that share a UUID (HID Report).
+    if n.handle == 0 {
+        format!("[{kind}] {id}  {}", n.hex)
+    } else {
+        format!("[{kind}] {:#06x}  {id}  {}", n.handle, n.hex)
+    }
+}
+
+fn brief_uuid(uuid: &str) -> String {
+    let u = uuid.trim().to_ascii_lowercase();
+    if let Some(body) = u.strip_suffix("-0000-1000-8000-00805f9b34fb") {
+        if let Some(short) = body.strip_prefix("0000") {
+            if short.len() == 4 && short.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return format!("0x{short}");
+            }
+        }
+    }
+    u
+}
+
+fn listen_loop(
+    dev: Arc<Mutex<Device>>,
+    stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    tx: SyncSender<String>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        if pause.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let line = {
+            let Ok(mut d) = dev.lock() else {
+                break;
+            };
+            // Recheck after the lock so a command is not stuck behind another read.
+            if pause.load(Ordering::Acquire) || stop.load(Ordering::Relaxed) {
+                None
+            } else {
+                match d.poll_notification() {
+                    Ok(Some(n)) => Some(notify_line(&n)),
+                    Ok(None) => None,
+                    Err(infishark::Error::Timeout) | Err(infishark::Error::Interrupted) => None,
+                    Err(infishark::Error::Json(e)) => Some(format!("notify: {e}")),
+                    Err(e) => {
+                        let _ = tx.try_send(format!("notify: {e}"));
+                        break;
+                    }
+                }
+            }
+        };
+        if let Some(line) = line {
+            // A full queue drops the line. A blocking send would stall quit.
+            let _ = tx.try_send(line);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn stdin_pending(timeout_ms: i32) -> Result<bool> {
+    let mut fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+        if rc >= 0 {
+            return Ok(rc > 0);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err.into());
+    }
+}
+
+fn paint_prompt(label: &str) {
+    let mut out = std::io::stdout();
+    let head = style(label).white();
+    let ind = style("> ").dim();
+    let _ = write!(out, "\r\x1b[2K{head}{ind}");
+    let _ = out.flush();
+}
+
+fn paint_above(label: &str, line: &str) {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r\x1b[2K{line}\r\n");
+    let _ = out.flush();
+    paint_prompt(label);
+}
+
+fn erase_line() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r\x1b[2K");
+    let _ = out.flush();
+}
+
 fn stats(port: &str, id: &DeviceIdent) -> Option<String> {
     let s = Device::open(Some(port), 2000).ok()?.system_status().ok()?;
     let field = |k: &str| s.get(k).and_then(|v| v.as_u64());
@@ -438,6 +807,109 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn is_quit(line: &str) -> bool {
+    matches!(line, "exit" | "quit" | ":q" | ":q!")
+}
+
+/// A leading `!` runs the rest in the host shell; `Some("")` means a bare `!`.
+fn host_command(line: &str) -> Option<&str> {
+    line.strip_prefix('!').map(str::trim_start)
+}
+
+enum CdPlan {
+    NotCd,
+    Home,
+    Path(String),
+    RunShell,
+}
+
+fn cd_plan(cmd: &str) -> CdPlan {
+    let Some(toks) = shlex::split(cmd) else {
+        return CdPlan::RunShell;
+    };
+    if toks.first().map(String::as_str) != Some("cd") {
+        return CdPlan::NotCd;
+    }
+    match toks.len() {
+        1 => CdPlan::Home,
+        2 => {
+            let path = &toks[1];
+            // `~user` is the shell's job. `~` and `~/...` stick via set_current_dir.
+            if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+                CdPlan::RunShell
+            } else {
+                CdPlan::Path(path.clone())
+            }
+        }
+        _ => CdPlan::RunShell,
+    }
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+fn expand_cd_path(raw: &str) -> Result<std::path::PathBuf, &'static str> {
+    if raw == "~" {
+        return home_dir().ok_or("home directory is not set");
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = home_dir().ok_or("home directory is not set")?;
+        return Ok(home.join(rest));
+    }
+    Ok(std::path::PathBuf::from(raw))
+}
+
+fn apply_cd(path: Option<&str>) {
+    let dest = match path {
+        None => match home_dir() {
+            Some(p) => p,
+            None => {
+                eprintln!("cd: home directory is not set");
+                return;
+            }
+        },
+        Some(raw) => match expand_cd_path(raw) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cd: {e}");
+                return;
+            }
+        },
+    };
+    if let Err(e) = std::env::set_current_dir(&dest) {
+        eprintln!("cd: {}: {e}", dest.display());
+    }
+}
+
+fn run_host(cmd: &str) {
+    if cmd.is_empty() {
+        eprintln!("usage: !<command>");
+        return;
+    }
+    match cd_plan(cmd) {
+        CdPlan::Home => apply_cd(None),
+        CdPlan::Path(path) => apply_cd(Some(&path)),
+        CdPlan::NotCd | CdPlan::RunShell => spawn_sh(cmd),
+    }
+}
+
+fn spawn_sh(cmd: &str) {
+    RUNNING.store(true, Ordering::SeqCst);
+    let result = std::process::Command::new(crate::privs::tool_path("sh"))
+        .arg("-c")
+        .arg(cmd)
+        .status();
+    // Reset RUNNING after child Ctrl-C so the next command does not stop
+    // immediately.
+    RUNNING.store(true, Ordering::SeqCst);
+    if let Err(e) = result {
+        eprintln!("failed to run: {e}");
+    }
+}
+
 fn arg_label(a: &Arg) -> String {
     match a.get_long() {
         Some(l) => format!("--{l}"),
@@ -495,5 +967,98 @@ impl Prompt for NanoPrompt {
     }
     fn get_indicator_color(&self) -> Color {
         Color::Grey
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sig_uuid_is_shown_short() {
+        assert_eq!(brief_uuid("00002A19-0000-1000-8000-00805F9B34FB"), "0x2a19");
+        assert_eq!(
+            brief_uuid("deadbeef-1234-5678-9abc-000000000000"),
+            "deadbeef-1234-5678-9abc-000000000000"
+        );
+    }
+
+    #[test]
+    fn notify_line_shows_the_handle_beside_a_shared_uuid() {
+        let n = GattNotification {
+            characteristic: "00002a4d-0000-1000-8000-00805f9b34fb".into(),
+            handle: 24,
+            is_notify: true,
+            hex: "a1".into(),
+        };
+        assert_eq!(notify_line(&n), "[notify] 0x0018  0x2a4d  a1");
+    }
+    #[test]
+    fn account_status_does_not_change_device_or_peripheral_prompts() {
+        let (notes_tx, notes_rx) = sync_channel(1);
+        let port = "/dev/fake-nano".to_string();
+        let mut sh = Shell {
+            devices: vec![PortEntry {
+                name: port.clone(),
+                kind: "USB".into(),
+                vid: None,
+                pid: None,
+                serial_number: None,
+                manufacturer: None,
+                product: None,
+                device: None,
+            }],
+            selected: Some(port),
+            peripheral: None,
+            listen: None,
+            account_status: None,
+            notes_tx,
+            notes_rx,
+        };
+        assert_eq!(sh.label(), "nano0");
+        sh.peripheral = Some("BLE");
+        assert_eq!(sh.label(), "nano0 (BLE)");
+        let prompt = NanoPrompt(sh.label());
+        assert_eq!(prompt.render_prompt_left(), "nano0 (BLE)");
+        assert_eq!(
+            prompt.render_prompt_indicator(PromptEditMode::Default),
+            "> "
+        );
+        sh.selected = None;
+        sh.peripheral = None;
+        assert_eq!(sh.label(), "infishark");
+    }
+
+    #[test]
+    fn quit_lines() {
+        assert!(is_quit("exit"));
+        assert!(is_quit("quit"));
+        assert!(is_quit(":q"));
+        assert!(is_quit(":q!"));
+        assert!(!is_quit(":wq"));
+        assert!(!is_quit("q"));
+        assert!(!is_quit("exit now"));
+    }
+
+    #[test]
+    fn bang_strips_once() {
+        assert_eq!(host_command("ls"), None);
+        assert_eq!(host_command("!ls"), Some("ls"));
+        assert_eq!(host_command("! ls -la"), Some("ls -la"));
+        assert_eq!(host_command("!"), Some(""));
+        assert_eq!(host_command("!   "), Some(""));
+        assert_eq!(host_command("wifi !scan"), None);
+    }
+
+    #[test]
+    fn cd_plan_cases() {
+        assert!(matches!(cd_plan("ls"), CdPlan::NotCd));
+        assert!(matches!(cd_plan("cd"), CdPlan::Home));
+        assert!(matches!(cd_plan("cd /tmp"), CdPlan::Path(p) if p == "/tmp"));
+        assert!(matches!(cd_plan("cd \"a b\""), CdPlan::Path(p) if p == "a b"));
+        assert!(matches!(cd_plan("cd foo && ls"), CdPlan::RunShell));
+        assert!(matches!(cd_plan("cd ~/x"), CdPlan::Path(p) if p == "~/x"));
+        assert!(matches!(cd_plan("cd ~root"), CdPlan::RunShell));
+        assert!(matches!(cd_plan("cd \"unclosed"), CdPlan::RunShell));
     }
 }

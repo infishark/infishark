@@ -94,7 +94,8 @@ pub struct HiddenCorrelation {
 
 /// Correlate empty-SSID rows with nearby named APs of the same OUI.
 ///
-/// Thresholds: |dRSSI| <= rssi_window dB; same OUI, last-octet +/- 1, same channel.
+/// Thresholds: |dRSSI| <= rssi_window dB; same OUI, last-octet +/- 1, same
+/// channel.
 pub fn hidden_correlations(nets: &[Network], rssi_window: u8) -> Vec<HiddenCorrelation> {
     let mut out = Vec::new();
     for h in nets.iter().filter(|n| n.ssid.is_empty()) {

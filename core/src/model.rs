@@ -33,7 +33,7 @@ pub struct Network {
 impl Network {
     pub fn enrich(&mut self, oui: Option<&oui::Db>) {
         if let Some(db) = oui {
-            if let Some(v) = db.lookup(&self.bssid) {
+            if let Some(v) = db.lookup_ap(&self.bssid) {
                 self.vendor = Some(v.to_string());
             }
         }
@@ -189,11 +189,43 @@ pub struct BleDevice {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// Universally administered unicast: both the local and group bits are clear.
+fn universal_oui(addr: &str) -> bool {
+    let mut hex = addr.chars().filter(|c| c.is_ascii_hexdigit());
+    let Some(hi) = hex.next().and_then(|c| c.to_digit(16)) else {
+        return false;
+    };
+    let Some(lo) = hex.next().and_then(|c| c.to_digit(16)) else {
+        return false;
+    };
+    (hi << 4 | lo) & 0x03 == 0
+}
+
 impl BleDevice {
-    /// Whether this address class carries a real OUI (public /
-    /// public-identity).
+    /// Public and public-identity addresses carry a real OUI. If the address
+    /// type was not reported, a universally administered address still does.
     fn has_public_oui(&self) -> bool {
-        matches!(self.addr_type, Some(0) | Some(2))
+        match self.addr_type {
+            Some(0) | Some(2) => true,
+            Some(_) => false,
+            None => universal_oui(&self.address),
+        }
+    }
+
+    /// SIG company id, or the first two bytes of manufacturer data
+    /// (little-endian).
+    fn resolved_company_id(&self) -> Option<u16> {
+        if let Some(id) = self.company_id {
+            return Some(id);
+        }
+        let hex = self.extra.get("mfg_data")?.as_str()?;
+        let digits: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if digits.len() < 4 {
+            return None;
+        }
+        let lo = u8::from_str_radix(&digits[0..2], 16).ok()?;
+        let hi = u8::from_str_radix(&digits[2..4], 16).ok()?;
+        Some(u16::from_le_bytes([lo, hi]))
     }
 
     /// Fill `vendor` (public addresses only) and override `company` from the
@@ -207,7 +239,7 @@ impl BleDevice {
             }
         }
         if let Some(db) = companies {
-            if let Some(id) = self.company_id {
+            if let Some(id) = self.resolved_company_id() {
                 if let Some(name) = db.lookup(id) {
                     self.company = Some(name.to_string());
                 }
@@ -379,11 +411,17 @@ pub struct GattConnectOpts {
     pub latency: Option<u16>,
     pub supervision_timeout: Option<u16>,
     pub secure: bool,
+    /// Pair with a deadline and surface the PIN. The device does not block
+    /// inside `secureConnection()` for this flag.
+    pub pair: bool,
     pub bond: bool,
     pub mitm: bool,
     pub sc: bool,
     pub io_cap: Option<u8>,
     pub passkey: Option<u32>,
+    /// "off", "auto", "passkey", or "justworks". Omitted lets the device
+    /// decide.
+    pub pair_mode: Option<String>,
 }
 
 impl GattConnectOpts {
@@ -403,11 +441,13 @@ impl GattConnectOpts {
         insert_opt(&mut m, "latency", self.latency);
         insert_opt(&mut m, "supervision_timeout", self.supervision_timeout);
         insert_flag(&mut m, "secure", self.secure, true.into());
+        insert_flag(&mut m, "pair", self.pair, true.into());
         insert_flag(&mut m, "bond", self.bond, true.into());
         insert_flag(&mut m, "mitm", self.mitm, true.into());
         insert_flag(&mut m, "sc", self.sc, true.into());
         insert_opt(&mut m, "io_cap", self.io_cap);
         insert_opt(&mut m, "passkey", self.passkey);
+        insert_opt(&mut m, "pair_mode", self.pair_mode.as_deref());
         serde_json::Value::Object(m)
     }
 }
@@ -467,6 +507,39 @@ mod tests {
         random.enrich(Some(&db), None);
         assert_eq!(public.vendor.as_deref(), Some("Apple, Inc."));
         assert!(random.vendor.is_none());
+    }
+
+    #[test]
+    fn ble_enrich_uses_oui_when_address_type_is_missing() {
+        let db = oui_db(0x001B63, "Apple, Inc.");
+        let mut known: BleDevice =
+            serde_json::from_str(r#"{"address":"00:1B:63:11:22:33"}"#).unwrap();
+        let mut local: BleDevice =
+            serde_json::from_str(r#"{"address":"02:1B:63:11:22:33"}"#).unwrap();
+        known.enrich(Some(&db), None);
+        local.enrich(Some(&db), None);
+        assert_eq!(known.vendor.as_deref(), Some("Apple, Inc."));
+        assert!(local.vendor.is_none());
+    }
+
+    #[test]
+    fn ble_company_falls_back_to_manufacturer_data() {
+        let db = company::Db::from_map(HashMap::from([(0x004Cu16, "Apple, Inc.".to_string())]));
+        let mut d: BleDevice = serde_json::from_str(
+            r#"{"address":"AA:BB:CC:DD:EE:FF","addr_type":1,"mfg_data":"4c0016"}"#,
+        )
+        .unwrap();
+        d.enrich(None, Some(&db));
+        assert_eq!(d.company.as_deref(), Some("Apple, Inc."));
+        assert!(d.vendor.is_none());
+    }
+
+    #[test]
+    fn network_enrich_resolves_virtual_bssid() {
+        let db = oui_db(0x001122, "Example");
+        let mut n: Network = serde_json::from_str(r#"{"bssid":"02:11:22:00:00:01"}"#).unwrap();
+        n.enrich(Some(&db));
+        assert_eq!(n.vendor.as_deref(), Some("Example"));
     }
 
     #[test]

@@ -1,11 +1,14 @@
-//! libpcap writer. The device streams raw frames; the host stamps them with its
-//! own wall-clock and wraps them in pcap for Wireshark/tshark.
+//! libpcap writer/reader. The device streams raw frames; the host stamps them
+//! with its own wall-clock and wraps them in pcap for Wireshark/tshark. A
+//! reader recovers ATT PDUs from HCI captures so recorded traffic can be
+//! replayed.
 
-use std::io::{Result, Write};
+use std::io::{Read, Result, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// pcap link type for bare 802.11 MAC frames
 pub const LINKTYPE_IEEE802_11: u32 = 105;
+pub const LINKTYPE_RAW: u32 = 101;
 
 /// pcap link type for 802.11 frames prefixed with a radiotap header
 pub const LINKTYPE_IEEE802_11_RADIOTAP: u32 = 127;
@@ -26,6 +29,11 @@ pub fn write_global_header<W: Write>(w: &mut W, linktype: u32) -> Result<()> {
 
 /// Write one packet record, timestamped with the host clock at call time.
 pub fn write_record<W: Write>(w: &mut W, frame: &[u8]) -> Result<()> {
+    write_record_truncated(w, frame, frame.len() as u32)
+}
+
+/// Write a captured prefix while retaining the original IP packet length.
+pub fn write_record_truncated<W: Write>(w: &mut W, frame: &[u8], orig_len: u32) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -33,7 +41,7 @@ pub fn write_record<W: Write>(w: &mut W, frame: &[u8]) -> Result<()> {
     w.write_all(&(now.as_secs() as u32).to_le_bytes())?; // ts_sec
     w.write_all(&now.subsec_micros().to_le_bytes())?; // ts_usec
     w.write_all(&len.to_le_bytes())?; // incl_len
-    w.write_all(&len.to_le_bytes())?; // orig_len
+    w.write_all(&orig_len.to_le_bytes())?; // orig_len
     w.write_all(frame)?;
     Ok(())
 }
@@ -116,22 +124,126 @@ pub fn mitm_event_to_hci(v: &serde_json::Value) -> Option<Vec<u8>> {
         "notify" if handle != 0 => att_handle_value(0x1B, handle, &value),
         "indicate" if handle != 0 => att_handle_value(0x1D, handle, &value),
         "write" if handle != 0 => att_handle_value(0x52, handle, &value),
-        "subscribe" if handle != 0 => {
-            // CCCD is the next attribute after the value handle.
-            att_handle_value(0x12, handle.saturating_add(1), &[0x01, 0x00])
-        }
-        "unsubscribe" if handle != 0 => {
-            att_handle_value(0x12, handle.saturating_add(1), &[0x00, 0x00])
-        }
+        // Subscribe is skipped. The CCCD is not the value handle plus one.
+        "subscribe" | "unsubscribe" => return None,
         _ => return None,
     };
     let host_to_controller = dir == "p2c";
     Some(hci_att_frame(host_to_controller, &att))
 }
 
+/// One ATT PDU read back from an HCI H4-with-pseudoheader pcap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttRecord {
+    /// Record timestamp, microseconds since the capture epoch.
+    pub ts_us: u64,
+    /// Direction prefix: true = host -> controller (our p2c notifications).
+    pub host_to_controller: bool,
+    /// ATT PDU bytes (opcode + handle + value).
+    pub pdu: Vec<u8>,
+}
+
+/// Read ATT PDUs from a `LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR` capture written
+/// by [`hci_att_frame`]. Frames that are not complete ACL packets on the ATT
+/// L2CAP CID (4) are skipped. Both pcap byte orders are accepted.
+pub fn read_hci_att_pcap<R: Read>(mut r: R) -> Result<Vec<AttRecord>> {
+    fn le(b: &[u8]) -> u32 {
+        u32::from_le_bytes(b.try_into().expect("4 bytes"))
+    }
+    let mut hdr = [0u8; 24];
+    r.read_exact(&mut hdr)?;
+    let little = match le(&hdr[0..4]) {
+        0xa1b2c3d4 => true,
+        0xd4c3b2a1 => false,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not a microsecond-resolution pcap file",
+            ));
+        }
+    };
+    let u32_at = |b: &[u8]| {
+        if little {
+            le(b)
+        } else {
+            u32::from_be_bytes(b.try_into().expect("4 bytes"))
+        }
+    };
+    let linktype = u32_at(&hdr[20..24]);
+    if linktype != LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported pcap link type {linktype}"),
+        ));
+    }
+    let mut out = Vec::new();
+    let mut rec = [0u8; 16];
+    let mut frame = Vec::new();
+    loop {
+        match r.read_exact(&mut rec) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let ts_us = (u32_at(&rec[0..4]) as u64) * 1_000_000 + u32_at(&rec[4..8]) as u64;
+        let incl = u32_at(&rec[8..12]) as usize;
+        if incl > 1 << 20 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "implausible pcap record length",
+            ));
+        }
+        frame.clear();
+        frame.resize(incl, 0);
+        if let Err(e) = r.read_exact(&mut frame) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                break; // truncated tail
+            }
+            return Err(e);
+        }
+        if let Some((p2c, pdu)) = parse_hci_att_frame(&frame) {
+            out.push(AttRecord {
+                ts_us,
+                host_to_controller: p2c,
+                pdu,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Split one HCI H4-with-pseudoheader frame into (peripheral_to_central, ATT
+/// PDU). Returns `None` for non-ACL frames, L2CAP fragments, and non-ATT CIDs.
+fn parse_hci_att_frame(frame: &[u8]) -> Option<(bool, Vec<u8>)> {
+    if frame.len() < 13 || frame[4] != 0x02 {
+        return None; // not HCI ACL
+    }
+    let handle_pb = u16::from_le_bytes(frame[5..7].try_into().ok()?);
+    if (handle_pb >> 12) & 0b11 != 0b10 {
+        return None; // not a complete-packet start; our writer never fragments
+    }
+    let l2_len = u16::from_le_bytes(frame[9..11].try_into().ok()?) as usize;
+    let cid = u16::from_le_bytes(frame[11..13].try_into().ok()?);
+    if cid != 4 || frame.len() < 13 + l2_len {
+        return None; // not ATT, or truncated
+    }
+    Some((
+        u32::from_be_bytes(frame[0..4].try_into().ok()?) == 0,
+        frame[13..13 + l2_len].to_vec(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_record_keeps_original_ip_length() {
+        let mut data = Vec::new();
+        write_record_truncated(&mut data, &[0x45, 0, 0, 60], 60).unwrap();
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 60);
+    }
 
     #[test]
     fn mitm_notify_is_att_handle_value_notification() {
@@ -151,23 +263,44 @@ mod tests {
     }
 
     #[test]
-    fn mitm_subscribe_is_cccd_write() {
+    fn mitm_subscribe_is_not_invented() {
         let v = serde_json::json!({
             "dir": "c2p",
             "op": "subscribe",
             "handle": 16
         });
-        let frame = mitm_event_to_hci(&v).unwrap();
-        assert_eq!(&frame[0..4], &[0, 0, 0, 1]); // controller → host
-        let att_off = 4 + 1 + 4 + 4;
-        assert_eq!(frame[att_off], 0x12);
-        assert_eq!(&frame[att_off + 1..att_off + 3], &[17, 0]); // handle+1
-        assert_eq!(&frame[att_off + 3..], &[0x01, 0x00]);
+        assert!(mitm_event_to_hci(&v).is_none());
     }
 
     #[test]
     fn mitm_status_has_no_pdu() {
         let v = serde_json::json!({"op":"status","step":"ready"});
         assert!(mitm_event_to_hci(&v).is_none());
+    }
+
+    #[test]
+    fn read_back_written_att_pcaps() {
+        let mut buf = Vec::new();
+        write_global_header(&mut buf, LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR).unwrap();
+        let notify = hci_att_frame(true, &att_handle_value(0x1B, 42, &[0, 9, 0, 0, 0, 0, 0]));
+        let write = hci_att_frame(false, &att_handle_value(0x52, 17, &[1, 0]));
+        for f in [&notify, &write] {
+            // Hand-rolled record so the test stays timestamp-deterministic.
+            buf.extend_from_slice(&7u32.to_le_bytes());
+            buf.extend_from_slice(&500_000u32.to_le_bytes());
+            buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            buf.extend_from_slice(f);
+        }
+        buf.extend_from_slice(&[0]); // truncated trailing record: ignored
+
+        let recs = read_hci_att_pcap(&buf[..]).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert!(recs[0].host_to_controller);
+        assert_eq!(recs[0].ts_us, 7 * 1_000_000 + 500_000);
+        assert_eq!(recs[0].pdu[0], 0x1B);
+        assert_eq!(recs[0].pdu[1..3], [42, 0]);
+        assert!(!recs[1].host_to_controller);
+        assert_eq!(recs[1].pdu[0], 0x52);
     }
 }

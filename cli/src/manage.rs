@@ -26,7 +26,7 @@ pub enum ManageCmd {
 pub enum OuiCmd {
     /// Download the IEEE registry and install the local vendor database.
     Update {
-        /// Source URL (defaults to the IEEE MA-L registry).
+        /// Source URL (defaults to the IEEE OUI registry).
         #[arg(long)]
         url: Option<String>,
     },

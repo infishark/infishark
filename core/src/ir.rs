@@ -136,7 +136,8 @@ pub enum IrCapture {
 }
 
 impl IrCapture {
-    /// Parse an `EVT_IR` JSON body. `Ok(None)` = skippable noise (not an error).
+    /// Parse an `EVT_IR` JSON body. `Ok(None)` = skippable noise (not an
+    /// error).
     pub fn from_event_json(v: &serde_json::Value) -> Result<Option<Self>> {
         let proto_id = v.get("protocol").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
         if let Some(protocol) = Protocol::from_id(proto_id) {
