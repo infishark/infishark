@@ -17,7 +17,7 @@ curl -fsSL https://cdn.infishark.com/install.sh | sh
 
 **Windows (PowerShell)**
 ```powershell
-irm https://cdn.infishark.com/install.ps1 | iex
+irm https://raw.githubusercontent.com/infishark/infishark/main/install.ps1 | iex
 ```
 
 Binary lands in `~/.local/bin` (or `%USERPROFILE%\.infishark\bin` on Windows).
