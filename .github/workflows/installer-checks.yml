@@ -1,0 +1,81 @@
+name: installer checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify_cdn:
+        description: Verify canonical CDN bytes after publication
+        type: boolean
+        default: false
+  push:
+    branches:
+      - 'fix/installer-*'
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - '.github/workflows/installer-checks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check PowerShell 5.1 and 7 syntax and release resolution
+        shell: powershell
+        env:
+          VERIFY_INSTALLER_CDN: ${{ inputs.verify_cdn && '1' || '0' }}
+        run: |
+          $check = @'
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd 'install.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors) { throw ($errors | Out-String) }
+          foreach ($name in @('Fail', 'Resolve-ReleaseTag')) {
+            $definition = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true))
+            if ($definition.Count -ne 1) { throw "Missing function: $name" }
+            . ([scriptblock]::Create($definition[0].Extent.Text))
+          }
+          $repo = 'infishark/infishark'
+          $uri = [uri]'https://github.com/infishark/infishark/releases/tag/v0.3.2'
+          function Invoke-WebRequest { $script:mockResponse }
+          $script:mockResponse = [pscustomobject]@{ BaseResponse = [pscustomobject]@{ ResponseUri = $uri } }
+          if ((Resolve-ReleaseTag) -ne 'v0.3.2') { throw 'PowerShell 5.1 response shape failed' }
+          $script:mockResponse = [pscustomobject]@{ BaseResponse = [pscustomobject]@{ RequestMessage = [pscustomobject]@{ RequestUri = $uri } } }
+          if ((Resolve-ReleaseTag) -ne 'v0.3.2') { throw 'PowerShell 7 response shape failed' }
+          $script:mockResponse = [pscustomobject]@{ BaseResponse = [pscustomobject]@{ ResponseUri = [uri]'https://unexpected.invalid/tag/v0.3.2' } }
+          $rejected = $false
+          try { Resolve-ReleaseTag | Out-Null } catch { $rejected = $_.Exception.Message -match 'unexpected URL' }
+          if (-not $rejected) { throw 'Unexpected redirect was accepted' }
+          function Invoke-WebRequest { throw 'synthetic lookup failure' }
+          $rejected = $false
+          try { Resolve-ReleaseTag | Out-Null } catch { $rejected = $_.Exception.Message -match 'Could not determine the latest release' }
+          if (-not $rejected) { throw 'Lookup failure did not stop resolution' }
+          Remove-Item Function:Invoke-WebRequest
+          if ((Resolve-ReleaseTag) -notmatch '^v[0-9][0-9A-Za-z._+-]*$') { throw 'Actual latest release lookup failed' }
+          $download = Join-Path $env:RUNNER_TEMP ('infishark-cdn-' + $PSVersionTable.PSVersion.Major + '.ps1')
+          Invoke-WebRequest -Uri 'https://cdn.infishark.com/install.ps1' -OutFile $download -UseBasicParsing -TimeoutSec 30
+          $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+          $expectedText = (Get-Content -LiteralPath 'install.ps1' -Raw -Encoding UTF8).Replace("`r`n", "`n")
+          $algorithm = [System.Security.Cryptography.SHA256]::Create()
+          $expectedHash = [BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($expectedText))).Replace('-', '')
+          $downloadedText = Invoke-RestMethod -Uri 'https://cdn.infishark.com/install.ps1' -TimeoutSec 30
+          if ($downloadedText -isnot [string]) { throw 'Canonical irm transport did not return script text' }
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseInput($downloadedText, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors) { throw ('Canonical irm script parse failed: ' + ($errors | Out-String)) }
+          if ($env:VERIFY_INSTALLER_CDN -eq '1' -and $actualHash -ne $expectedHash) { throw 'Canonical CDN bytes differ from reviewed installer' }
+          Write-Output ('CDN_SHA256=' + $actualHash + '; MATCHES_REVIEWED=' + ($actualHash -eq $expectedHash))
+          Write-Output ('PASS: syntax, strict response shapes, rejection guards and actual HEAD on PowerShell ' + $PSVersionTable.PSVersion)
+          '@
+          $testPath = Join-Path $env:RUNNER_TEMP 'infishark-installer-resolver-check.ps1'
+          Set-Content -LiteralPath $testPath -Value $check
+          & powershell.exe -NoProfile -File $testPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & pwsh.exe -NoProfile -File $testPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

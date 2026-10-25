@@ -16,6 +16,37 @@ function Say([string]$m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Warn([string]$m) { Write-Host "note: $m" -ForegroundColor Yellow }
 function Fail([string]$m) { throw $m }
 
+function Resolve-ReleaseTag {
+    try {
+        $response = Invoke-WebRequest -Uri "https://github.com/$repo/releases/latest" -Method Head -UseBasicParsing -TimeoutSec 30
+    } catch {
+        Fail "Could not determine the latest release. Check your connection and re-run."
+    }
+    $releaseUri = $null
+    $baseProperty = $response.PSObject.Properties['BaseResponse']
+    if ($baseProperty -and $baseProperty.Value) {
+        $uriProperty = $baseProperty.Value.PSObject.Properties['ResponseUri']
+        if ($uriProperty) {
+            $releaseUri = $uriProperty.Value
+        } else {
+            $requestProperty = $baseProperty.Value.PSObject.Properties['RequestMessage']
+            if ($requestProperty -and $requestProperty.Value) {
+                $requestUriProperty = $requestProperty.Value.PSObject.Properties['RequestUri']
+                if ($requestUriProperty) { $releaseUri = $requestUriProperty.Value }
+            }
+        }
+    }
+    $prefix = "https://github.com/$repo/releases/tag/"
+    if ($releaseUri -isnot [uri] -or -not $releaseUri.AbsoluteUri.StartsWith($prefix, [StringComparison]::Ordinal)) {
+        Fail "Latest release lookup returned an unexpected URL."
+    }
+    $tag = $releaseUri.AbsoluteUri.Substring($prefix.Length)
+    if ($tag -notmatch '^v[0-9][0-9A-Za-z._+-]*$') {
+        Fail "Latest release lookup returned an invalid tag."
+    }
+    return $tag
+}
+
 function Assert-Exe([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) {
         Fail "Expected binary missing: $path"
@@ -25,17 +56,18 @@ function Assert-Exe([string]$path) {
     }
 }
 
+$releaseTag = Resolve-ReleaseTag
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
 $installed = $false
-$url = "https://github.com/$repo/releases/latest/download/infishark-$target.zip"
+$url = "https://github.com/$repo/releases/download/$releaseTag/infishark-$target.zip"
 
 $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) (
     'infishark-install-' + [guid]::NewGuid().ToString('n'))
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 $zip = Join-Path $tmpDir 'infishark.zip'
 try {
-    Say "Installing prebuilt infishark ($target)"
+    Say "Installing prebuilt infishark $releaseTag ($target)"
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
     if (-not (Test-Path -LiteralPath $zip) -or (Get-Item -LiteralPath $zip).Length -le 0) {
         Fail "download empty or missing"
@@ -71,9 +103,9 @@ the "Desktop development with C++" workload (MSVC + Windows SDK), then re-run.
         Warn "link.exe is '$($link.Source)' — not MSVC. Put Visual Studio's linker first on PATH, or remove the other link.exe (e.g. Git/Hermes usr\bin)."
     }
 
-    Say "Building infishark from source (needs MSVC; Smart App Control may block unsigned cargo build scripts)"
+    Say "Building infishark $releaseTag from source (needs MSVC; Smart App Control may block unsigned cargo build scripts)"
     $cargoRoot = Split-Path $dest -Parent
-    & cargo install --git "https://github.com/$repo" infishark-cli --root $cargoRoot
+    & cargo install --git "https://github.com/$repo" --tag $releaseTag --locked --force infishark-cli --root $cargoRoot
     if ($LASTEXITCODE -ne 0) {
         Fail @"
 cargo install failed (exit $LASTEXITCODE).
