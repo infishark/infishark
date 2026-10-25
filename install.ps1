@@ -100,7 +100,7 @@ the "Desktop development with C++" workload (MSVC + Windows SDK), then re-run.
     if ($null -eq $link) {
         Warn "link.exe not on PATH. Open 'x64 Native Tools Command Prompt for VS' (or install VS Build Tools MSVC + Windows SDK) before building from source."
     } elseif ($link.Source -notmatch '[\\/]Microsoft Visual Studio[\\/]') {
-        Warn "link.exe is '$($link.Source)' — not MSVC. Put Visual Studio's linker first on PATH, or remove the other link.exe (e.g. Git/Hermes usr\bin)."
+        Warn "link.exe is '$($link.Source)' - not MSVC. Put Visual Studio's linker first on PATH, or remove the other link.exe (e.g. Git/Hermes usr\bin)."
     }
 
     Say "Building infishark $releaseTag from source (needs MSVC; Smart App Control may block unsigned cargo build scripts)"

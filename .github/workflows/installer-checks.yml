@@ -35,7 +35,7 @@ jobs:
           $tokens = $null
           $errors = $null
           $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd 'install.ps1'), [ref]$tokens, [ref]$errors)
-          if ($errors) { throw ($errors | Out-String) }
+          if ($errors) { throw (($errors | ForEach-Object { $_.Message }) -join '; ') }
           foreach ($name in @('Fail', 'Resolve-ReleaseTag')) {
             $definition = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true))
             if ($definition.Count -ne 1) { throw "Missing function: $name" }
