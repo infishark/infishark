@@ -3,7 +3,7 @@
 # Prefers a prebuilt infishark.exe from GitHub Releases; otherwise builds from
 # source with the local Rust + MSVC toolchain. Install root: %USERPROFILE%\.infishark\bin
 #
-# irm https://cdn.infishark.com/install.ps1 | iex
+# irm https://raw.githubusercontent.com/infishark/infishark/main/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 
