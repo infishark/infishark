@@ -306,7 +306,7 @@ enum CtfCmd {
         #[command(flatten)]
         api: CtfApiOpts,
     },
-    /// Request one staged hint; later levels reveal more detail.
+    /// Read a challenge hint, with more detail at each level.
     Hint {
         /// Challenge slug.
         slug: String,
