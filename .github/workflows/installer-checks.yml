@@ -7,6 +7,10 @@ on:
         description: Verify canonical CDN bytes after publication
         type: boolean
         default: false
+      installer_url:
+        description: Installer transport URL to verify
+        type: string
+        default: https://cdn.infishark.com/install.ps1
   push:
     branches:
       - 'fix/installer-*'
@@ -28,6 +32,7 @@ jobs:
         shell: powershell
         env:
           VERIFY_INSTALLER_CDN: ${{ inputs.verify_cdn && '1' || '0' }}
+          INSTALLER_TEST_URL: ${{ inputs.installer_url || 'https://cdn.infishark.com/install.ps1' }}
         run: |
           $check = @'
           Set-StrictMode -Version Latest
@@ -59,19 +64,20 @@ jobs:
           Remove-Item Function:Invoke-WebRequest
           if ((Resolve-ReleaseTag) -notmatch '^v[0-9][0-9A-Za-z._+-]*$') { throw 'Actual latest release lookup failed' }
           if ($env:VERIFY_INSTALLER_CDN -eq '1') {
+            $transportUrl = $env:INSTALLER_TEST_URL
             $download = Join-Path $env:RUNNER_TEMP ('infishark-cdn-' + $PSVersionTable.PSVersion.Major + '.ps1')
-            Invoke-WebRequest -Uri 'https://cdn.infishark.com/install.ps1' -OutFile $download -UseBasicParsing -TimeoutSec 30
+            Invoke-WebRequest -Uri $transportUrl -OutFile $download -UseBasicParsing -TimeoutSec 30
             $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
             $expectedText = (Get-Content -LiteralPath 'install.ps1' -Raw -Encoding UTF8).Replace("`r`n", "`n")
             $algorithm = [System.Security.Cryptography.SHA256]::Create()
             $expectedHash = [BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($expectedText))).Replace('-', '')
-            $downloadedText = Invoke-RestMethod -Uri 'https://cdn.infishark.com/install.ps1' -TimeoutSec 30
+            $downloadedText = Invoke-RestMethod -Uri $transportUrl -TimeoutSec 30
             if ($downloadedText -isnot [string]) { throw 'Canonical irm transport did not return script text' }
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseInput($downloadedText, [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors) { throw ('Canonical irm script parse failed: ' + ($errors | Out-String)) }
             if ($actualHash -ne $expectedHash) { throw 'Canonical CDN bytes differ from reviewed installer' }
-            Write-Output ('CDN_SHA256=' + $actualHash + '; MATCHES_REVIEWED=' + ($actualHash -eq $expectedHash))
+            Write-Output ('TRANSPORT_URL=' + $transportUrl + '; CDN_SHA256=' + $actualHash + '; MATCHES_REVIEWED=' + ($actualHash -eq $expectedHash))
           }
           Write-Output ('PASS: syntax, strict response shapes, rejection guards and actual HEAD on PowerShell ' + $PSVersionTable.PSVersion)
           '@
