@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "infishark"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "dirs",
  "serde",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "infishark-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "anyhow",

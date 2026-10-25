@@ -29,7 +29,7 @@ mod vendors;
 mod wifi_analysis;
 mod wifi_mitm;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -3555,7 +3555,7 @@ fn view_hid_timeline(timeline: &[(f64, Vec<u8>)], speed: f64, max_gap: Option<f6
         "as fast as possible".into()
     };
     eprintln!("Playing back {n} reports over {duration:.1}s of capture at {pace}. Ctrl-C stops.");
-    let dim = if unsafe { libc::isatty(1) } == 1 {
+    let dim = if std::io::stdout().is_terminal() {
         "\x1b[2m"
     } else {
         ""

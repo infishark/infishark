@@ -1786,26 +1786,16 @@ mod prompt_tests {
 
     fn pty_pair() -> (i32, std::fs::File) {
         unsafe {
-            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(
-                master >= 0,
-                "posix_openpt: {}",
-                std::io::Error::last_os_error()
+            let mut master = -1;
+            let mut slave = -1;
+            let rc = libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
             );
-            assert_eq!(libc::grantpt(master), 0);
-            assert_eq!(libc::unlockpt(master), 0);
-            let mut name = [0u8; 64];
-            let rc = libc::ptsname_r(master, name.as_mut_ptr().cast::<libc::c_char>(), name.len());
-            assert_eq!(rc, 0, "ptsname_r");
-            let slave = libc::open(
-                name.as_ptr().cast::<libc::c_char>(),
-                libc::O_RDWR | libc::O_NOCTTY,
-            );
-            assert!(
-                slave >= 0,
-                "open slave: {}",
-                std::io::Error::last_os_error()
-            );
+            assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
             (master, std::fs::File::from_raw_fd(slave))
         }
     }
